@@ -5,6 +5,7 @@ import os
 import random
 import re
 import string
+import sys
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -58,6 +59,14 @@ def read_int_env(name: str, fallback: int) -> int:
         return int(value)
     except ValueError:
         return fallback
+
+def log_info(message: str, **fields: Any) -> None:
+    print(json.dumps({"level": "info", "message": message, **fields}, ensure_ascii=False), flush=True)
+
+
+def log_error(message: str, **fields: Any) -> None:
+    print(json.dumps({"level": "error", "message": message, **fields}, ensure_ascii=False), file=sys.stderr, flush=True)
+
 
 
 def load_config() -> Config:
@@ -221,6 +230,7 @@ class SimilarWebClient:
     async def fetch(self, domain: str, requested_month: str) -> FetchResult:
         clean_domain = normalize_domain(domain)
         if not clean_domain:
+            log_info("similarweb.invalid_domain", domain=domain, requested_month=requested_month)
             return FetchResult(status="failed", monthly_rows=[], error="invalid_domain")
 
         headers = {
@@ -229,12 +239,16 @@ class SimilarWebClient:
             "Accept-Language": "en-US,en;q=0.8",
         }
         url = f"{SIMILARWEB_API_BASE}?domain={clean_domain}"
+        log_info("similarweb.fetch.start", domain=clean_domain, requested_month=requested_month)
 
         try:
             async with httpx.AsyncClient(proxy=self.proxy_url, headers=headers, timeout=25.0, verify=False) as client:
                 response = await client.get(url)
         except Exception as error:
+            log_error("similarweb.fetch.request_error", domain=clean_domain, error=str(error)[:300])
             return FetchResult(status="failed", monthly_rows=[], error=f"request_error:{str(error)[:300]}")
+
+        log_info("similarweb.fetch.response", domain=clean_domain, status_code=response.status_code)
 
         if response.status_code == 404:
             return FetchResult(status="no_data", monthly_rows=[], error="similarweb_no_data")
@@ -256,13 +270,16 @@ class SimilarWebClient:
         try:
             payload = response.json()
         except json.JSONDecodeError:
+            log_error("similarweb.fetch.invalid_json", domain=clean_domain)
             return FetchResult(status="failed", monthly_rows=[], error="similarweb_invalid_json")
 
         monthly_rows = parse_monthly_rows(payload, clean_domain, requested_month)
         has_data = any(row.get("visits") is not None for row in monthly_rows) or any(
             row.get("global_rank") is not None for row in monthly_rows
         )
-        return FetchResult(status="done" if has_data else "no_data", monthly_rows=monthly_rows)
+        status = "done" if has_data else "no_data"
+        log_info("similarweb.fetch.parsed", domain=clean_domain, status=status, monthly_rows=len(monthly_rows))
+        return FetchResult(status=status, monthly_rows=monthly_rows)
 
 
 class D1Client:
@@ -341,8 +358,22 @@ class D1Client:
 
     async def insert_result(self, task: TrafficTask, result: FetchResult) -> None:
         rows = result.monthly_rows or [{"traffic_month": task.traffic_month}]
+        log_info(
+            "d1.insert_result.start",
+            domain=task.normalized_domain,
+            traffic_month=task.traffic_month,
+            status=result.status,
+            rows=len(rows),
+        )
         for row in rows:
             await self.insert_snapshot(task.normalized_domain, task.traffic_month, result.status, row, result.error)
+        log_info(
+            "d1.insert_result.done",
+            domain=task.normalized_domain,
+            traffic_month=task.traffic_month,
+            status=result.status,
+            rows=len(rows),
+        )
 
 
 class NeonTaskStore:
@@ -397,6 +428,12 @@ class NeonTaskStore:
 
     async def complete_task(self, task: TrafficTask, result: FetchResult) -> None:
         retry_days = 1 if result.status == "failed" else None
+        log_info(
+            "neon.complete_task.start",
+            domain=task.normalized_domain,
+            traffic_month=task.traffic_month,
+            status=result.status,
+        )
         await self.pool.execute(
             """
             UPDATE public.traffic_tasks
@@ -420,6 +457,12 @@ class NeonTaskStore:
             task.traffic_month,
         )
         await self.update_tool_status(task.normalized_domain, result)
+        log_info(
+            "neon.complete_task.done",
+            domain=task.normalized_domain,
+            traffic_month=task.traffic_month,
+            status=result.status,
+        )
 
     async def update_tool_status(self, domain: str, result: FetchResult) -> None:
         retry_days = 30
@@ -470,7 +513,21 @@ async def process_task(
 ) -> str:
     result = FetchResult(status="failed", monthly_rows=[], error="not_started")
     for attempt in range(max_retries + 1):
+        log_info(
+            "task.fetch_attempt.start",
+            domain=task.normalized_domain,
+            traffic_month=task.traffic_month,
+            attempt=attempt + 1,
+            max_attempts=max_retries + 1,
+        )
         result = await similarweb.fetch(task.normalized_domain, task.traffic_month)
+        log_info(
+            "task.fetch_attempt.done",
+            domain=task.normalized_domain,
+            traffic_month=task.traffic_month,
+            attempt=attempt + 1,
+            status=result.status,
+        )
         if result.status != "failed":
             break
         if attempt < max_retries:
@@ -482,11 +539,14 @@ async def process_task(
 
 
 async def run_once(config: Config, limit: int | None = None) -> dict[str, int]:
+    effective_limit = limit or config.limit
+    log_info("runner.batch.start", limit=effective_limit, concurrency=config.concurrency)
     pool = await asyncpg.create_pool(config.database_url, min_size=1, max_size=2)
     store = NeonTaskStore(pool)
     d1 = D1Client(config)
     similarweb = SimilarWebClient(config)
-    tasks = await store.claim_due_tasks(limit or config.limit)
+    tasks = await store.claim_due_tasks(effective_limit)
+    log_info("runner.claim_due_tasks.done", claimed=len(tasks))
     if not tasks:
         await pool.close()
         return {"claimed": 0, "done": 0, "no_data": 0, "forbidden": 0, "failed": 0}
@@ -497,12 +557,19 @@ async def run_once(config: Config, limit: int | None = None) -> dict[str, int]:
     async def guarded(task: TrafficTask) -> None:
         async with semaphore:
             try:
+                log_info("task.start", domain=task.normalized_domain, traffic_month=task.traffic_month)
                 status = await process_task(task, similarweb, d1, store, config.max_retries)
             except Exception as error:
                 status = "failed"
+                log_error(
+                    "task.failed_with_exception",
+                    domain=task.normalized_domain,
+                    traffic_month=task.traffic_month,
+                    error=str(error)[:300],
+                )
                 await store.complete_task(task, FetchResult(status="failed", monthly_rows=[], error=str(error)[:300]))
             counts[status] = counts.get(status, 0) + 1
-            print(f"[{status}] {task.normalized_domain} {task.traffic_month}")
+            log_info("task.done", domain=task.normalized_domain, traffic_month=task.traffic_month, status=status)
 
     await asyncio.gather(*(guarded(task) for task in tasks))
     await pool.close()
@@ -510,9 +577,10 @@ async def run_once(config: Config, limit: int | None = None) -> dict[str, int]:
 
 
 async def run_loop(config: Config, limit: int | None, interval_seconds: int) -> None:
+    log_info("runner.loop.start", interval_seconds=interval_seconds)
     while True:
         counts = await run_once(config, limit)
-        print(json.dumps(counts, ensure_ascii=False))
+        log_info("runner.batch.summary", **counts)
         await asyncio.sleep(interval_seconds)
 
 
@@ -535,7 +603,7 @@ def main() -> None:
         return
 
     counts = asyncio.run(run_once(config, args.limit))
-    print(json.dumps(counts, ensure_ascii=False))
+    log_info("runner.batch.summary", **counts)
 
 
 if __name__ == "__main__":
