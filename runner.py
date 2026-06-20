@@ -410,7 +410,7 @@ class NeonTaskStore:
                 updated_at = now()
             WHERE normalized_domain = $1
               AND source = $5
-              AND traffic_month = $6::date
+              AND traffic_month = $6::text::date
             """,
             task.normalized_domain,
             result.status,
