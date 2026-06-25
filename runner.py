@@ -360,11 +360,6 @@ class SimilarWebClient:
             "Accept": "application/json,text/plain,*/*",
             "Accept-Language": "en-US,en;q=0.9",
             "DNT": "1",
-            "Origin": "https://www.similarweb.com",
-            "Referer": f"https://www.similarweb.com/website/{clean_domain}/",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-site",
         }
         url = f"{SIMILARWEB_API_BASE}?domain={clean_domain}"
         log_info("similarweb.fetch.start", domain=clean_domain, requested_month=requested_month)
