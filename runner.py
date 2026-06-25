@@ -100,6 +100,41 @@ def log_error(message: str, **fields: Any) -> None:
     print(json.dumps({"level": "error", "message": message, **fields}, ensure_ascii=False), file=sys.stderr, flush=True)
 
 
+def mask_value(value: str, prefix: int = 18, suffix: int = 8) -> str:
+    if not value:
+        return ""
+    if len(value) <= prefix + suffix + 3:
+        return value
+    return f"{value[:prefix]}...{value[-suffix:]}"
+
+
+def extract_brightdata_zone(username: str) -> str | None:
+    match = re.search(r"(?:^|-)zone-([A-Za-z0-9_]+)", username or "")
+    return match.group(1) if match else None
+
+
+def response_header_summary(response: httpx.Response) -> dict[str, str]:
+    keys = [
+        "content-type",
+        "content-length",
+        "server",
+        "cf-ray",
+        "x-cache",
+        "via",
+        "x-brd-error",
+        "x-brd-ip",
+    ]
+    return {key.replace("-", "_"): response.headers[key] for key in keys if key in response.headers}
+
+
+def response_body_sample(response: httpx.Response, limit: int = 500) -> str:
+    try:
+        text = response.text
+    except Exception as error:
+        return f"<unable_to_read_response_text:{type(error).__name__}>"
+    return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
 
 def load_config() -> Config:
     load_dotenv()
@@ -296,11 +331,24 @@ class SimilarWebClient:
     def __init__(self, config: Config):
         session_id = generate_session_id()
         username = f"{config.brightdata_proxy_user}-session-{session_id}"
+        self.proxy_host = config.brightdata_proxy_host
+        self.proxy_port = config.brightdata_proxy_port
+        self.proxy_user_summary = mask_value(config.brightdata_proxy_user)
+        self.effective_proxy_user_summary = mask_value(username)
         self.proxy_url = (
             f"http://{username}:{config.brightdata_proxy_password}"
             f"@{config.brightdata_proxy_host}:{config.brightdata_proxy_port}"
         )
         self.user_agent = UserAgent()
+        log_info(
+            "similarweb.client.config",
+            proxy_host=self.proxy_host,
+            proxy_port=self.proxy_port,
+            proxy_user=self.proxy_user_summary,
+            proxy_zone=extract_brightdata_zone(config.brightdata_proxy_user),
+            proxy_user_has_session="-session-" in config.brightdata_proxy_user,
+            effective_proxy_user=self.effective_proxy_user_summary,
+        )
 
     async def fetch(self, domain: str, requested_month: str) -> FetchResult:
         clean_domain = normalize_domain(domain)
@@ -320,10 +368,34 @@ class SimilarWebClient:
             async with httpx.AsyncClient(proxy=self.proxy_url, headers=headers, timeout=25.0, verify=False) as client:
                 response = await client.get(url)
         except Exception as error:
-            log_error("similarweb.fetch.request_error", domain=clean_domain, error=str(error)[:300])
+            log_error(
+                "similarweb.fetch.request_error",
+                domain=clean_domain,
+                error_type=type(error).__name__,
+                error=str(error)[:500],
+                proxy_host=self.proxy_host,
+                proxy_port=self.proxy_port,
+                proxy_user=self.proxy_user_summary,
+            )
             return FetchResult(status="failed", monthly_rows=[], error=f"request_error:{str(error)[:300]}")
 
-        log_info("similarweb.fetch.response", domain=clean_domain, status_code=response.status_code)
+        log_info(
+            "similarweb.fetch.response",
+            domain=clean_domain,
+            status_code=response.status_code,
+            elapsed_ms=int(response.elapsed.total_seconds() * 1000),
+            final_host=urlsplit(str(response.url)).netloc,
+            http_version=response.http_version,
+            history_statuses=[item.status_code for item in response.history],
+            **response_header_summary(response),
+        )
+        if not response.is_success:
+            log_info(
+                "similarweb.fetch.response_body",
+                domain=clean_domain,
+                status_code=response.status_code,
+                body_sample=response_body_sample(response),
+            )
 
         if response.status_code == 404:
             return FetchResult(status="no_data", monthly_rows=[], error="similarweb_no_data")
