@@ -329,16 +329,11 @@ def parse_monthly_rows(payload: dict[str, Any], domain: str, requested_month: st
 
 class SimilarWebClient:
     def __init__(self, config: Config):
-        session_id = generate_session_id()
-        username = f"{config.brightdata_proxy_user}-session-{session_id}"
         self.proxy_host = config.brightdata_proxy_host
         self.proxy_port = config.brightdata_proxy_port
+        self.proxy_user = config.brightdata_proxy_user
+        self.proxy_password = config.brightdata_proxy_password
         self.proxy_user_summary = mask_value(config.brightdata_proxy_user)
-        self.effective_proxy_user_summary = mask_value(username)
-        self.proxy_url = (
-            f"http://{username}:{config.brightdata_proxy_password}"
-            f"@{config.brightdata_proxy_host}:{config.brightdata_proxy_port}"
-        )
         self.user_agent = UserAgent()
         log_info(
             "similarweb.client.config",
@@ -347,8 +342,13 @@ class SimilarWebClient:
             proxy_user=self.proxy_user_summary,
             proxy_zone=extract_brightdata_zone(config.brightdata_proxy_user),
             proxy_user_has_session="-session-" in config.brightdata_proxy_user,
-            effective_proxy_user=self.effective_proxy_user_summary,
+            proxy_session_per_fetch=True,
         )
+
+    def build_proxy_url(self) -> str:
+        session_id = generate_session_id()
+        username = f"{self.proxy_user}-session-{session_id}"
+        return f"http://{username}:{self.proxy_password}@{self.proxy_host}:{self.proxy_port}"
 
     async def fetch(self, domain: str, requested_month: str) -> FetchResult:
         clean_domain = normalize_domain(domain)
@@ -358,14 +358,17 @@ class SimilarWebClient:
 
         headers = {
             "User-Agent": self.user_agent.random,
-            "Accept": "application/json,text/plain,*/*",
-            "Accept-Language": "en-US,en;q=0.8",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.5",
+            "DNT": "1",
+            "Connection": "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
         }
         url = f"{SIMILARWEB_API_BASE}?domain={clean_domain}"
         log_info("similarweb.fetch.start", domain=clean_domain, requested_month=requested_month)
 
         try:
-            async with httpx.AsyncClient(proxy=self.proxy_url, headers=headers, timeout=25.0, verify=False) as client:
+            async with httpx.AsyncClient(proxy=self.build_proxy_url(), headers=headers, timeout=25.0, verify=False) as client:
                 response = await client.get(url)
         except Exception as error:
             log_error(
