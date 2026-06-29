@@ -10,4 +10,4 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY runner.py .
 
-CMD ["python", "runner.py", "--loop"]
+CMD ["python", "runner.py", "--all", "--loop", "--interval-seconds", "300"]

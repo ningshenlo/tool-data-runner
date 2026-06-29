@@ -37,6 +37,12 @@ Fill `.env` with:
 
 ## Run
 
+Docker default command runs all loops in one process:
+
+```bash
+python runner.py --all --loop --interval-seconds 300
+```
+
 Process one batch:
 
 ```bash
