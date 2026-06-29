@@ -1,0 +1,735 @@
+{
+  "generated_at": "2026-06-29T08:10:04.219432+00:00",
+  "runner": "traffic-runner",
+  "domains": [
+    "seamless.ai",
+    "playabl.ai",
+    "researchrabbit.ai",
+    "scoutnow.ai",
+    "purple.ai",
+    "slidesgo.ai"
+  ],
+  "config": {
+    "openai_model": "gpt-5.4-mini",
+    "openai_fallback_model": null,
+    "browser_rendering_enabled": true
+  },
+  "results": [
+    {
+      "domain": "seamless.ai",
+      "input_url": "https://seamless.ai/",
+      "final_url": "https://seamless.ai/pricing",
+      "http_status": 200,
+      "page_status": "found",
+      "discovery_method": "candidate_scored",
+      "review_status": "approved",
+      "confidence": 90,
+      "extractor_version": "openai-structured-pricing-v1",
+      "model_name": "gpt-5.4-mini",
+      "validation_errors": [],
+      "quality": {
+        "ok": true,
+        "reason": null,
+        "text_score": 6,
+        "final_url": "https://seamless.ai/pricing",
+        "notes": "Extracted the main public plan offerings shown on the pricing page. Ignored FAQ credit examples, annual discount language, add-ons, and non-primary plan details. The page text references a $19.99/mo student/recent grad promo, but it is not presented as a main public package price, so it was excluded"
+      },
+      "plans": [
+        {
+          "source_plan_key": "free",
+          "name": "Free",
+          "audience": "individuals getting started",
+          "description": "Best individual looking to get started with Seamless",
+          "is_enterprise": 0,
+          "prices": [
+            {
+              "kind": "recurring",
+              "amount": "0",
+              "currency": "USD",
+              "billing_interval": "monthly",
+              "commitment_interval": null,
+              "unit": "1 user / 50 credits",
+              "custom_quote": false,
+              "starting_at": false,
+              "display_text": "Free"
+            }
+          ],
+          "features": [
+            "1 User",
+            "50 Credits",
+            "Sign up free"
+          ],
+          "display_order": 0
+        },
+        {
+          "source_plan_key": "pro",
+          "name": "Pro",
+          "audience": "those seeking additional credits and premium products",
+          "description": "Best for those seeking additional credits and premium products",
+          "is_enterprise": 0,
+          "prices": [
+            {
+              "kind": "custom_quote",
+              "amount": null,
+              "currency": null,
+              "billing_interval": "yearly",
+              "commitment_interval": "yearly",
+              "unit": "per user",
+              "custom_quote": true,
+              "starting_at": false,
+              "display_text": "Contact sales"
+            }
+          ],
+          "features": [
+            "Per User",
+            "Unlimited Exports",
+            "Annual Credit Packages",
+            "1 Credits = Phone + Email"
+          ],
+          "display_order": 1
+        },
+        {
+          "source_plan_key": "enterprise",
+          "name": "Enterprise",
+          "audience": "large teams",
+          "description": "Enterprise-ready features for large teams with dedicated support",
+          "is_enterprise": 1,
+          "prices": [
+            {
+              "kind": "custom_quote",
+              "amount": null,
+              "currency": null,
+              "billing_interval": "custom",
+              "commitment_interval": "yearly",
+              "unit": "unlimited users",
+              "custom_quote": true,
+              "starting_at": false,
+              "display_text": "Contact sales"
+            }
+          ],
+          "features": [
+            "Unlimited Users",
+            "Unlimited Exports",
+            "Custom Packages",
+            "Customer Success",
+            "Enterprise Support"
+          ],
+          "display_order": 2
+        }
+      ],
+      "trace": [
+        {
+          "stage": "static_fetch_rule",
+          "url": "https://seamless.ai/pricing",
+          "final_url": "https://seamless.ai/pricing",
+          "http_status": 200,
+          "page_status": "found",
+          "discovery_method": "candidate_scored",
+          "text_score": 6,
+          "review_status": "approved",
+          "confidence": 82,
+          "validation_errors": [],
+          "plan_count": 2
+        },
+        {
+          "stage": "openai",
+          "model_name": "gpt-5.4-mini",
+          "triggered_by": {
+            "review_status": "approved",
+            "needs_model_check": true,
+            "model_check_reasons": [
+              "generic_plan_name",
+              "long_price_context",
+              "low_text_quality",
+              "polluted_price_context"
+            ]
+          },
+          "review_status": "approved",
+          "confidence": 90,
+          "validation_errors": [],
+          "plan_count": 3
+        }
+      ],
+      "final_pipeline_stage": "openai"
+    },
+    {
+      "domain": "playabl.ai",
+      "input_url": "https://playabl.ai/",
+      "final_url": "https://playabl.ai/en",
+      "http_status": 200,
+      "page_status": "not_found",
+      "discovery_method": "none",
+      "review_status": "manual_review",
+      "confidence": 10,
+      "extractor_version": "python-rule-pricing-v1",
+      "model_name": null,
+      "validation_errors": [
+        "No credible pricing page found"
+      ],
+      "quality": {
+        "ok": false,
+        "reason": "No credible pricing page found",
+        "text_score": 0,
+        "final_url": "https://playabl.ai/en",
+        "page_status": "not_found",
+        "discovery_method": "none"
+      },
+      "plans": [],
+      "trace": [
+        {
+          "stage": "static_fetch_rule",
+          "url": "https://playabl.ai/",
+          "final_url": "https://playabl.ai/en",
+          "http_status": 200,
+          "page_status": "not_found",
+          "discovery_method": "none",
+          "text_score": -4,
+          "review_status": "manual_review",
+          "confidence": 10,
+          "validation_errors": [
+            "No credible pricing page found"
+          ],
+          "plan_count": 0
+        }
+      ],
+      "final_pipeline_stage": "manual_review"
+    },
+    {
+      "domain": "researchrabbit.ai",
+      "input_url": "https://researchrabbit.ai/",
+      "final_url": "https://www.researchrabbit.ai/pricing",
+      "http_status": 200,
+      "page_status": "found",
+      "discovery_method": "candidate_scored",
+      "review_status": "approved",
+      "confidence": 90,
+      "extractor_version": "openai-structured-pricing-v1",
+      "model_name": "gpt-5.4-mini",
+      "validation_errors": [],
+      "quality": {
+        "ok": true,
+        "reason": null,
+        "text_score": 19,
+        "final_url": "https://www.researchrabbit.ai/pricing",
+        "notes": "Extracted only primary public package prices. RR+ had both annual and monthly mentions; kept the default monthly USD$10 per month as the primary price and ignored the alternate annual/monthly toggle text beyond that. Institution is a custom quote plan."
+      },
+      "plans": [
+        {
+          "source_plan_key": "free",
+          "name": "Free",
+          "audience": "Researchers and students",
+          "description": "Free forever tier for focused literature review",
+          "is_enterprise": 0,
+          "prices": [
+            {
+              "kind": "recurring",
+              "amount": "0",
+              "currency": "USD",
+              "billing_interval": "monthly",
+              "commitment_interval": null,
+              "unit": null,
+              "custom_quote": false,
+              "starting_at": false,
+              "display_text": "$0, Forever!"
+            }
+          ],
+          "features": [
+            "Unlimited searches across 310+ million articles",
+            "Unlimited library and collections",
+            "Collaborate by sharing your collection",
+            "Use up to 50 seed articles",
+            "Core search settings"
+          ],
+          "display_order": 0
+        },
+        {
+          "source_plan_key": "rr_plus",
+          "name": "ResearchRabbit+",
+          "audience": "Students and researchers",
+          "description": "Premium tier for faster discovery and organisation during large scale research",
+          "is_enterprise": 0,
+          "prices": [
+            {
+              "kind": "recurring",
+              "amount": "10",
+              "currency": "USD",
+              "billing_interval": "monthly",
+              "commitment_interval": "yearly",
+              "unit": null,
+              "custom_quote": false,
+              "starting_at": false,
+              "display_text": "$10 per month"
+            }
+          ],
+          "features": [
+            "Everything in Free Forever",
+            "Use up to 300 seed articles for large scale reviews",
+            "Advanced search controls for faster discovery",
+            "Multiple projects for focused discovery per topic",
+            "Faster support responses"
+          ],
+          "display_order": 1
+        },
+        {
+          "source_plan_key": "institution",
+          "name": "Institution",
+          "audience": "Organizations",
+          "description": "Empowering research at scale for institutions",
+          "is_enterprise": 1,
+          "prices": [
+            {
+              "kind": "custom_quote",
+              "amount": null,
+              "currency": null,
+              "billing_interval": "custom",
+              "commitment_interval": null,
+              "unit": null,
+              "custom_quote": true,
+              "starting_at": false,
+              "display_text": "Contact Us"
+            }
+          ],
+          "features": [
+            "Everything in RR+",
+            "Greater volume discounts",
+            "Integrate with your research library (LibKey)",
+            "Manage thousands of users",
+            "Review usage statistics and learn about your researchers",
+            "Dedicated support"
+          ],
+          "display_order": 2
+        }
+      ],
+      "trace": [
+        {
+          "stage": "static_fetch_rule",
+          "url": "https://www.researchrabbit.ai/pricing",
+          "final_url": "https://www.researchrabbit.ai/pricing",
+          "http_status": 200,
+          "page_status": "found",
+          "discovery_method": "candidate_scored",
+          "text_score": 19,
+          "review_status": "approved",
+          "confidence": 82,
+          "validation_errors": [],
+          "plan_count": 3
+        },
+        {
+          "stage": "openai",
+          "model_name": "gpt-5.4-mini",
+          "triggered_by": {
+            "review_status": "approved",
+            "needs_model_check": true,
+            "model_check_reasons": [
+              "duplicate_plan_names",
+              "long_price_context"
+            ]
+          },
+          "review_status": "approved",
+          "confidence": 90,
+          "validation_errors": [],
+          "plan_count": 3
+        }
+      ],
+      "final_pipeline_stage": "openai"
+    },
+    {
+      "domain": "scoutnow.ai",
+      "input_url": "https://scoutnow.ai/",
+      "final_url": "https://scoutnow.ai/",
+      "http_status": 200,
+      "page_status": "not_found",
+      "discovery_method": "none",
+      "review_status": "manual_review",
+      "confidence": 10,
+      "extractor_version": "python-rule-pricing-v1",
+      "model_name": null,
+      "validation_errors": [
+        "No credible pricing page found"
+      ],
+      "quality": {
+        "ok": false,
+        "reason": "No credible pricing page found",
+        "text_score": 0,
+        "final_url": "https://scoutnow.ai/",
+        "page_status": "not_found",
+        "discovery_method": "none"
+      },
+      "plans": [],
+      "trace": [
+        {
+          "stage": "static_fetch_rule",
+          "url": "https://scoutnow.ai/",
+          "final_url": "https://scoutnow.ai/",
+          "http_status": 200,
+          "page_status": "not_found",
+          "discovery_method": "none",
+          "text_score": -1,
+          "review_status": "manual_review",
+          "confidence": 10,
+          "validation_errors": [
+            "No credible pricing page found"
+          ],
+          "plan_count": 0
+        }
+      ],
+      "final_pipeline_stage": "manual_review"
+    },
+    {
+      "domain": "purple.ai",
+      "input_url": "https://purple.ai/",
+      "final_url": "https://www.purple.ai/es-mx/guest-wifi/pricing",
+      "http_status": 200,
+      "page_status": "found",
+      "discovery_method": "candidate_scored",
+      "review_status": "approved",
+      "confidence": 90,
+      "extractor_version": "openai-structured-pricing-v1",
+      "model_name": "gpt-5.4-mini",
+      "validation_errors": [],
+      "quality": {
+        "ok": true,
+        "reason": null,
+        "text_score": 23,
+        "final_url": "https://www.purple.ai/es-mx/guest-wifi/pricing",
+        "notes": "La página muestra tres planes públicos principales. Connect aparece como gratuito; Capture y Engage requieren hablar con un experto, sin precio numérico público. Se ignoraron complementos, prueba gratuita y texto de comparación/FAQ."
+      },
+      "plans": [
+        {
+          "source_plan_key": "connect",
+          "name": "Connect",
+          "audience": "Pequeñas empresas / usuarios que comienzan",
+          "description": "Plan gratuito de nivel de entrada para Guest WiFi con funciones básicas de marca y analítica.",
+          "is_enterprise": 0,
+          "prices": [
+            {
+              "kind": "recurring",
+              "amount": "0",
+              "currency": "USD",
+              "billing_interval": "monthly",
+              "commitment_interval": null,
+              "unit": null,
+              "custom_quote": false,
+              "starting_at": false,
+              "display_text": "Gratis"
+            }
+          ],
+          "features": [
+            "Captive Portal seguro",
+            "Splash pages personalizadas",
+            "25 idiomas compatibles",
+            "Analíticas de red",
+            "Monitoree la velocidad y la cobertura del establecimiento",
+            "Cumplimiento con las principales leyes de datos"
+          ],
+          "display_order": 0
+        },
+        {
+          "source_plan_key": "capture",
+          "name": "Capture",
+          "audience": "Empresas que necesitan capturar datos e integrarlos con CRM",
+          "description": "Incluye todas las funciones de Connect más captura de datos, CRM y analítica detallada.",
+          "is_enterprise": 0,
+          "prices": [
+            {
+              "kind": "custom_quote",
+              "amount": null,
+              "currency": null,
+              "billing_interval": "custom",
+              "commitment_interval": null,
+              "unit": null,
+              "custom_quote": true,
+              "starting_at": false,
+              "display_text": "Hable con un experto"
+            }
+          ],
+          "features": [
+            "Captura de datos de primera mano",
+            "Integración con CRM",
+            "Analíticas detalladas de WiFi",
+            "Información sobre el comportamiento",
+            "Verificación de dirección de correo electrónico",
+            "Acceso a nuestro equipo de soporte"
+          ],
+          "display_order": 1
+        },
+        {
+          "source_plan_key": "engage",
+          "name": "Engage",
+          "audience": "Empresas que buscan automatización y experiencia personalizada",
+          "description": "Incluye todas las funciones de Capture más recorridos personalizados, comunicaciones y analítica avanzada.",
+          "is_enterprise": 0,
+          "prices": [
+            {
+              "kind": "custom_quote",
+              "amount": null,
+              "currency": null,
+              "billing_interval": "custom",
+              "commitment_interval": null,
+              "unit": null,
+              "custom_quote": true,
+              "starting_at": false,
+              "display_text": "Hable con un experto"
+            }
+          ],
+          "features": [
+            "Recorridos de acceso personalizados",
+            "Comunicaciones personalizadas",
+            "Analíticas avanzadas de WiFi",
+            "Integraciones de suite completa",
+            "Autenticación de perfiles y Passpoint",
+            "Opciones de servicio totalmente gestionado"
+          ],
+          "display_order": 2
+        }
+      ],
+      "trace": [
+        {
+          "stage": "static_fetch_rule",
+          "url": "https://www.purple.ai/es-mx/guest-wifi/pricing",
+          "final_url": "https://www.purple.ai/es-mx/guest-wifi/pricing",
+          "http_status": 200,
+          "page_status": "found",
+          "discovery_method": "candidate_scored",
+          "text_score": 23,
+          "review_status": "approved",
+          "confidence": 82,
+          "validation_errors": [],
+          "plan_count": 1
+        },
+        {
+          "stage": "openai",
+          "model_name": "gpt-5.4-mini",
+          "triggered_by": {
+            "review_status": "approved",
+            "needs_model_check": true,
+            "model_check_reasons": [
+              "long_price_context"
+            ]
+          },
+          "review_status": "approved",
+          "confidence": 90,
+          "validation_errors": [],
+          "plan_count": 3
+        }
+      ],
+      "final_pipeline_stage": "openai"
+    },
+    {
+      "domain": "slidesgo.ai",
+      "input_url": "https://slidesgo.ai/",
+      "final_url": "https://slidesgo.ai/pricing",
+      "http_status": 200,
+      "page_status": "found",
+      "discovery_method": "candidate_scored",
+      "review_status": "approved",
+      "confidence": 90,
+      "extractor_version": "openai-structured-pricing-v1",
+      "model_name": "gpt-5.4-mini",
+      "validation_errors": [],
+      "quality": {
+        "ok": true,
+        "reason": null,
+        "text_score": 78,
+        "final_url": "https://slidesgo.ai/pricing",
+        "notes": "Extracted the primary public pricing plans only. Ignored duplicated sections, comparison table repetition, and non-primary billing text like 'per day' for lifetime. Lifetime was treated as a one-time payment."
+      },
+      "plans": [
+        {
+          "source_plan_key": "free",
+          "name": "Free",
+          "audience": "individuals trying the product",
+          "description": "Free plan with limited AI generation and editing usage.",
+          "is_enterprise": 0,
+          "prices": [
+            {
+              "kind": "recurring",
+              "amount": "0",
+              "currency": "USD",
+              "billing_interval": "monthly",
+              "commitment_interval": null,
+              "unit": "month",
+              "custom_quote": false,
+              "starting_at": false,
+              "display_text": "$0.00"
+            }
+          ],
+          "features": [
+            "1 times generation of ai ppt",
+            "1 times of template replacement",
+            "Upload text 1 times and 1 times ai summarizer usage",
+            "15 times ai mind map usage",
+            "20 times ai PDF usage",
+            "2 times ai writing usage",
+            "Edit slides online"
+          ],
+          "display_order": 0
+        },
+        {
+          "source_plan_key": "month",
+          "name": "Month Plan",
+          "audience": "individuals and teams",
+          "description": "Monthly paid plan with expanded AI generation and content limits.",
+          "is_enterprise": 0,
+          "prices": [
+            {
+              "kind": "recurring",
+              "amount": "17.99",
+              "currency": "USD",
+              "billing_interval": "monthly",
+              "commitment_interval": "monthly",
+              "unit": "month",
+              "custom_quote": false,
+              "starting_at": false,
+              "display_text": "$17.99 per month"
+            }
+          ],
+          "features": [
+            "30 times generation of ai ppt",
+            "Support uploading various texts to generate slides",
+            "Support input link to generate slides",
+            "Support uploading audio to generate slides",
+            "Ability to generate charts in Presentation",
+            "30 times of template replacement",
+            "15 times generation of ai writing",
+            "Upload text 10 times and 30 times ai summarizer usage",
+            "30 times of mind map usage",
+            "40 times ai PDF usage"
+          ],
+          "display_order": 1
+        },
+        {
+          "source_plan_key": "month_unlimited",
+          "name": "Month Plan Unlimited",
+          "audience": "power users",
+          "description": "Monthly unlimited plan.",
+          "is_enterprise": 0,
+          "prices": [
+            {
+              "kind": "recurring",
+              "amount": "29.99",
+              "currency": "USD",
+              "billing_interval": "monthly",
+              "commitment_interval": "monthly",
+              "unit": "month",
+              "custom_quote": false,
+              "starting_at": false,
+              "display_text": "$29.99 per month"
+            }
+          ],
+          "features": [
+            "Unlimited times generation of ai ppt",
+            "Support uploading various texts to generate slides",
+            "Support input link to generate slides",
+            "Support uploading audio to generate slides",
+            "Ability to generate charts in Presentation",
+            "Unlimited times of template replacement",
+            "Unlimited times generation of ai writing",
+            "Unlimited upload text and ai summarizer usage",
+            "Unlimited mind map usage",
+            "Unlimited times ai PDF usage"
+          ],
+          "display_order": 2
+        },
+        {
+          "source_plan_key": "year_unlimited",
+          "name": "Year Plan Unlimited",
+          "audience": "power users",
+          "description": "Annual unlimited plan billed yearly.",
+          "is_enterprise": 0,
+          "prices": [
+            {
+              "kind": "recurring",
+              "amount": "199.99",
+              "currency": "USD",
+              "billing_interval": "yearly",
+              "commitment_interval": "yearly",
+              "unit": "year",
+              "custom_quote": false,
+              "starting_at": false,
+              "display_text": "$16.66 per month, billed $199.99 every year"
+            }
+          ],
+          "features": [
+            "Unlimited times generation of ai ppt",
+            "Support uploading various texts to generate slides",
+            "Support input link to generate slides",
+            "Support uploading audio to generate slides",
+            "Ability to generate charts in Presentation",
+            "Unlimited times of template replacement",
+            "Unlimited times generation of ai writing",
+            "Unlimited upload text and ai summarizer usage",
+            "Unlimited mind map usage",
+            "Unlimited times ai PDF usage"
+          ],
+          "display_order": 3
+        },
+        {
+          "source_plan_key": "lifetime_unlimited",
+          "name": "Lifetime Plan Unlimited",
+          "audience": "power users",
+          "description": "One-time lifetime unlimited plan.",
+          "is_enterprise": 0,
+          "prices": [
+            {
+              "kind": "one_time",
+              "amount": "299.99",
+              "currency": "USD",
+              "billing_interval": "one_time",
+              "commitment_interval": null,
+              "unit": null,
+              "custom_quote": false,
+              "starting_at": false,
+              "display_text": "Billed $299.99 lifetime"
+            }
+          ],
+          "features": [
+            "Unlimited times generation of ai ppt",
+            "Support uploading various texts to generate slides",
+            "Support input link to generate slides",
+            "Support uploading audio to generate slides",
+            "Ability to generate charts in Presentation",
+            "Unlimited times of template replacement",
+            "Unlimited times generation of ai writing",
+            "Unlimited upload text and ai summarizer usage",
+            "Unlimited mind map usage",
+            "Unlimited times ai PDF usage"
+          ],
+          "display_order": 4
+        }
+      ],
+      "trace": [
+        {
+          "stage": "static_fetch_rule",
+          "url": "https://slidesgo.ai/pricing",
+          "final_url": "https://slidesgo.ai/pricing",
+          "http_status": 200,
+          "page_status": "found",
+          "discovery_method": "candidate_scored",
+          "text_score": 78,
+          "review_status": "approved",
+          "confidence": 82,
+          "validation_errors": [],
+          "plan_count": 6
+        },
+        {
+          "stage": "openai",
+          "model_name": "gpt-5.4-mini",
+          "triggered_by": {
+            "review_status": "approved",
+            "needs_model_check": true,
+            "model_check_reasons": [
+              "generic_plan_name",
+              "long_price_context"
+            ]
+          },
+          "review_status": "approved",
+          "confidence": 90,
+          "validation_errors": [],
+          "plan_count": 5
+        }
+      ],
+      "final_pipeline_stage": "openai"
+    }
+  ]
+}
