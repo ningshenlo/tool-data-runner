@@ -336,7 +336,7 @@ def load_config(require_brightdata: bool = True) -> Config:
         concurrency=read_int_env("RUNNER_CONCURRENCY", 5),
         max_retries=read_int_env("RUNNER_MAX_RETRIES", 2),
         poll_interval_seconds=read_int_env("RUNNER_POLL_INTERVAL_SECONDS", 300),
-        asset_limit=read_int_env("RUNNER_ASSET_LIMIT", 50),
+        asset_limit=read_int_env("RUNNER_ASSET_LIMIT", 5),
         domain_state_limit=read_int_env("RUNNER_DOMAIN_STATE_LIMIT", 50),
         domain_state_max_age_days=read_int_env("RUNNER_DOMAIN_STATE_MAX_AGE_DAYS", 30),
         pricing_limit=read_int_env("RUNNER_PRICING_LIMIT", 20),
@@ -1725,7 +1725,10 @@ class R2AssetUploader:
         async with httpx.AsyncClient(timeout=45.0) as client:
             response = await client.put(f"https://{host}{canonical_uri}", headers=headers, content=body)
         if response.status_code < 200 or response.status_code >= 300:
-            raise RuntimeError(f"R2 upload failed: HTTP {response.status_code} {response.text[:300]}")
+            raise RuntimeError(f"R2 upload failed for bucket {self.bucket}: HTTP {response.status_code} {response.text[:300]}")
+
+    async def check_access(self) -> None:
+        await self.put_object("_runner-healthcheck.txt", b"ok\n", "text/plain")
 
 
 def amount_minor(value: str | None) -> int | None:
@@ -3865,6 +3868,7 @@ async def run_assets_once(config: Config, limit: int | None = None) -> dict[str,
     log_info("assets_runner.batch.start", limit=effective_limit, concurrency=config.concurrency)
     browser_client = CloudflareBrowserRunAssetClient(config)
     uploader = R2AssetUploader(config)
+    await uploader.check_access()
     d1 = D1Client(config)
     store = D1AssetStore(d1)
     queued = await store.queue_missing_asset_tasks(effective_limit)
@@ -4053,8 +4057,11 @@ async def run_pricing_once(
 async def run_assets_loop(config: Config, limit: int | None, interval_seconds: int) -> None:
     log_info("assets_runner.loop.start", interval_seconds=interval_seconds)
     while True:
-        counts = await run_assets_once(config, limit)
-        log_info("assets_runner.batch.summary", **counts)
+        try:
+            counts = await run_assets_once(config, limit)
+            log_info("assets_runner.batch.summary", **counts)
+        except Exception as error:
+            log_error("assets_runner.batch.failed", error=str(error)[:500])
         await asyncio.sleep(interval_seconds)
 
 
