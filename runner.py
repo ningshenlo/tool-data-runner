@@ -3041,6 +3041,65 @@ class D1PricingStore:
     def __init__(self, d1: D1Client):
         self.d1 = d1
 
+    async def queue_due_tasks(self, limit: int) -> int:
+        now = utc_now_iso()
+        rows = await self.d1.query(
+            """
+            WITH latest_task AS (
+              SELECT pricing_source_id, max(id) AS task_id
+              FROM pricing_tasks
+              GROUP BY pricing_source_id
+            )
+            SELECT
+              ps.id AS pricing_source_id,
+              ps.tool_id
+            FROM pricing_sources ps
+            JOIN tools t ON t.id = ps.tool_id
+            LEFT JOIN latest_task lt ON lt.pricing_source_id = ps.id
+            LEFT JOIN pricing_tasks task ON task.id = lt.task_id
+            WHERE ps.is_active = 1
+              AND t.status = 'published'
+              AND t.duplicate_of_tool_id IS NULL
+              AND (
+                ps.next_run_at IS NULL
+                OR ps.next_run_at <= ?
+                OR t.pricing_model = 'unknown'
+              )
+              AND (
+                task.id IS NULL
+                OR task.status IN ('succeeded', 'failed')
+              )
+            ORDER BY coalesce(ps.next_run_at, ''), ps.id
+            LIMIT ?
+            """,
+            [now, limit],
+        )
+
+        queued = 0
+        for row in rows:
+            source_id = int(row.get("pricing_source_id") or 0)
+            tool_id = int(row.get("tool_id") or 0)
+            if source_id <= 0 or tool_id <= 0:
+                continue
+            await self.d1.run(
+                """
+                INSERT INTO pricing_tasks (
+                  pricing_source_id,
+                  tool_id,
+                  status,
+                  priority,
+                  run_after,
+                  attempts,
+                  max_attempts,
+                  last_error
+                )
+                VALUES (?, ?, 'queued', 0, ?, 0, 3, NULL)
+                """,
+                [source_id, tool_id, now],
+            )
+            queued += 1
+        return queued
+
     async def claim_due_tasks(
         self,
         limit: int,
@@ -3941,11 +4000,16 @@ async def run_pricing_once(
         enabled=browser_renderer is not None,
         timeout_seconds=config.browser_rendering_timeout_seconds if browser_renderer is not None else None,
     )
+    queued = 0
+    if not task_ids and not dry_run:
+        queued = await store.queue_due_tasks(effective_limit)
+        log_info("pricing_runner.queue_due_tasks.done", queued=queued)
     tasks = await store.claim_due_tasks(effective_limit, task_ids=task_ids, claim=not dry_run)
     log_info("pricing_runner.claim_due_tasks.done", claimed=len(tasks), dry_run=dry_run)
 
     semaphore = asyncio.Semaphore(config.concurrency)
     counts = {
+        "queued": queued,
         "claimed": len(tasks),
         "succeeded": 0,
         "manual_review": 0,
