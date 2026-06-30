@@ -59,6 +59,14 @@ COMMON_PRICING_PATHS = (
     "/pricing/",
     "/plans",
     "/plans/",
+    "/subscribe",
+    "/subscribe/",
+    "/subscription",
+    "/subscription/",
+    "/subscriptions",
+    "/subscriptions/",
+    "/upgrade",
+    "/upgrade/",
     "/pricing-page",
     "/pricing-plans",
     "/plans-pricing",
@@ -105,7 +113,18 @@ BAD_PRICING_PATH_PARTS = {
     "terms",
     "terms-of-use",
 }
-PRICING_PATH_PARTS = {"pricing", "prices", "plans", "pricing-plans", "plans-pricing", "billing"}
+PRICING_PATH_PARTS = {
+    "pricing",
+    "prices",
+    "plans",
+    "pricing-plans",
+    "plans-pricing",
+    "billing",
+    "subscribe",
+    "subscription",
+    "subscriptions",
+    "upgrade",
+}
 CONTACT_SALES_PATH_PARTS = {
     "book-a-demo",
     "book-a-demo-call",
@@ -218,6 +237,13 @@ class PricingTask:
     official_url: str
     attempts: int
     max_attempts: int
+
+
+@dataclass(frozen=True)
+class PricingSourceCandidate:
+    tool_id: int
+    canonical_slug: str
+    official_url: str
 
 
 @dataclass(frozen=True)
@@ -509,7 +535,7 @@ def is_pricing_path_part(part: str) -> bool:
 
 def is_pricing_fragment(fragment: str) -> bool:
     normalized = fragment.lower().strip()
-    return normalized in {"pricing", "plans", "price", "billing"} or "pricing" in normalized
+    return normalized in {"pricing", "plans", "price", "billing", "subscribe", "subscription"} or "pricing" in normalized
 
 
 def is_strict_pricing_url(value: str) -> bool:
@@ -557,7 +583,7 @@ def pricing_url_score(value: str) -> int:
             score += 100
         elif "pricing" in part:
             score += 85
-        elif part in {"plans", "billing", "upgrade"}:
+        elif part in {"plans", "billing", "upgrade", "subscribe", "subscription", "subscriptions"}:
             score += 55
         elif part in {"enterprise", "contact-sales", "contact"}:
             score -= 20
@@ -835,7 +861,7 @@ def decimal_value(value: Any) -> Decimal:
 
 
 def normalize_currency(value: str | None) -> str:
-    raw = (value or "$").upper().replace("US$", "USD").replace("$", "USD").replace("₹", "INR")
+    raw = (value or "$").upper().replace("US$", "USD").replace("$", "USD").replace("\u20b9", "INR")
     if raw in {"USD", "EUR", "GBP", "INR"}:
         return raw
     return "USD"
@@ -1011,7 +1037,7 @@ def should_verify_rule_pricing_with_openai(
                 reasons.append("long_price_context")
             if re.search(r"\b(raise[sd]?|funding|students?|graduates?|academy|this month only|additional cost|traditional)\b", lower):
                 reasons.append("polluted_price_context")
-            if "₹" in display_text and price.get("currency") != "INR":
+            if "\u20b9" in display_text and price.get("currency") != "INR":
                 reasons.append("currency_mismatch")
     if len(currencies) > 1:
         reasons.append("mixed_currencies")
@@ -3044,6 +3070,74 @@ class D1PricingStore:
     def __init__(self, d1: D1Client):
         self.d1 = d1
 
+    async def missing_source_candidates(self, limit: int) -> list[PricingSourceCandidate]:
+        rows = await self.d1.query(
+            """
+            SELECT
+              t.id AS tool_id,
+              t.canonical_slug,
+              t.official_url
+            FROM tools t
+            LEFT JOIN pricing_sources ps ON ps.tool_id = t.id
+            WHERE t.status = 'published'
+              AND t.duplicate_of_tool_id IS NULL
+              AND ps.id IS NULL
+              AND t.official_url IS NOT NULL
+              AND trim(t.official_url) <> ''
+            ORDER BY t.id
+            LIMIT ?
+            """,
+            [limit],
+        )
+        return [
+            PricingSourceCandidate(
+                tool_id=int(row["tool_id"]),
+                canonical_slug=str(row.get("canonical_slug") or ""),
+                official_url=str(row.get("official_url") or ""),
+            )
+            for row in rows
+        ]
+
+    async def insert_pricing_source(
+        self,
+        tool_id: int,
+        url: str,
+        discovery_method: str,
+        source_confidence: int,
+    ) -> None:
+        now = utc_now_iso()
+        await self.d1.run(
+            """
+            INSERT INTO pricing_sources (
+              tool_id,
+              url,
+              source_type,
+              scope,
+              locale,
+              region,
+              expected_currency,
+              fetch_mode,
+              discovery_method,
+              source_confidence,
+              is_active,
+              unchanged_runs,
+              next_run_at,
+              last_error,
+              created_at,
+              updated_at
+            )
+            VALUES (?, ?, 'marketing_pricing', 'individual', 'en-US', 'US', 'USD', 'static', ?, ?, 1, 0, NULL, NULL, ?, ?)
+            ON CONFLICT (tool_id, url, locale, region, scope) DO UPDATE SET
+              is_active = 1,
+              discovery_method = excluded.discovery_method,
+              source_confidence = excluded.source_confidence,
+              next_run_at = NULL,
+              last_error = NULL,
+              updated_at = ?
+            """,
+            [tool_id, url, discovery_method, source_confidence, now, now, now],
+        )
+
     async def queue_due_tasks(self, limit: int) -> int:
         now = utc_now_iso()
         rows = await self.d1.query(
@@ -3695,6 +3789,59 @@ async def run_openai_pricing_extraction(
     return payload, review_status, confidence, validation_errors, model_name
 
 
+async def discover_missing_pricing_sources(
+    store: D1PricingStore,
+    client: PricingClient,
+    limit: int,
+) -> int:
+    if limit <= 0:
+        return 0
+
+    created = 0
+    for candidate in await store.missing_source_candidates(limit):
+        task = PricingTask(
+            task_id=0,
+            pricing_source_id=0,
+            tool_id=candidate.tool_id,
+            canonical_slug=candidate.canonical_slug,
+            source_url=candidate.official_url,
+            official_url=candidate.official_url,
+            attempts=0,
+            max_attempts=1,
+        )
+        result = await client.choose_pricing_page(task)
+        text = parse_pricing_html(result.html).text if result.html else ""
+        text_score = pricing_text_quality(text)
+        if (
+            result.page_status == "found"
+            and result.status == 200
+            and is_strict_pricing_url(result.final_url)
+            and text_score > 0
+        ):
+            confidence = 70 if text_score >= 12 else 60
+            await store.insert_pricing_source(candidate.tool_id, result.final_url, "homepage_link", confidence)
+            created += 1
+            log_info(
+                "pricing_source.discovery.created",
+                tool_id=candidate.tool_id,
+                slug=candidate.canonical_slug,
+                url=result.final_url,
+                text_score=text_score,
+            )
+        else:
+            log_info(
+                "pricing_source.discovery.skipped",
+                tool_id=candidate.tool_id,
+                slug=candidate.canonical_slug,
+                final_url=result.final_url,
+                status=result.status,
+                page_status=result.page_status,
+                text_score=text_score,
+                error=(result.error or "")[:200],
+            )
+    return created
+
+
 def should_render_pricing_with_browser(
     result: PricingFetchResult,
     review_status: str,
@@ -4005,15 +4152,23 @@ async def run_pricing_once(
         timeout_seconds=config.browser_rendering_timeout_seconds if browser_renderer is not None else None,
     )
     queued = 0
+    discovered_sources = 0
     if not task_ids and not dry_run:
         queued = await store.queue_due_tasks(effective_limit)
         log_info("pricing_runner.queue_due_tasks.done", queued=queued)
+        if queued < effective_limit:
+            discovered_sources = await discover_missing_pricing_sources(store, client, effective_limit - queued)
+            log_info("pricing_runner.discover_missing_sources.done", discovered=discovered_sources)
+            if discovered_sources:
+                queued += await store.queue_due_tasks(effective_limit - queued)
+                log_info("pricing_runner.queue_discovered_tasks.done", queued=queued)
     tasks = await store.claim_due_tasks(effective_limit, task_ids=task_ids, claim=not dry_run)
     log_info("pricing_runner.claim_due_tasks.done", claimed=len(tasks), dry_run=dry_run)
 
     semaphore = asyncio.Semaphore(config.concurrency)
     counts = {
         "queued": queued,
+        "discovered_sources": discovered_sources,
         "claimed": len(tasks),
         "succeeded": 0,
         "manual_review": 0,
