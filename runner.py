@@ -30,6 +30,13 @@ except ImportError:
 
 
 SIMILARWEB_API_BASE = "https://data.similarweb.com/api/v1/data"
+SIMILARWEB_EXTENSION_UPDATE_URL = "https://clients2.google.com/service/update2/crx"
+SIMILARWEB_EXTENSION_ID = "hoklmmgfnpapgjgcpechhaamimifchmp"
+SIMILARWEB_EXTENSION_VERSION_FALLBACK = "6.12.21"
+SIMILARWEB_USER_AGENT = (
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
+)
 TRAFFIC_SOURCE = "similarweb"
 ASSET_SOURCE = "site_scraper"
 ASSET_DB_STORAGE_BUCKET = "sitesimgs"
@@ -1940,6 +1947,20 @@ def parse_monthly_rows(payload: dict[str, Any], domain: str, requested_month: st
     return monthly_rows
 
 
+async def fetch_similarweb_extension_version(timeout: float = 10.0) -> str | None:
+    params = {
+        "response": "updatecheck",
+        "prodversion": "120.0",
+        "acceptformat": "crx2,crx3",
+        "x": f"id={SIMILARWEB_EXTENSION_ID}&installsource=ondemand&uc",
+    }
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.get(SIMILARWEB_EXTENSION_UPDATE_URL, params=params)
+    response.raise_for_status()
+    match = re.search(r'<updatecheck[^>]*\bversion="([^"]+)"', response.text)
+    return match.group(1) if match else None
+
+
 class SimilarWebClient:
     def __init__(self, config: Config):
         self.proxy_host = config.brightdata_proxy_host
@@ -1947,6 +1968,7 @@ class SimilarWebClient:
         self.proxy_user = config.brightdata_proxy_user
         self.proxy_password = config.brightdata_proxy_password
         self.proxy_user_summary = mask_value(config.brightdata_proxy_user)
+        self.extension_version: str | None = None
         log_info(
             "similarweb.client.config",
             proxy_host=self.proxy_host,
@@ -1962,16 +1984,34 @@ class SimilarWebClient:
         username = f"{self.proxy_user}-session-{session_id}"
         return f"http://{username}:{self.proxy_password}@{self.proxy_host}:{self.proxy_port}"
 
+    async def get_extension_version(self) -> str:
+        if self.extension_version:
+            return self.extension_version
+        try:
+            version = await fetch_similarweb_extension_version()
+        except Exception as error:
+            log_error(
+                "similarweb.extension_version.fetch_error",
+                error_type=type(error).__name__,
+                error=str(error)[:500],
+            )
+            version = None
+        self.extension_version = version or SIMILARWEB_EXTENSION_VERSION_FALLBACK
+        return self.extension_version
+
     async def fetch(self, domain: str, requested_month: str) -> FetchResult:
         clean_domain = normalize_domain(domain)
         if not clean_domain:
             log_info("similarweb.invalid_domain", domain=domain, requested_month=requested_month)
             return FetchResult(status="failed", monthly_rows=[], error="invalid_domain")
 
+        extension_version = await self.get_extension_version()
         headers = {
+            "User-Agent": SIMILARWEB_USER_AGENT,
             "Accept": "application/json,text/plain,*/*",
             "Accept-Language": "en-US,en;q=0.9",
             "DNT": "1",
+            "X-Extension-Version": extension_version,
         }
         url = f"{SIMILARWEB_API_BASE}?domain={clean_domain}"
         log_info("similarweb.fetch.start", domain=clean_domain, requested_month=requested_month)
