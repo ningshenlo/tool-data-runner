@@ -732,6 +732,10 @@ def clean_key_features(value: Any) -> list[dict[str, str]]:
     return features
 
 
+def has_asset_enrichment_payload(result: AssetFetchResult) -> bool:
+    return bool(clean_asset_text(result.description, 500) or clean_key_features(result.key_features))
+
+
 def read_html_title(html_body: str) -> str:
     match = re.search(r"<title[^>]*>([\s\S]*?)</title>", html_body or "", re.I)
     return clean_asset_text(match.group(1), 120) if match else ""
@@ -2261,11 +2265,21 @@ class DomainStateClient:
             self.fetch_ahrefs_domain_rating(domain),
             self.fetch_domain_created_at(domain),
         )
+        domain_created_at = ahrefs_result.domain_created_at or whois_result.domain_created_at
+        if ahrefs_result.status == "done" or domain_created_at:
+            status = "done"
+            error = None
+        elif ahrefs_result.status == "no_data" or whois_result.status == "no_data":
+            status = "no_data"
+            error = ahrefs_result.error or whois_result.error
+        else:
+            status = "failed"
+            error = ahrefs_result.error or whois_result.error
         return DomainStateResult(
-            status=ahrefs_result.status,
+            status=status,
             domain_rating=ahrefs_result.domain_rating,
-            domain_created_at=ahrefs_result.domain_created_at or whois_result.domain_created_at,
-            error=ahrefs_result.error,
+            domain_created_at=domain_created_at,
+            error=error,
         )
 
     async def fetch_ahrefs_domain_rating(self, domain: str) -> DomainStateResult:
@@ -2730,6 +2744,29 @@ class D1AssetStore:
                     AND ta.asset_kind = 'favicon'
                     AND ta.is_current = 1
                 )
+                OR NOT EXISTS (
+                  SELECT 1
+                  FROM tool_localizations tl
+                  WHERE tl.tool_id = t.id
+                    AND tl.translation_status = 'published'
+                    AND tl.published_at IS NOT NULL
+                    AND trim(coalesce(tl.short_description, '')) <> ''
+                )
+                OR (
+                  NOT EXISTS (
+                    SELECT 1
+                    FROM tool_key_features tkf
+                    WHERE tkf.tool_id = t.id
+                  )
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM tool_localizations tl
+                    WHERE tl.tool_id = t.id
+                      AND tl.translation_status = 'published'
+                      AND tl.published_at IS NOT NULL
+                      AND json_array_length(coalesce(tl.feature_highlights, '[]')) > 0
+                  )
+                )
               )
               AND (
                 task.tool_id IS NULL
@@ -3058,6 +3095,54 @@ class D1AssetStore:
                 """,
                 [task.tool_id, feature["name"], feature["description"] or None, position, ASSET_SOURCE],
             )
+        feature_highlights = json.dumps(
+            [feature["name"] for feature in features],
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        await self.d1.run(
+            """
+            UPDATE tool_localizations
+            SET feature_highlights = CASE
+                  WHEN json_array_length(coalesce(feature_highlights, '[]')) = 0
+                  THEN ?
+                  ELSE feature_highlights
+                END,
+                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+            WHERE tool_id = ?
+            """,
+            [feature_highlights, task.tool_id],
+        )
+
+    async def has_tool_enrichment(self, tool_id: int) -> bool:
+        rows = await self.d1.query(
+            """
+            SELECT
+              CASE WHEN EXISTS (
+                SELECT 1
+                FROM tool_localizations tl
+                WHERE tl.tool_id = ?
+                  AND tl.translation_status = 'published'
+                  AND tl.published_at IS NOT NULL
+                  AND trim(coalesce(tl.short_description, '')) <> ''
+              ) THEN 1 ELSE 0 END AS has_description,
+              CASE WHEN EXISTS (
+                SELECT 1
+                FROM tool_key_features tkf
+                WHERE tkf.tool_id = ?
+              ) OR EXISTS (
+                SELECT 1
+                FROM tool_localizations tl
+                WHERE tl.tool_id = ?
+                  AND tl.translation_status = 'published'
+                  AND tl.published_at IS NOT NULL
+                  AND json_array_length(coalesce(tl.feature_highlights, '[]')) > 0
+              ) THEN 1 ELSE 0 END AS has_features
+            """,
+            [tool_id, tool_id, tool_id],
+        )
+        row = rows[0] if rows else {}
+        return bool(int(row.get("has_description") or 0) and int(row.get("has_features") or 0))
 
     async def save_tool_enrichment(self, task: AssetTask, result: AssetFetchResult) -> None:
         await self.save_tool_localization(task, result)
@@ -3364,7 +3449,7 @@ class D1DomainStateStore:
             )
             VALUES (?, ?, ?, ?, ?)
             ON CONFLICT (normalized_domain, source) DO UPDATE
-            SET domain_rating = excluded.domain_rating,
+            SET domain_rating = coalesce(excluded.domain_rating, domain_states.domain_rating),
                 last_crawled_at = excluded.last_crawled_at,
                 domain_created_at = coalesce(excluded.domain_created_at, domain_states.domain_created_at),
                 updated_at = ?
@@ -3965,6 +4050,43 @@ async def process_domain_state(
     return result.status
 
 
+async def run_domain_state_once(config: Config, limit: int | None = None) -> dict[str, int]:
+    effective_limit = limit or config.domain_state_limit
+    log_info("domain_state_runner.batch.start", limit=effective_limit, concurrency=config.concurrency)
+    d1 = D1Client(config)
+    store = D1DomainStateStore(d1)
+    client = DomainStateClient()
+    candidates = await store.get_due_candidates(effective_limit, config.domain_state_max_age_days)
+    log_info("domain_state_runner.get_due_candidates.done", candidates=len(candidates))
+
+    semaphore = asyncio.Semaphore(config.concurrency)
+    counts = {
+        "claimed": len(candidates),
+        "done": 0,
+        "no_data": 0,
+        "failed": 0,
+    }
+
+    async def guarded(candidate: DomainStateCandidate) -> None:
+        async with semaphore:
+            try:
+                status = await process_domain_state(candidate, client, store, config.max_retries)
+            except Exception as error:
+                status = "failed"
+                log_error(
+                    "domain_state.failed_with_exception",
+                    domain=candidate.normalized_domain,
+                    error=str(error)[:300],
+                )
+            counts[status] = counts.get(status, 0) + 1
+            log_info("domain_state.done", domain=candidate.normalized_domain, status=status)
+
+    if candidates:
+        await asyncio.gather(*(guarded(candidate) for candidate in candidates))
+
+    return counts
+
+
 async def fetch_favicon_asset(page_url: str, domain: str, html_body: str, favicon_href: str = "") -> FaviconAsset | None:
     favicon_url = urljoin(page_url, favicon_href) if favicon_href else extract_favicon_href(html_body, page_url)
     if not favicon_url:
@@ -4062,16 +4184,9 @@ async def process_asset_task(
                     None,
                 )
 
-            try:
-                await store.save_tool_enrichment(task, result)
-            except Exception as enrichment_error:
-                log_error(
-                    "asset_task.enrichment_failed",
-                    tool_id=task.tool_id,
-                    slug=task.canonical_slug,
-                    domain=task.normalized_domain,
-                    error=str(enrichment_error)[:300],
-                )
+            await store.save_tool_enrichment(task, result)
+            if not has_asset_enrichment_payload(result) and not await store.has_tool_enrichment(task.tool_id):
+                raise RuntimeError("asset enrichment returned no description or key features")
 
             await store.complete_task(task, "done")
             log_info(
@@ -4628,20 +4743,34 @@ async def run_pricing_loop(
         await asyncio.sleep(interval_seconds)
 
 
+async def run_domain_state_loop(config: Config, limit: int | None, interval_seconds: int) -> None:
+    log_info("domain_state_runner.loop.start", interval_seconds=interval_seconds)
+    while True:
+        try:
+            counts = await run_domain_state_once(config, limit)
+            log_info("domain_state_runner.batch.summary", **counts)
+        except Exception as error:
+            log_error("domain_state_runner.batch.failed", error=str(error)[:500])
+        await asyncio.sleep(interval_seconds)
+
+
 async def run_all_loop(config: Config, limit: int | None, interval_seconds: int, timeout_seconds: int | None) -> None:
     shared_interval = interval_seconds or 300
     assets_interval = max(60, shared_interval // 2)
     traffic_interval = shared_interval
+    domain_state_interval = max(900, shared_interval * 3)
     pricing_interval = max(900, shared_interval * 3)
     log_info(
         "all_runner.loop.start",
         assets_interval_seconds=assets_interval,
         traffic_interval_seconds=traffic_interval,
+        domain_state_interval_seconds=domain_state_interval,
         pricing_interval_seconds=pricing_interval,
     )
     await asyncio.gather(
         run_assets_loop(config, config.asset_limit, assets_interval),
         run_loop(config, limit or config.limit, traffic_interval),
+        run_domain_state_loop(config, config.domain_state_limit, domain_state_interval),
         run_pricing_loop(config, config.pricing_limit, pricing_interval, None, True, False, timeout_seconds),
     )
 
@@ -4653,7 +4782,8 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--loop", action="store_true", help="poll tasks forever")
     parser.add_argument("--pricing", action="store_true", help="process pricing_tasks instead of traffic_tasks")
     parser.add_argument("--assets", action="store_true", help="process asset_tasks instead of traffic_tasks")
-    parser.add_argument("--all", action="store_true", help="run traffic, pricing, and assets loops in one process")
+    parser.add_argument("--domain-state", action="store_true", help="process domain rating and whois creation date tasks")
+    parser.add_argument("--all", action="store_true", help="run traffic, domain-state, pricing, and assets loops in one process")
     parser.add_argument("--approve-pricing", action="store_true", help="write approved pricing extractions into active catalogs")
     parser.add_argument("--dry-run", action="store_true", help="for pricing mode, fetch and extract without D1 writes")
     parser.add_argument("--task-id", type=int, action="append", default=[], help="pricing task id to run; can be repeated")
@@ -4661,9 +4791,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--interval-seconds", type=int, default=None)
     args = parser.parse_args()
-    selected = [args.pricing, args.assets, args.all]
+    selected = [args.pricing, args.assets, args.domain_state, args.all]
     if sum(1 for value in selected if value) > 1:
-        parser.error("--pricing, --assets, and --all are mutually exclusive")
+        parser.error("--pricing, --assets, --domain-state, and --all are mutually exclusive")
     if args.all and not args.loop:
         parser.error("--all requires --loop")
     return args
@@ -4671,7 +4801,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
-    config = load_config(require_brightdata=not (args.pricing or args.assets))
+    config = load_config(require_brightdata=not (args.pricing or args.assets or args.domain_state))
     interval_seconds = args.interval_seconds or config.poll_interval_seconds
     if args.all:
         asyncio.run(run_all_loop(config, args.limit, args.interval_seconds, args.timeout))
@@ -4684,6 +4814,15 @@ def main() -> None:
 
         counts = asyncio.run(run_assets_once(config, args.limit))
         log_info("assets_runner.batch.summary", **counts)
+        return
+
+    if args.domain_state:
+        if args.loop:
+            asyncio.run(run_domain_state_loop(config, args.limit, interval_seconds))
+            return
+
+        counts = asyncio.run(run_domain_state_once(config, args.limit))
+        log_info("domain_state_runner.batch.summary", **counts)
         return
 
     if args.pricing:
