@@ -11,7 +11,9 @@ import re
 import string
 import sys
 import time
+import uuid
 import xml.etree.ElementTree as ET
+from contextlib import suppress
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
@@ -194,6 +196,10 @@ class Config:
     concurrency: int
     max_retries: int
     poll_interval_seconds: int
+    traffic_release_probe_domain: str
+    traffic_release_probe_start_day: int
+    traffic_release_probe_interval_seconds: int
+    traffic_release_queue_limit: int
     asset_limit: int
     domain_state_limit: int
     domain_state_max_age_days: int
@@ -211,6 +217,8 @@ class Config:
     r2_secret_access_key: str
     r2_bucket: str
     r2_public_base_url: str
+    runner_instance_id: str
+    runner_version: str
 
 
 @dataclass(frozen=True)
@@ -218,6 +226,9 @@ class TrafficTask:
     normalized_domain: str
     traffic_month: str
     attempts: int
+    max_attempts: int
+    generation: int
+    lease_token: str
 
 
 @dataclass(frozen=True)
@@ -227,11 +238,18 @@ class AssetTask:
     normalized_domain: str
     official_url: str
     attempts: int
+    max_attempts: int
+    generation: int
+    lease_token: str
 
 
 @dataclass(frozen=True)
-class DomainStateCandidate:
+class DomainStateTask:
     normalized_domain: str
+    attempts: int
+    max_attempts: int
+    generation: int
+    lease_token: str
 
 
 @dataclass(frozen=True)
@@ -244,6 +262,8 @@ class PricingTask:
     official_url: str
     attempts: int
     max_attempts: int
+    generation: int
+    lease_token: str
 
 
 @dataclass(frozen=True)
@@ -254,10 +274,33 @@ class PricingSourceCandidate:
 
 
 @dataclass(frozen=True)
+class ReviewedPricingExtraction:
+    extraction_id: int
+    pricing_task_id: int
+    pricing_source_id: int
+    tool_id: int
+    canonical_slug: str
+    source_url: str
+    final_url: str
+    http_status: int
+    content_type: str
+    payload: dict[str, Any]
+
+
+@dataclass(frozen=True)
 class FetchResult:
     status: str
     monthly_rows: list[dict[str, Any]]
     error: str | None = None
+    observed_latest_month: str | None = None
+
+
+@dataclass(frozen=True)
+class TrafficReleaseGateResult:
+    available: bool
+    status: str
+    probe_attempted: bool
+    observed_latest_month: str | None = None
 
 
 @dataclass(frozen=True)
@@ -375,6 +418,10 @@ def load_config(require_brightdata: bool = True) -> Config:
         concurrency=read_int_env("RUNNER_CONCURRENCY", 5),
         max_retries=read_int_env("RUNNER_MAX_RETRIES", 2),
         poll_interval_seconds=read_int_env("RUNNER_POLL_INTERVAL_SECONDS", 300),
+        traffic_release_probe_domain=normalize_domain(os.getenv("TRAFFIC_RELEASE_PROBE_DOMAIN", "chatgpt.com")) or "chatgpt.com",
+        traffic_release_probe_start_day=min(max(read_int_env("TRAFFIC_RELEASE_PROBE_START_DAY", 7), 1), 28),
+        traffic_release_probe_interval_seconds=max(900, read_int_env("TRAFFIC_RELEASE_PROBE_INTERVAL_SECONDS", 21600)),
+        traffic_release_queue_limit=max(1, read_int_env("TRAFFIC_RELEASE_QUEUE_LIMIT", 5000)),
         asset_limit=read_int_env("RUNNER_ASSET_LIMIT", 5),
         domain_state_limit=read_int_env("RUNNER_DOMAIN_STATE_LIMIT", 50),
         domain_state_max_age_days=read_int_env("RUNNER_DOMAIN_STATE_MAX_AGE_DAYS", 30),
@@ -392,6 +439,8 @@ def load_config(require_brightdata: bool = True) -> Config:
         r2_secret_access_key=os.getenv("CLOUDFLARE_R2_SECRET_ACCESS_KEY", ""),
         r2_bucket=os.getenv("CLOUDFLARE_R2_BUCKET", DEFAULT_R2_BUCKET),
         r2_public_base_url=os.getenv("R2_PUBLIC_BASE_URL", "").rstrip("/"),
+        runner_instance_id=os.getenv("RUNNER_INSTANCE_ID") or f"runner-{uuid.uuid4().hex[:16]}",
+        runner_version=os.getenv("RUNNER_VERSION", "dev"),
     )
 
 
@@ -2068,6 +2117,19 @@ def parse_monthly_rows(payload: dict[str, Any], domain: str, requested_month: st
     return monthly_rows
 
 
+def requested_month_has_traffic_data(rows: list[dict[str, Any]], requested_month: str) -> bool:
+    return any(
+        row.get("traffic_month") == requested_month
+        and (row.get("visits") is not None or row.get("global_rank") is not None)
+        for row in rows
+    )
+
+
+def latest_observed_traffic_month(rows: list[dict[str, Any]]) -> str | None:
+    months = [str(row.get("traffic_month") or "") for row in rows if row.get("traffic_month")]
+    return max(months) if months else None
+
+
 async def fetch_similarweb_extension_version(timeout: float = 10.0) -> str | None:
     params = {
         "response": "updatecheck",
@@ -2206,12 +2268,24 @@ class SimilarWebClient:
             return FetchResult(status="failed", monthly_rows=[], error="similarweb_invalid_json")
 
         monthly_rows = parse_monthly_rows(payload, clean_domain, requested_month)
-        has_data = any(row.get("visits") is not None for row in monthly_rows) or any(
-            row.get("global_rank") is not None for row in monthly_rows
+        observed_latest_month = latest_observed_traffic_month(monthly_rows)
+        has_requested_month = requested_month_has_traffic_data(monthly_rows, requested_month)
+        status = "done" if has_requested_month else "no_data"
+        error = None if has_requested_month else f"requested_month_unavailable:latest={observed_latest_month or 'none'}"
+        log_info(
+            "similarweb.fetch.parsed",
+            domain=clean_domain,
+            status=status,
+            requested_month=requested_month,
+            observed_latest_month=observed_latest_month,
+            monthly_rows=len(monthly_rows),
         )
-        status = "done" if has_data else "no_data"
-        log_info("similarweb.fetch.parsed", domain=clean_domain, status=status, monthly_rows=len(monthly_rows))
-        return FetchResult(status=status, monthly_rows=monthly_rows)
+        return FetchResult(
+            status=status,
+            monthly_rows=monthly_rows,
+            error=error,
+            observed_latest_month=observed_latest_month,
+        )
 
 
 def extract_rdap_created_at(payload: dict[str, Any]) -> str | None:
@@ -2539,21 +2613,69 @@ class D1Client:
             "Authorization": f"Bearer {config.cloudflare_api_token}",
             "Content-Type": "application/json",
         }
+        self.client = httpx.AsyncClient(timeout=30.0)
 
-    async def execute(self, sql: str, params: list[Any] | None = None) -> Any:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(self.url, headers=self.headers, json={"sql": sql, "params": params or []})
-        response.raise_for_status()
+    async def close(self) -> None:
+        await self.client.aclose()
+
+    async def __aenter__(self) -> "D1Client":
+        return self
+
+    async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
+        await self.close()
+
+    async def _request(self, body: dict[str, Any], retry_transient: bool = False) -> list[dict[str, Any]]:
+        response: httpx.Response | None = None
+        last_error: Exception | None = None
+        max_attempts = 4 if retry_transient else 1
+        for attempt in range(max_attempts):
+            try:
+                response = await self.client.post(self.url, headers=self.headers, json=body)
+                if response.status_code not in {429, 502, 503, 504}:
+                    response.raise_for_status()
+                    break
+                last_error = httpx.HTTPStatusError(
+                    f"D1 transient HTTP {response.status_code}",
+                    request=response.request,
+                    response=response,
+                )
+            except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as error:
+                last_error = error
+                if isinstance(error, httpx.HTTPStatusError) and error.response.status_code not in {429, 502, 503, 504}:
+                    raise
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(min(8.0, (2**attempt) + random.uniform(0.0, 0.5)))
+
+        if response is None or response.status_code in {429, 502, 503, 504}:
+            raise RuntimeError(f"D1 request failed after {max_attempts} attempt(s): {last_error}") from last_error
+
         payload = response.json()
         if not payload.get("success", False):
             raise RuntimeError(f"D1 query failed: {payload}")
         result = payload.get("result")
-        if isinstance(result, list):
-            first_result = result[0] if result else {}
-            if isinstance(first_result, dict) and not first_result.get("success", True):
+        results = result if isinstance(result, list) else [result or {}]
+        for query_result in results:
+            if isinstance(query_result, dict) and not query_result.get("success", True):
                 raise RuntimeError(f"D1 query failed: {payload}")
-            return first_result
-        return result or {}
+        return [query_result for query_result in results if isinstance(query_result, dict)]
+
+    async def execute(self, sql: str, params: list[Any] | None = None) -> Any:
+        normalized_sql = sql.lstrip().upper()
+        retry_transient = normalized_sql.startswith(("SELECT", "PRAGMA", "EXPLAIN"))
+        results = await self._request({"sql": sql, "params": params or []}, retry_transient=retry_transient)
+        return results[0] if results else {}
+
+    async def batch(self, statements: list[tuple[str, list[Any]]]) -> list[dict[str, Any]]:
+        if not statements:
+            return []
+        return await self._request(
+            {
+                "batch": [
+                    {"sql": sql, "params": params}
+                    for sql, params in statements
+                ]
+            }
+        )
 
     async def query(self, sql: str, params: list[Any] | None = None) -> list[dict[str, Any]]:
         result = await self.execute(sql, params)
@@ -2702,8 +2824,254 @@ class D1Client:
                         captured_at,
                         json.dumps(row, ensure_ascii=False),
                         captured_at,
-                    ],
-                )
+            ],
+        )
+
+
+class RunnerTelemetry:
+    WORKLOADS = ["assets", "traffic", "domain_state", "pricing", "enrichment"]
+
+    def __init__(self, d1: D1Client, config: Config):
+        self.d1 = d1
+        self.instance_id = config.runner_instance_id
+        self.version = config.runner_version
+
+    async def start(self, workload: str) -> int:
+        now = utc_now_iso()
+        await self.d1.run(
+            """
+            INSERT INTO runner_instances (
+              instance_id, service, version, status, workloads_json,
+              started_at, last_heartbeat_at, last_error, metadata_json, updated_at
+            )
+            VALUES (?, 'tool-data-runner', ?, 'healthy', ?, ?, ?, NULL, '{}', ?)
+            ON CONFLICT(instance_id) DO UPDATE SET
+              version = excluded.version,
+              workloads_json = excluded.workloads_json,
+              last_heartbeat_at = excluded.last_heartbeat_at,
+              stopped_at = NULL,
+              updated_at = excluded.updated_at
+            """,
+            [self.instance_id, self.version, json.dumps(self.WORKLOADS), now, now, now],
+        )
+        rows = await self.d1.query(
+            """
+            INSERT INTO runner_runs (instance_id, workload, status, started_at, counts_json)
+            VALUES (?, ?, 'running', ?, '{}')
+            RETURNING id
+            """,
+            [self.instance_id, workload, now],
+        )
+        if not rows:
+            raise RuntimeError("Runner telemetry did not return a run id")
+        return int(rows[0]["id"])
+
+    async def finish(self, run_id: int, counts: dict[str, int] | None = None, error: str | None = None) -> None:
+        now = utc_now_iso()
+        status = "failed" if error else "succeeded"
+        counts = counts or {}
+        counts_json = json.dumps(counts, sort_keys=True)
+        degraded_counts = {
+            key: int(counts.get(key) or 0)
+            for key in ("failed", "materialization_failed", "stale")
+            if int(counts.get(key) or 0) > 0
+        }
+        health_error = error
+        if not health_error and degraded_counts:
+            health_error = "Batch completed with " + ", ".join(
+                f"{key}={value}" for key, value in degraded_counts.items()
+            )
+        statements: list[tuple[str, list[Any]]] = [
+            (
+                """
+                UPDATE runner_runs
+                SET status = ?, finished_at = ?, counts_json = ?, error = ?
+                WHERE id = ? AND instance_id = ? AND status = 'running'
+                """,
+                [status, now, counts_json, error, run_id, self.instance_id],
+            ),
+            (
+                """
+                UPDATE runner_instances
+                SET status = CASE
+                      WHEN ? IS NOT NULL THEN 'degraded'
+                      WHEN EXISTS (
+                        SELECT 1
+                        FROM runner_runs latest
+                        WHERE latest.instance_id = ? AND latest.status = 'failed'
+                          AND latest.id = (
+                            SELECT max(candidate.id)
+                            FROM runner_runs candidate
+                            WHERE candidate.instance_id = latest.instance_id
+                              AND candidate.workload = latest.workload
+                          )
+                      ) THEN 'degraded'
+                      ELSE 'healthy'
+                    END,
+                    last_heartbeat_at = ?,
+                    last_success_at = CASE WHEN ? IS NULL THEN ? ELSE last_success_at END,
+                    last_error = CASE
+                      WHEN ? IS NOT NULL THEN ?
+                      WHEN EXISTS (
+                        SELECT 1
+                        FROM runner_runs latest
+                        WHERE latest.instance_id = ? AND latest.status = 'failed'
+                          AND latest.id = (
+                            SELECT max(candidate.id)
+                            FROM runner_runs candidate
+                            WHERE candidate.instance_id = latest.instance_id
+                              AND candidate.workload = latest.workload
+                          )
+                      ) THEN last_error
+                      ELSE NULL
+                    END,
+                    updated_at = ?
+                WHERE instance_id = ?
+                """,
+                [
+                    health_error,
+                    self.instance_id,
+                    now,
+                    health_error,
+                    now,
+                    health_error,
+                    health_error,
+                    self.instance_id,
+                    now,
+                    self.instance_id,
+                ],
+            ),
+        ]
+        await self.d1.batch(statements)
+
+    async def heartbeat(self) -> None:
+        now = utc_now_iso()
+        await self.d1.run(
+            """
+            UPDATE runner_instances
+            SET last_heartbeat_at = ?, updated_at = ?
+            WHERE instance_id = ?
+            """,
+            [now, now, self.instance_id],
+        )
+
+
+class D1EnrichmentStore:
+    def __init__(self, d1: D1Client):
+        self.d1 = d1
+
+    async def evaluate_tool(self, tool_id: int) -> str:
+        rows = await self.d1.query(
+            """
+            SELECT
+              t.id,
+              state.readiness AS previous_readiness,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM tool_assets a
+                WHERE a.tool_id = t.id AND a.asset_kind = 'screenshot' AND a.is_current = 1
+              ) THEN 1 ELSE 0 END AS has_screenshot,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM tool_assets a
+                WHERE a.tool_id = t.id AND a.asset_kind = 'favicon' AND a.is_current = 1
+              ) THEN 1 ELSE 0 END AS has_favicon,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM tool_localizations l
+                WHERE l.tool_id = t.id AND l.translation_status = 'published'
+                  AND l.published_at IS NOT NULL AND trim(l.name) <> ''
+                  AND trim(coalesce(l.short_description, '')) <> ''
+              ) THEN 1 ELSE 0 END AS has_localization,
+              CASE WHEN EXISTS (SELECT 1 FROM tool_key_features f WHERE f.tool_id = t.id)
+                     OR EXISTS (
+                       SELECT 1 FROM tool_localizations l
+                       WHERE l.tool_id = t.id AND l.translation_status = 'published'
+                         AND l.published_at IS NOT NULL
+                         AND json_array_length(coalesce(l.feature_highlights, '[]')) > 0
+                     ) THEN 1 ELSE 0 END AS has_features,
+              CASE WHEN t.primary_category_id IS NOT NULL
+                     OR EXISTS (SELECT 1 FROM tool_categories tc WHERE tc.tool_id = t.id)
+                   THEN 1 ELSE 0 END AS has_category,
+              CASE WHEN EXISTS (SELECT 1 FROM tool_sources s WHERE s.tool_id = t.id)
+                   THEN 1 ELSE 0 END AS has_source,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM tool_traffic_monthly tm WHERE tm.tool_id = t.id
+              ) THEN 1 ELSE 0 END AS has_traffic,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM domain_states ds
+                WHERE ds.normalized_domain = t.normalized_domain AND ds.source = ?
+                  AND ds.last_crawled_at IS NOT NULL
+              ) THEN 1 ELSE 0 END AS has_domain_state,
+              CASE WHEN t.pricing_model <> 'unknown' OR EXISTS (
+                SELECT 1 FROM pricing_sources ps
+                WHERE ps.tool_id = t.id AND ps.is_active = 1 AND ps.last_success_at IS NOT NULL
+              ) THEN 1 ELSE 0 END AS has_pricing
+            FROM tools t
+            LEFT JOIN tool_enrichment_states state ON state.tool_id = t.id
+            WHERE t.id = ?
+            LIMIT 1
+            """,
+            [DOMAIN_STATE_SOURCE, tool_id],
+        )
+        if not rows:
+            return "missing"
+        row = rows[0]
+        blocking = [
+            name
+            for name, column in (
+                ("screenshot", "has_screenshot"),
+                ("published_localization", "has_localization"),
+                ("key_feature", "has_features"),
+                ("category", "has_category"),
+                ("source_evidence", "has_source"),
+            )
+            if not int(row.get(column) or 0)
+        ]
+        warnings = [
+            name
+            for name, column in (
+                ("favicon", "has_favicon"),
+                ("traffic", "has_traffic"),
+                ("domain_state", "has_domain_state"),
+                ("pricing", "has_pricing"),
+            )
+            if not int(row.get(column) or 0)
+        ]
+        readiness = "ready" if not blocking else "blocked"
+        now = utc_now_iso()
+        transitioned_at = now if row.get("previous_readiness") != readiness else None
+        await self.d1.run(
+            """
+            INSERT INTO tool_enrichment_states (
+              tool_id, readiness, blocking_json, warnings_json, evaluated_at, transitioned_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(tool_id) DO UPDATE SET
+              readiness = excluded.readiness,
+              blocking_json = excluded.blocking_json,
+              warnings_json = excluded.warnings_json,
+              evaluated_at = excluded.evaluated_at,
+              transitioned_at = coalesce(excluded.transitioned_at, tool_enrichment_states.transitioned_at),
+              updated_at = excluded.updated_at
+            """,
+            [
+                tool_id,
+                readiness,
+                json.dumps(blocking, separators=(",", ":")),
+                json.dumps(warnings, separators=(",", ":")),
+                now,
+                transitioned_at,
+                now,
+            ],
+        )
+        if readiness == "ready":
+            await self.d1.run(
+                """
+                UPDATE tools
+                SET status = 'pending_review', updated_at = ?
+                WHERE id = ? AND status = 'pending_enrich'
+                """,
+                [now, tool_id],
+            )
+        return readiness
 
 
 class D1AssetStore:
@@ -2712,7 +3080,6 @@ class D1AssetStore:
 
     async def queue_missing_asset_tasks(self, limit: int) -> int:
         now = utc_now_iso()
-        stale_queued_before = iso_delta(hours=-1)
         stale_done_before = iso_delta(hours=-24)
         rows = await self.d1.query(
             """
@@ -2771,12 +3138,18 @@ class D1AssetStore:
               AND (
                 task.tool_id IS NULL
                 OR (
+                  task.dead_letter_at IS NULL
+                  AND
                   task.status IN ('failed', 'sync_failed')
+                  AND task.attempts < task.max_attempts
                   AND (task.next_retry_at IS NULL OR task.next_retry_at <= ?)
                 )
+                OR (task.status = 'queued' AND task.dead_letter_at IS NULL)
                 OR (
-                  task.status IN ('queued', 'processing')
-                  AND task.updated_at < ?
+                  task.status = 'processing'
+                  AND task.dead_letter_at IS NULL
+                  AND task.lease_expires_at IS NOT NULL
+                  AND task.lease_expires_at <= ?
                 )
                 OR (
                   task.status = 'done'
@@ -2786,7 +3159,7 @@ class D1AssetStore:
             ORDER BY t.id ASC
             LIMIT ?
             """,
-            [ASSET_SOURCE, ASSET_DB_STORAGE_BUCKET, now, stale_queued_before, stale_done_before, limit],
+            [ASSET_SOURCE, ASSET_DB_STORAGE_BUCKET, now, now, stale_done_before, limit],
         )
         queued = 0
         for row in rows:
@@ -2794,7 +3167,7 @@ class D1AssetStore:
             domain = str(row.get("normalized_domain") or "")
             if tool_id <= 0 or not domain:
                 continue
-            await self.d1.run(
+            meta = await self.d1.run(
                 """
                 INSERT INTO asset_tasks (
                   tool_id, normalized_domain, source, status, last_queued_at, next_retry_at, last_error
@@ -2803,31 +3176,41 @@ class D1AssetStore:
                 ON CONFLICT (tool_id, source) DO UPDATE
                 SET normalized_domain = excluded.normalized_domain,
                     status = excluded.status,
+                    attempts = 0,
+                    generation = asset_tasks.generation + 1,
                     last_queued_at = excluded.last_queued_at,
                     next_retry_at = NULL,
                     last_error = NULL,
+                    lease_owner = NULL,
+                    lease_token = NULL,
+                    lease_expires_at = NULL,
+                    dead_letter_at = NULL,
                     updated_at = excluded.last_queued_at
+                WHERE asset_tasks.status = 'done'
                 """,
                 [tool_id, domain, ASSET_SOURCE, now],
             )
-            queued += 1
+            queued += int(meta.get("changes") or 0)
         return queued
 
-    async def claim_due_tasks(self, limit: int) -> list[AssetTask]:
+    async def claim_due_tasks(self, limit: int, lease_owner: str) -> list[AssetTask]:
         now = utc_now_iso()
-        stale_processing_before = iso_delta(hours=-1)
-        next_retry_at = iso_delta(hours=1)
+        lease_expires_at = iso_delta(hours=1)
         rows = await self.d1.query(
             """
             SELECT
               task.tool_id,
               task.normalized_domain,
               task.attempts,
+              task.max_attempts,
+              task.generation,
               t.canonical_slug,
               t.official_url
             FROM asset_tasks task
             JOIN tools t ON t.id = task.tool_id
             WHERE task.source = ?
+              AND task.dead_letter_at IS NULL
+              AND task.attempts < task.max_attempts
               AND (
                 (
                   task.status IN ('queued', 'failed', 'sync_failed')
@@ -2835,13 +3218,14 @@ class D1AssetStore:
                 )
                 OR (
                   task.status = 'processing'
-                  AND task.updated_at < ?
+                  AND task.lease_expires_at IS NOT NULL
+                  AND task.lease_expires_at <= ?
                 )
               )
             ORDER BY coalesce(task.next_retry_at, ''), task.updated_at
             LIMIT ?
             """,
-            [ASSET_SOURCE, now, stale_processing_before, limit],
+            [ASSET_SOURCE, now, now, limit],
         )
 
         claimed: list[AssetTask] = []
@@ -2850,17 +3234,22 @@ class D1AssetStore:
             domain = str(row.get("normalized_domain") or "")
             if tool_id <= 0 or not domain:
                 continue
-            meta = await self.d1.run(
+            claimed_rows = await self.d1.query(
                 """
                 UPDATE asset_tasks
                 SET status = 'processing',
                     attempts = attempts + 1,
                     last_started_at = ?,
-                    next_retry_at = ?,
+                    next_retry_at = NULL,
                     last_error = NULL,
+                    lease_owner = ?,
+                    lease_token = lower(hex(randomblob(16))),
+                    lease_expires_at = ?,
                     updated_at = ?
                 WHERE tool_id = ?
                   AND source = ?
+                  AND dead_letter_at IS NULL
+                  AND attempts < max_attempts
                   AND (
                     (
                       status IN ('queued', 'failed', 'sync_failed')
@@ -2868,20 +3257,26 @@ class D1AssetStore:
                     )
                     OR (
                       status = 'processing'
-                      AND updated_at < ?
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at <= ?
                     )
                   )
+                RETURNING attempts, max_attempts, generation, lease_token
                 """,
-                [now, next_retry_at, now, tool_id, ASSET_SOURCE, now, stale_processing_before],
+                [now, lease_owner, lease_expires_at, now, tool_id, ASSET_SOURCE, now, now],
             )
-            if int(meta.get("changes") or 0) > 0:
+            if claimed_rows:
+                claimed_row = claimed_rows[0]
                 claimed.append(
                     AssetTask(
                         tool_id=tool_id,
                         canonical_slug=str(row.get("canonical_slug") or ""),
                         normalized_domain=domain,
                         official_url=str(row.get("official_url") or ""),
-                        attempts=int(row.get("attempts") or 0) + 1,
+                        attempts=int(claimed_row.get("attempts") or 0),
+                        max_attempts=int(claimed_row.get("max_attempts") or 5),
+                        generation=int(claimed_row.get("generation") or 1),
+                        lease_token=str(claimed_row.get("lease_token") or ""),
                     )
                 )
         return claimed
@@ -3149,28 +3544,164 @@ class D1AssetStore:
         await self.save_tool_categories(task, result)
         await self.save_tool_features(task, result)
 
-    async def complete_task(self, task: AssetTask, status: str, error: str | None = None) -> None:
+    async def renew_lease(self, task: AssetTask) -> bool:
+        meta = await self.d1.run(
+            """
+            UPDATE asset_tasks
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE tool_id = ? AND source = ? AND status = 'processing'
+              AND generation = ? AND lease_token = ?
+            """,
+            [iso_delta(hours=1), utc_now_iso(), task.tool_id, ASSET_SOURCE, task.generation, task.lease_token],
+        )
+        return int(meta.get("changes") or 0) > 0
+
+    async def complete_task(self, task: AssetTask, status: str, error: str | None = None) -> bool:
         now = utc_now_iso()
-        await self.d1.run(
+        exhausted = task.attempts >= task.max_attempts
+        meta = await self.d1.run(
             """
             UPDATE asset_tasks
             SET status = ?,
                 last_fetched_at = ?,
                 next_retry_at = ?,
                 last_error = ?,
+                dead_letter_at = ?,
+                last_completed_at = ?,
+                lease_owner = NULL,
+                lease_token = NULL,
+                lease_expires_at = NULL,
                 updated_at = ?
             WHERE tool_id = ?
               AND source = ?
+              AND status = 'processing'
+              AND generation = ?
+              AND lease_token = ?
             """,
             [
                 status,
                 now,
-                None if status == "done" else iso_delta(days=1),
+                None if status == "done" or exhausted else iso_delta(days=1),
                 (error or "")[:2000] or None,
+                now if status != "done" and exhausted else None,
+                now,
                 now,
                 task.tool_id,
                 ASSET_SOURCE,
+                task.generation,
+                task.lease_token,
             ],
+        )
+        return int(meta.get("changes") or 0) > 0
+
+
+def traffic_release_probe_window_open(config: Config, now: datetime | None = None) -> bool:
+    current = now or datetime.now(timezone.utc)
+    return current.day >= config.traffic_release_probe_start_day
+
+
+class D1TrafficReleaseStore:
+    def __init__(self, d1: D1Client):
+        self.d1 = d1
+
+    async def check_or_probe(
+        self,
+        traffic_month: str,
+        probe_domain: str,
+        probe_interval_seconds: int,
+        client: SimilarWebClient,
+    ) -> TrafficReleaseGateResult:
+        now = utc_now_iso()
+        rows = await self.d1.query(
+            """
+            SELECT status, observed_latest_month, next_check_at
+            FROM traffic_month_release_checks
+            WHERE source = ? AND traffic_month = ?
+            LIMIT 1
+            """,
+            [TRAFFIC_SOURCE, traffic_month],
+        )
+        existing = rows[0] if rows else None
+        if existing and existing.get("status") == "available":
+            return TrafficReleaseGateResult(
+                available=True,
+                status="available",
+                probe_attempted=False,
+                observed_latest_month=existing.get("observed_latest_month"),
+            )
+
+        next_check_at = str(existing.get("next_check_at") or "") if existing else ""
+        if next_check_at and next_check_at > now:
+            return TrafficReleaseGateResult(
+                available=False,
+                status=str(existing.get("status") or "unavailable"),
+                probe_attempted=False,
+                observed_latest_month=existing.get("observed_latest_month"),
+            )
+
+        result = await client.fetch(probe_domain, traffic_month)
+        available = result.status == "done" and requested_month_has_traffic_data(result.monthly_rows, traffic_month)
+        status = "available" if available else ("unavailable" if result.status == "no_data" else "error")
+        next_check = None if available else iso_delta(seconds=probe_interval_seconds)
+        error = None if available else (result.error or f"probe_status:{result.status}")
+        response_meta = json.dumps(
+            {
+                "probe_status": result.status,
+                "monthly_rows": len(result.monthly_rows),
+                "requested_month_present": requested_month_has_traffic_data(result.monthly_rows, traffic_month),
+            },
+            sort_keys=True,
+        )
+        await self.d1.run(
+            """
+            INSERT INTO traffic_month_release_checks (
+              source, traffic_month, status, probe_domain, observed_latest_month,
+              attempts, last_checked_at, next_check_at, available_at, last_error,
+              response_meta_json, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source, traffic_month) DO UPDATE SET
+              status = excluded.status,
+              probe_domain = excluded.probe_domain,
+              observed_latest_month = excluded.observed_latest_month,
+              attempts = traffic_month_release_checks.attempts + 1,
+              last_checked_at = excluded.last_checked_at,
+              next_check_at = excluded.next_check_at,
+              available_at = CASE
+                WHEN excluded.status = 'available' THEN coalesce(traffic_month_release_checks.available_at, excluded.available_at)
+                ELSE traffic_month_release_checks.available_at
+              END,
+              last_error = excluded.last_error,
+              response_meta_json = excluded.response_meta_json,
+              updated_at = excluded.updated_at
+            """,
+            [
+                TRAFFIC_SOURCE,
+                traffic_month,
+                status,
+                probe_domain,
+                result.observed_latest_month,
+                now,
+                next_check,
+                now if available else None,
+                error[:2000] if error else None,
+                response_meta,
+                now,
+            ],
+        )
+        log_info(
+            "traffic_release_gate.probe",
+            traffic_month=traffic_month,
+            probe_domain=probe_domain,
+            status=status,
+            observed_latest_month=result.observed_latest_month,
+            next_check_at=next_check,
+        )
+        return TrafficReleaseGateResult(
+            available=available,
+            status=status,
+            probe_attempted=True,
+            observed_latest_month=result.observed_latest_month,
         )
 
 
@@ -3180,7 +3711,6 @@ class D1TaskStore:
 
     async def queue_missing_traffic_tasks(self, limit: int, traffic_month: str) -> int:
         now = utc_now_iso()
-        stale_queued_before = iso_delta(hours=-1)
         candidates = await self.d1.query(
             """
             SELECT t.normalized_domain
@@ -3199,20 +3729,26 @@ class D1TaskStore:
               AND tm.traffic_month IS NULL
               AND (
                 task.normalized_domain IS NULL
+                OR task.status = 'done'
                 OR (
                   task.status IN ('failed', 'sync_failed')
+                  AND task.dead_letter_at IS NULL
+                  AND task.attempts < task.max_attempts
                   AND (task.next_retry_at IS NULL OR task.next_retry_at <= ?)
                 )
+                OR (task.status = 'queued' AND task.dead_letter_at IS NULL)
                 OR (
-                  task.status IN ('queued', 'processing')
-                  AND task.updated_at < ?
+                  task.status = 'processing'
+                  AND task.dead_letter_at IS NULL
+                  AND task.lease_expires_at IS NOT NULL
+                  AND task.lease_expires_at <= ?
                 )
               )
             GROUP BY t.normalized_domain
             ORDER BY min(coalesce(task.updated_at, '')) ASC, min(t.id) ASC
             LIMIT ?
             """,
-            [TRAFFIC_SOURCE, traffic_month, TRAFFIC_SOURCE, traffic_month, now, stale_queued_before, limit],
+            [TRAFFIC_SOURCE, traffic_month, TRAFFIC_SOURCE, traffic_month, now, now, limit],
         )
 
         queued = 0
@@ -3220,34 +3756,44 @@ class D1TaskStore:
             domain = str(candidate.get("normalized_domain") or "")
             if not domain:
                 continue
-            await self.d1.run(
+            meta = await self.d1.run(
                 """
                 INSERT INTO traffic_tasks (
                   normalized_domain, source, traffic_month, status, last_queued_at, next_retry_at, last_error
                 )
                 VALUES (?, ?, ?, 'queued', ?, NULL, NULL)
-                ON CONFLICT (normalized_domain, source, traffic_month) DO UPDATE
-                SET status = excluded.status,
-                    last_queued_at = excluded.last_queued_at,
-                    next_retry_at = excluded.next_retry_at,
-                    last_error = NULL,
-                    updated_at = excluded.last_queued_at
+                ON CONFLICT (normalized_domain, source, traffic_month) DO UPDATE SET
+                  status = 'queued',
+                  attempts = 0,
+                  generation = traffic_tasks.generation + 1,
+                  last_queued_at = excluded.last_queued_at,
+                  last_started_at = NULL,
+                  last_fetched_at = NULL,
+                  next_retry_at = NULL,
+                  last_error = 'Requeued because the monthly materialization is missing',
+                  lease_owner = NULL,
+                  lease_token = NULL,
+                  lease_expires_at = NULL,
+                  dead_letter_at = NULL,
+                  updated_at = excluded.last_queued_at
+                WHERE traffic_tasks.status = 'done'
                 """,
                 [domain, TRAFFIC_SOURCE, traffic_month, now],
             )
-            queued += 1
+            queued += int(meta.get("changes") or 0)
 
         return queued
 
-    async def claim_due_tasks(self, limit: int) -> list[TrafficTask]:
+    async def claim_due_tasks(self, limit: int, lease_owner: str) -> list[TrafficTask]:
         now = utc_now_iso()
-        stale_processing_before = iso_delta(hours=-1)
-        next_retry_at = iso_delta(hours=1)
+        lease_expires_at = iso_delta(hours=1)
         rows = await self.d1.query(
             """
-            SELECT normalized_domain, source, traffic_month, attempts
+            SELECT normalized_domain, source, traffic_month, attempts, max_attempts, generation
             FROM traffic_tasks
             WHERE source = ?
+              AND dead_letter_at IS NULL
+              AND attempts < max_attempts
               AND (
                 (
                   status IN ('queued', 'failed', 'sync_failed')
@@ -3255,13 +3801,14 @@ class D1TaskStore:
                 )
                 OR (
                   status = 'processing'
-                  AND updated_at < ?
+                  AND lease_expires_at IS NOT NULL
+                  AND lease_expires_at <= ?
                 )
               )
             ORDER BY coalesce(next_retry_at, ''), updated_at
             LIMIT ?
             """,
-            [TRAFFIC_SOURCE, now, stale_processing_before, limit],
+            [TRAFFIC_SOURCE, now, now, limit],
         )
 
         claimed: list[TrafficTask] = []
@@ -3271,18 +3818,23 @@ class D1TaskStore:
             if not domain or not traffic_month:
                 continue
 
-            meta = await self.d1.run(
+            claimed_rows = await self.d1.query(
                 """
                 UPDATE traffic_tasks
                 SET status = 'processing',
                     attempts = attempts + 1,
                     last_started_at = ?,
-                    next_retry_at = ?,
+                    next_retry_at = NULL,
                     last_error = NULL,
+                    lease_owner = ?,
+                    lease_token = lower(hex(randomblob(16))),
+                    lease_expires_at = ?,
                     updated_at = ?
                 WHERE normalized_domain = ?
                   AND source = ?
                   AND traffic_month = ?
+                  AND dead_letter_at IS NULL
+                  AND attempts < max_attempts
                   AND (
                     (
                       status IN ('queued', 'failed', 'sync_failed')
@@ -3290,64 +3842,100 @@ class D1TaskStore:
                     )
                     OR (
                       status = 'processing'
-                      AND updated_at < ?
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at <= ?
                     )
                   )
+                RETURNING attempts, max_attempts, generation, lease_token
                 """,
                 [
                     now,
-                    next_retry_at,
+                    lease_owner,
+                    lease_expires_at,
                     now,
                     domain,
                     TRAFFIC_SOURCE,
                     traffic_month,
                     now,
-                    stale_processing_before,
+                    now,
                 ],
             )
-            if int(meta.get("changes") or 0) > 0:
+            if claimed_rows:
+                claimed_row = claimed_rows[0]
                 claimed.append(
                     TrafficTask(
                         normalized_domain=domain,
                         traffic_month=traffic_month,
-                        attempts=int(row.get("attempts") or 0) + 1,
+                        attempts=int(claimed_row.get("attempts") or 0),
+                        max_attempts=int(claimed_row.get("max_attempts") or 5),
+                        generation=int(claimed_row.get("generation") or 1),
+                        lease_token=str(claimed_row.get("lease_token") or ""),
                     )
                 )
 
         return claimed
 
-    async def complete_task(self, task: TrafficTask, result: FetchResult) -> None:
+    async def renew_lease(self, task: TrafficTask) -> bool:
+        now = utc_now_iso()
+        meta = await self.d1.run(
+            """
+            UPDATE traffic_tasks
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE normalized_domain = ? AND source = ? AND traffic_month = ?
+              AND status = 'processing' AND generation = ? AND lease_token = ?
+            """,
+            [iso_delta(hours=1), now, task.normalized_domain, TRAFFIC_SOURCE, task.traffic_month, task.generation, task.lease_token],
+        )
+        return int(meta.get("changes") or 0) > 0
+
+    async def complete_task(self, task: TrafficTask, result: FetchResult) -> bool:
         retry_days = 1 if result.status == "failed" else None
         now = utc_now_iso()
+        exhausted = task.attempts >= task.max_attempts
         log_info(
             "d1.complete_task.start",
             domain=task.normalized_domain,
             traffic_month=task.traffic_month,
             status=result.status,
         )
-        await self.d1.run(
+        meta = await self.d1.run(
             """
             UPDATE traffic_tasks
             SET status = ?,
                 last_fetched_at = ?,
                 next_retry_at = ?,
                 last_error = ?,
+                dead_letter_at = ?,
+                last_completed_at = ?,
+                lease_owner = NULL,
+                lease_token = NULL,
+                lease_expires_at = NULL,
                 updated_at = ?
             WHERE normalized_domain = ?
               AND source = ?
               AND traffic_month = ?
+              AND status = 'processing'
+              AND generation = ?
+              AND lease_token = ?
             """,
             [
                 result.status,
                 now,
-                iso_delta(days=retry_days) if retry_days is not None else None,
+                iso_delta(days=retry_days) if retry_days is not None and not exhausted else None,
                 (result.error or "")[:2000] or None,
+                now if result.status == "failed" and exhausted else None,
+                now,
                 now,
                 task.normalized_domain,
                 TRAFFIC_SOURCE,
                 task.traffic_month,
+                task.generation,
+                task.lease_token,
             ],
         )
+        if int(meta.get("changes") or 0) == 0:
+            log_info("d1.complete_task.stale", domain=task.normalized_domain, traffic_month=task.traffic_month)
+            return False
         await self.update_tool_status(task.normalized_domain, result)
         log_info(
             "d1.complete_task.done",
@@ -3355,6 +3943,7 @@ class D1TaskStore:
             traffic_month=task.traffic_month,
             status=result.status,
         )
+        return True
 
     async def update_tool_status(self, domain: str, result: FetchResult) -> None:
         retry_days = 30
@@ -3405,64 +3994,221 @@ class D1DomainStateStore:
     def __init__(self, d1: D1Client):
         self.d1 = d1
 
-    async def get_due_candidates(self, limit: int, max_age_days: int) -> list[DomainStateCandidate]:
+    async def queue_due_tasks(self, limit: int, max_age_days: int) -> int:
         stale_before = iso_delta(days=-max_age_days)
         missing_created_at_before = iso_delta(days=-1)
-        rows = await self.d1.query(
-            """
-            SELECT t.normalized_domain
-            FROM tools t
-            LEFT JOIN domain_states ds
-              ON ds.normalized_domain = t.normalized_domain
-             AND ds.source = ?
-            WHERE t.status IN ('published', 'pending_enrich')
-              AND t.duplicate_of_tool_id IS NULL
-              AND trim(t.normalized_domain) <> ''
-              AND (
-                ds.last_crawled_at IS NULL
-                OR ds.last_crawled_at < ?
-                OR (
-                  ds.domain_created_at IS NULL
-                  AND ds.last_crawled_at < ?
-                )
-              )
-            GROUP BY t.normalized_domain
-            ORDER BY CASE WHEN min(ds.last_crawled_at) IS NULL THEN 0 ELSE 1 END,
-                     min(ds.last_crawled_at) ASC,
-                     t.normalized_domain ASC
-            LIMIT ?
-            """,
-            [DOMAIN_STATE_SOURCE, stale_before, missing_created_at_before, limit],
-        )
-        return [
-            DomainStateCandidate(normalized_domain=str(row.get("normalized_domain") or ""))
-            for row in rows
-            if row.get("normalized_domain")
-        ]
-
-    async def update_domain_state(self, domain: str, result: DomainStateResult) -> None:
         now = utc_now_iso()
-        await self.d1.run(
+        meta = await self.d1.run(
             """
-            INSERT INTO domain_states (
-              normalized_domain, source, domain_rating, last_crawled_at, domain_created_at
+            INSERT INTO domain_state_tasks (
+              normalized_domain, source, status, attempts, last_queued_at,
+              next_retry_at, last_error, created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT (normalized_domain, source) DO UPDATE
-            SET domain_rating = coalesce(excluded.domain_rating, domain_states.domain_rating),
-                last_crawled_at = excluded.last_crawled_at,
-                domain_created_at = coalesce(excluded.domain_created_at, domain_states.domain_created_at),
-                updated_at = ?
+            SELECT due.normalized_domain, ?, 'queued', 0, ?, NULL, NULL, ?, ?
+            FROM (
+              SELECT t.normalized_domain
+              FROM tools t
+              LEFT JOIN domain_states ds
+                ON ds.normalized_domain = t.normalized_domain
+               AND ds.source = ?
+              WHERE t.status IN ('published', 'pending_enrich')
+                AND t.duplicate_of_tool_id IS NULL
+                AND trim(t.normalized_domain) <> ''
+                AND (
+                  ds.last_crawled_at IS NULL
+                  OR ds.last_crawled_at < ?
+                  OR (
+                    ds.domain_created_at IS NULL
+                    AND ds.last_crawled_at < ?
+                  )
+                )
+              GROUP BY t.normalized_domain
+              ORDER BY CASE WHEN min(ds.last_crawled_at) IS NULL THEN 0 ELSE 1 END,
+                       min(ds.last_crawled_at) ASC,
+                       t.normalized_domain ASC
+              LIMIT ?
+            ) AS due
+            WHERE 1 = 1
+            ON CONFLICT(normalized_domain, source) DO UPDATE SET
+              status = 'queued',
+              attempts = 0,
+              generation = domain_state_tasks.generation + 1,
+              last_queued_at = excluded.last_queued_at,
+              next_retry_at = NULL,
+              last_error = NULL,
+              lease_owner = NULL,
+              lease_token = NULL,
+              lease_expires_at = NULL,
+              dead_letter_at = NULL,
+              updated_at = excluded.updated_at
+            WHERE domain_state_tasks.status IN ('done', 'no_data')
             """,
             [
-                domain,
                 DOMAIN_STATE_SOURCE,
-                result.domain_rating,
                 now,
-                result.domain_created_at,
                 now,
+                now,
+                DOMAIN_STATE_SOURCE,
+                stale_before,
+                missing_created_at_before,
+                limit,
             ],
         )
+        return int(meta.get("changes") or 0)
+
+    async def claim_due_tasks(self, limit: int, lease_owner: str) -> list[DomainStateTask]:
+        now = utc_now_iso()
+        lease_expires_at = iso_delta(minutes=15)
+        rows = await self.d1.query(
+            """
+            UPDATE domain_state_tasks
+            SET status = 'processing',
+                attempts = attempts + 1,
+                last_started_at = ?,
+                next_retry_at = NULL,
+                last_error = NULL,
+                lease_owner = ?,
+                lease_token = lower(hex(randomblob(16))),
+                lease_expires_at = ?,
+                updated_at = ?
+            WHERE rowid IN (
+              SELECT rowid
+              FROM domain_state_tasks
+              WHERE source = ?
+                AND dead_letter_at IS NULL
+                AND attempts < max_attempts
+                AND (
+                  (
+                    status IN ('queued', 'failed', 'sync_failed')
+                    AND (next_retry_at IS NULL OR next_retry_at <= ?)
+                  )
+                  OR (
+                    status = 'processing'
+                    AND lease_expires_at IS NOT NULL
+                    AND lease_expires_at <= ?
+                  )
+                )
+              ORDER BY coalesce(next_retry_at, ''), updated_at, normalized_domain
+              LIMIT ?
+            )
+            RETURNING normalized_domain, attempts, max_attempts, generation, lease_token
+            """,
+            [now, lease_owner, lease_expires_at, now, DOMAIN_STATE_SOURCE, now, now, limit],
+        )
+        return [
+            DomainStateTask(
+                normalized_domain=str(row.get("normalized_domain") or ""),
+                attempts=int(row.get("attempts") or 0),
+                max_attempts=int(row.get("max_attempts") or 5),
+                generation=int(row.get("generation") or 1),
+                lease_token=str(row.get("lease_token") or ""),
+            )
+            for row in rows
+            if row.get("normalized_domain") and row.get("lease_token")
+        ]
+
+    async def renew_lease(self, task: DomainStateTask) -> bool:
+        now = utc_now_iso()
+        meta = await self.d1.run(
+            """
+            UPDATE domain_state_tasks
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE normalized_domain = ? AND source = ? AND status = 'processing'
+              AND generation = ? AND lease_token = ?
+            """,
+            [iso_delta(minutes=15), now, task.normalized_domain, DOMAIN_STATE_SOURCE, task.generation, task.lease_token],
+        )
+        return int(meta.get("changes") or 0) > 0
+
+    async def complete_task(self, task: DomainStateTask, result: DomainStateResult) -> bool:
+        now = utc_now_iso()
+        if result.status in ("done", "no_data"):
+            batch_results = await self.d1.batch(
+                [
+                    (
+                        """
+                        INSERT INTO domain_states (
+                          normalized_domain, source, domain_rating, last_crawled_at, domain_created_at
+                        )
+                        SELECT ?, ?, ?, ?, ?
+                        WHERE EXISTS (
+                          SELECT 1 FROM domain_state_tasks
+                          WHERE normalized_domain = ? AND source = ?
+                            AND status = 'processing' AND generation = ? AND lease_token = ?
+                        )
+                        ON CONFLICT (normalized_domain, source) DO UPDATE SET
+                          domain_rating = coalesce(excluded.domain_rating, domain_states.domain_rating),
+                          last_crawled_at = excluded.last_crawled_at,
+                          domain_created_at = coalesce(excluded.domain_created_at, domain_states.domain_created_at),
+                          updated_at = ?
+                        """,
+                        [
+                            task.normalized_domain,
+                            DOMAIN_STATE_SOURCE,
+                            result.domain_rating,
+                            now,
+                            result.domain_created_at,
+                            task.normalized_domain,
+                            DOMAIN_STATE_SOURCE,
+                            task.generation,
+                            task.lease_token,
+                            now,
+                        ],
+                    ),
+                    (
+                        """
+                        UPDATE domain_state_tasks
+                        SET status = ?, last_fetched_at = ?, last_completed_at = ?,
+                            next_retry_at = NULL, last_error = NULL,
+                            lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
+                            updated_at = ?
+                        WHERE normalized_domain = ? AND source = ?
+                          AND status = 'processing' AND generation = ? AND lease_token = ?
+                        """,
+                        [
+                            result.status,
+                            now,
+                            now,
+                            now,
+                            task.normalized_domain,
+                            DOMAIN_STATE_SOURCE,
+                            task.generation,
+                            task.lease_token,
+                        ],
+                    ),
+                ]
+            )
+            task_meta = batch_results[-1].get("meta") if batch_results else {}
+            return int((task_meta or {}).get("changes") or 0) > 0
+
+        exhausted = task.attempts >= task.max_attempts
+        retry_minutes = min(60, 2 ** min(task.attempts, 6))
+        meta = await self.d1.run(
+            """
+            UPDATE domain_state_tasks
+            SET status = 'failed',
+                next_retry_at = ?,
+                last_error = ?,
+                dead_letter_at = ?,
+                lease_owner = NULL,
+                lease_token = NULL,
+                lease_expires_at = NULL,
+                updated_at = ?
+            WHERE normalized_domain = ? AND source = ?
+              AND status = 'processing' AND generation = ? AND lease_token = ?
+            """,
+            [
+                None if exhausted else iso_delta(minutes=retry_minutes),
+                (result.error or "Domain state fetch failed")[:2000],
+                now if exhausted else None,
+                now,
+                task.normalized_domain,
+                DOMAIN_STATE_SOURCE,
+                task.generation,
+                task.lease_token,
+            ],
+        )
+        return int(meta.get("changes") or 0) > 0
 
 
 class D1PricingStore:
@@ -3642,8 +4388,10 @@ class D1PricingStore:
         limit: int,
         task_ids: list[int] | None = None,
         claim: bool = True,
+        lease_owner: str = "tool-data-runner",
     ) -> list[PricingTask]:
         now = utc_now_iso()
+        lease_expires_at = iso_delta(hours=1)
         task_ids = task_ids or []
         params: list[Any]
         if task_ids:
@@ -3662,6 +4410,7 @@ class D1PricingStore:
               task.tool_id,
               task.attempts,
               task.max_attempts,
+              task.generation,
               t.canonical_slug,
               t.official_url,
               ps.url AS source_url
@@ -3686,12 +4435,14 @@ class D1PricingStore:
                 official_url=str(row.get("official_url") or ""),
                 attempts=int(row.get("attempts") or 0) + (1 if claim else 0),
                 max_attempts=int(row.get("max_attempts") or 3),
+                generation=int(row.get("generation") or 1),
+                lease_token="",
             )
             if not claim:
                 tasks.append(task)
                 continue
 
-            meta = await self.d1.run(
+            claimed_rows = await self.d1.query(
                 """
                 UPDATE pricing_tasks
                 SET status = 'running',
@@ -3699,15 +4450,47 @@ class D1PricingStore:
                     started_at = ?,
                     finished_at = NULL,
                     last_error = NULL,
+                    lease_owner = ?,
+                    lease_token = lower(hex(randomblob(16))),
+                    lease_expires_at = ?,
                     updated_at = ?
                 WHERE id = ?
                   AND status IN ('queued', 'manual_review', 'failed')
+                  AND dead_letter_at IS NULL
+                  AND attempts < max_attempts
+                RETURNING attempts, max_attempts, generation, lease_token
                 """,
-                [now, now, task.task_id],
+                [now, lease_owner, lease_expires_at, now, task.task_id],
             )
-            if int(meta.get("changes") or 0) > 0:
-                tasks.append(task)
+            if claimed_rows:
+                claimed_row = claimed_rows[0]
+                tasks.append(
+                    PricingTask(
+                        task_id=task.task_id,
+                        pricing_source_id=task.pricing_source_id,
+                        tool_id=task.tool_id,
+                        canonical_slug=task.canonical_slug,
+                        source_url=task.source_url,
+                        official_url=task.official_url,
+                        attempts=int(claimed_row.get("attempts") or 0),
+                        max_attempts=int(claimed_row.get("max_attempts") or task.max_attempts),
+                        generation=int(claimed_row.get("generation") or task.generation),
+                        lease_token=str(claimed_row.get("lease_token") or ""),
+                    )
+                )
         return tasks
+
+    async def renew_lease(self, task: PricingTask) -> bool:
+        now = utc_now_iso()
+        meta = await self.d1.run(
+            """
+            UPDATE pricing_tasks
+            SET lease_expires_at = ?, updated_at = ?
+            WHERE id = ? AND status = 'running' AND generation = ? AND lease_token = ?
+            """,
+            [iso_delta(hours=1), now, task.task_id, task.generation, task.lease_token],
+        )
+        return int(meta.get("changes") or 0) > 0
 
     async def insert_snapshot(self, task: PricingTask, result: PricingFetchResult) -> int:
         text = parse_pricing_html(result.html).text if result.html else ""
@@ -3936,19 +4719,41 @@ class D1PricingStore:
         status: str,
         error: str | None,
         result: PricingFetchResult | None,
-    ) -> None:
+    ) -> bool:
         now = utc_now_iso()
-        await self.d1.run(
+        exhausted = task.attempts >= task.max_attempts
+        meta = await self.d1.run(
             """
             UPDATE pricing_tasks
             SET status = ?,
                 last_error = ?,
                 finished_at = ?,
+                dead_letter_at = ?,
+                last_completed_at = ?,
+                lease_owner = NULL,
+                lease_token = NULL,
+                lease_expires_at = NULL,
                 updated_at = ?
             WHERE id = ?
+              AND status = 'running'
+              AND generation = ?
+              AND lease_token = ?
             """,
-            [status, (error or "")[:2000] or None, now, now, task.task_id],
+            [
+                status,
+                (error or "")[:2000] or None,
+                now,
+                now if status not in ("succeeded", "manual_review") and exhausted else None,
+                now,
+                now,
+                task.task_id,
+                task.generation,
+                task.lease_token,
+            ],
         )
+        if int(meta.get("changes") or 0) == 0:
+            log_info("pricing_task.stale_completion_ignored", task_id=task.task_id)
+            return False
         if status == "succeeded":
             await self.d1.run(
                 """
@@ -3969,17 +4774,180 @@ class D1PricingStore:
                     task.pricing_source_id,
                 ],
             )
-            return
+            return True
 
         await self.d1.run(
             """
             UPDATE pricing_sources
-            SET last_error = ?,
-                updated_at = ?
+            SET last_error = ?, updated_at = ?
             WHERE id = ?
             """,
             [(error or "")[:2000] or None, now, task.pricing_source_id],
         )
+        return True
+
+    async def claim_reviewed_extractions(self, limit: int = 20) -> list[ReviewedPricingExtraction]:
+        stale_before = iso_delta(hours=-1)
+        rows = await self.d1.query(
+            """
+            WITH latest_review AS (
+              SELECT extraction_id, max(id) AS review_id
+              FROM pricing_extraction_reviews
+              GROUP BY extraction_id
+            )
+            SELECT
+              extraction.id AS extraction_id,
+              snapshot.pricing_task_id,
+              snapshot.pricing_source_id,
+              task.tool_id,
+              tool.canonical_slug,
+              source.url AS source_url,
+              snapshot.final_url,
+              coalesce(snapshot.http_status, 0) AS http_status,
+              coalesce(snapshot.content_type, '') AS content_type,
+              extraction.raw_extraction_json
+            FROM latest_review latest
+            JOIN pricing_extraction_reviews review ON review.id = latest.review_id
+            JOIN pricing_extractions extraction ON extraction.id = latest.extraction_id
+            JOIN pricing_snapshots snapshot ON snapshot.id = extraction.snapshot_id
+            JOIN pricing_tasks task ON task.id = snapshot.pricing_task_id
+            JOIN pricing_sources source ON source.id = snapshot.pricing_source_id
+            JOIN tools tool ON tool.id = task.tool_id
+            LEFT JOIN pricing_extraction_materializations materialization
+              ON materialization.extraction_id = extraction.id
+            WHERE review.decision = 'approved'
+              AND extraction.review_status = 'approved'
+              AND (
+                materialization.extraction_id IS NULL
+                OR materialization.status = 'failed'
+                OR (materialization.status = 'running' AND materialization.started_at < ?)
+              )
+              AND coalesce(materialization.attempts, 0) < 5
+            ORDER BY review.id
+            LIMIT ?
+            """,
+            [stale_before, limit],
+        )
+        claimed: list[ReviewedPricingExtraction] = []
+        now = utc_now_iso()
+        for row in rows:
+            claimed_rows = await self.d1.query(
+                """
+                INSERT INTO pricing_extraction_materializations (
+                  extraction_id, status, attempts, started_at, finished_at, last_error, updated_at
+                )
+                VALUES (?, 'running', 1, ?, NULL, NULL, ?)
+                ON CONFLICT(extraction_id) DO UPDATE SET
+                  status = 'running',
+                  attempts = pricing_extraction_materializations.attempts + 1,
+                  started_at = excluded.started_at,
+                  finished_at = NULL,
+                  last_error = NULL,
+                  updated_at = excluded.updated_at
+                WHERE pricing_extraction_materializations.attempts < 5
+                  AND (
+                    pricing_extraction_materializations.status = 'failed'
+                    OR (
+                      pricing_extraction_materializations.status = 'running'
+                      AND pricing_extraction_materializations.started_at < ?
+                    )
+                  )
+                RETURNING extraction_id
+                """,
+                [int(row["extraction_id"]), now, now, stale_before],
+            )
+            if not claimed_rows:
+                continue
+            try:
+                payload = json.loads(str(row.get("raw_extraction_json") or "{}"))
+            except json.JSONDecodeError:
+                await self.fail_materialization(int(row["extraction_id"]), "Invalid extraction JSON")
+                continue
+            if not isinstance(payload, dict):
+                await self.fail_materialization(int(row["extraction_id"]), "Extraction JSON must be an object")
+                continue
+            claimed.append(
+                ReviewedPricingExtraction(
+                    extraction_id=int(row["extraction_id"]),
+                    pricing_task_id=int(row["pricing_task_id"]),
+                    pricing_source_id=int(row["pricing_source_id"]),
+                    tool_id=int(row["tool_id"]),
+                    canonical_slug=str(row.get("canonical_slug") or ""),
+                    source_url=str(row.get("source_url") or ""),
+                    final_url=str(row.get("final_url") or row.get("source_url") or ""),
+                    http_status=int(row.get("http_status") or 0),
+                    content_type=str(row.get("content_type") or ""),
+                    payload=payload,
+                )
+            )
+        return claimed
+
+    async def fail_materialization(self, extraction_id: int, error: str) -> None:
+        now = utc_now_iso()
+        await self.d1.run(
+            """
+            UPDATE pricing_extraction_materializations
+            SET status = 'failed', finished_at = ?, last_error = ?, updated_at = ?
+            WHERE extraction_id = ? AND status = 'running'
+            """,
+            [now, error[:2000], now, extraction_id],
+        )
+
+    async def materialize_reviewed_extraction(self, extraction: ReviewedPricingExtraction) -> int:
+        plans = list(extraction.payload.get("plans") or [])
+        if not plans:
+            raise RuntimeError("Approved extraction contains no pricing plans")
+        task = PricingTask(
+            task_id=extraction.pricing_task_id,
+            pricing_source_id=extraction.pricing_source_id,
+            tool_id=extraction.tool_id,
+            canonical_slug=extraction.canonical_slug,
+            source_url=extraction.source_url,
+            official_url=extraction.source_url,
+            attempts=0,
+            max_attempts=1,
+            generation=1,
+            lease_token="materializer",
+        )
+        result = PricingFetchResult(
+            url=extraction.source_url,
+            final_url=extraction.final_url,
+            status=extraction.http_status,
+            content_type=extraction.content_type,
+            html="",
+        )
+        version_id = await self.save_catalog(task, result, plans)
+        await self.update_summary(task, plans)
+        now = utc_now_iso()
+        await self.d1.batch(
+            [
+                (
+                    """
+                    UPDATE pricing_extraction_materializations
+                    SET status = 'succeeded', catalog_version_id = ?, finished_at = ?, last_error = NULL, updated_at = ?
+                    WHERE extraction_id = ? AND status = 'running'
+                    """,
+                    [version_id, now, now, extraction.extraction_id],
+                ),
+                (
+                    """
+                    UPDATE pricing_tasks
+                    SET status = 'succeeded', finished_at = ?, last_error = NULL, updated_at = ?
+                    WHERE id = ? AND status = 'manual_review'
+                    """,
+                    [now, now, extraction.pricing_task_id],
+                ),
+                (
+                    """
+                    UPDATE pricing_sources
+                    SET last_success_at = ?, next_run_at = ?, last_error = NULL, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    [now, iso_delta(days=30), now, extraction.pricing_source_id],
+                ),
+            ]
+        )
+        return version_id
 
 
 async def process_task(
@@ -4011,13 +4979,15 @@ async def process_task(
         if attempt < max_retries:
             await asyncio.sleep(random.uniform(1.0, 3.0))
 
+    if not await store.renew_lease(task):
+        return "stale"
     await d1.insert_result(task, result)
-    await store.complete_task(task, result)
-    return result.status
+    completed = await store.complete_task(task, result)
+    return result.status if completed else "stale"
 
 
 async def process_domain_state(
-    candidate: DomainStateCandidate,
+    task: DomainStateTask,
     client: DomainStateClient,
     store: D1DomainStateStore,
     max_retries: int,
@@ -4026,17 +4996,17 @@ async def process_domain_state(
     for attempt in range(max_retries + 1):
         log_info(
             "domain_state.fetch_attempt.start",
-            domain=candidate.normalized_domain,
+            domain=task.normalized_domain,
             attempt=attempt + 1,
             max_attempts=max_retries + 1,
         )
         try:
-            result = await client.fetch(candidate.normalized_domain)
+            result = await client.fetch(task.normalized_domain)
         except Exception as error:
             result = DomainStateResult(status="failed", domain_rating=None, domain_created_at=None, error=str(error)[:300])
         log_info(
             "domain_state.fetch_attempt.done",
-            domain=candidate.normalized_domain,
+            domain=task.normalized_domain,
             attempt=attempt + 1,
             status=result.status,
         )
@@ -4045,46 +5015,122 @@ async def process_domain_state(
         if attempt < max_retries:
             await asyncio.sleep(random.uniform(1.0, 3.0))
 
-    if result.status in ("done", "no_data"):
-        await store.update_domain_state(candidate.normalized_domain, result)
-    return result.status
+    if not await store.renew_lease(task):
+        return "stale"
+    completed = await store.complete_task(task, result)
+    return result.status if completed else "stale"
 
 
-async def run_domain_state_once(config: Config, limit: int | None = None) -> dict[str, int]:
+async def run_with_telemetry(
+    config: Config,
+    d1: D1Client,
+    workload: str,
+    operation: Any,
+) -> dict[str, int]:
+    telemetry = RunnerTelemetry(d1, config)
+    run_id = await telemetry.start(workload)
+    async def heartbeat_loop() -> None:
+        while True:
+            await asyncio.sleep(30)
+            try:
+                await telemetry.heartbeat()
+            except Exception as error:
+                log_error("runner.telemetry.heartbeat_failed", workload=workload, error=str(error)[:300])
+
+    heartbeat_task = asyncio.create_task(heartbeat_loop())
+    try:
+        counts = await operation()
+    except asyncio.CancelledError:
+        try:
+            await telemetry.finish(run_id, error="cancelled")
+        except Exception as telemetry_error:
+            log_error("runner.telemetry.cancel_finish_failed", workload=workload, error=str(telemetry_error)[:300])
+        raise
+    except Exception as error:
+        try:
+            await telemetry.finish(run_id, error=str(error)[:2000])
+        except Exception as telemetry_error:
+            log_error(
+                "runner.telemetry.finish_failed",
+                workload=workload,
+                run_id=run_id,
+                error=str(telemetry_error)[:300],
+            )
+        raise
+    finally:
+        heartbeat_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await heartbeat_task
+    await telemetry.finish(run_id, counts=counts)
+    return counts
+
+
+async def _run_domain_state_once(config: Config, d1: D1Client, limit: int | None = None) -> dict[str, int]:
     effective_limit = limit or config.domain_state_limit
     log_info("domain_state_runner.batch.start", limit=effective_limit, concurrency=config.concurrency)
-    d1 = D1Client(config)
     store = D1DomainStateStore(d1)
     client = DomainStateClient()
-    candidates = await store.get_due_candidates(effective_limit, config.domain_state_max_age_days)
-    log_info("domain_state_runner.get_due_candidates.done", candidates=len(candidates))
+    queued = await store.queue_due_tasks(effective_limit, config.domain_state_max_age_days)
+    log_info("domain_state_runner.queue_due_tasks.done", queued=queued)
+    tasks = await store.claim_due_tasks(effective_limit, config.runner_instance_id)
+    log_info("domain_state_runner.claim_due_tasks.done", claimed=len(tasks))
 
     semaphore = asyncio.Semaphore(config.concurrency)
     counts = {
-        "claimed": len(candidates),
+        "queued": queued,
+        "claimed": len(tasks),
         "done": 0,
         "no_data": 0,
         "failed": 0,
+        "stale": 0,
     }
 
-    async def guarded(candidate: DomainStateCandidate) -> None:
+    async def guarded(task: DomainStateTask) -> None:
         async with semaphore:
             try:
-                status = await process_domain_state(candidate, client, store, config.max_retries)
+                status = await process_domain_state(task, client, store, config.max_retries)
             except Exception as error:
                 status = "failed"
                 log_error(
                     "domain_state.failed_with_exception",
-                    domain=candidate.normalized_domain,
+                    domain=task.normalized_domain,
                     error=str(error)[:300],
                 )
+                try:
+                    completed = await store.complete_task(
+                        task,
+                        DomainStateResult(
+                            status="failed",
+                            domain_rating=None,
+                            domain_created_at=None,
+                            error=str(error)[:300],
+                        ),
+                    )
+                    if not completed:
+                        status = "stale"
+                except Exception as completion_error:
+                    log_error(
+                        "domain_state.complete_failed",
+                        domain=task.normalized_domain,
+                        error=str(completion_error)[:300],
+                    )
             counts[status] = counts.get(status, 0) + 1
-            log_info("domain_state.done", domain=candidate.normalized_domain, status=status)
+            log_info("domain_state.done", domain=task.normalized_domain, status=status)
 
-    if candidates:
-        await asyncio.gather(*(guarded(candidate) for candidate in candidates))
+    if tasks:
+        await asyncio.gather(*(guarded(task) for task in tasks))
 
     return counts
+
+
+async def run_domain_state_once(config: Config, limit: int | None = None) -> dict[str, int]:
+    async with D1Client(config) as d1:
+        return await run_with_telemetry(
+            config,
+            d1,
+            "domain_state",
+            lambda: _run_domain_state_once(config, d1, limit),
+        )
 
 
 async def fetch_favicon_asset(page_url: str, domain: str, html_body: str, favicon_href: str = "") -> FaviconAsset | None:
@@ -4159,6 +5205,8 @@ async def process_asset_task(
                 max_attempts=max_retries + 1,
             )
             result = await browser_client.fetch_homepage_asset(task, category_options)
+            if not await store.renew_lease(task):
+                return "stale"
             screenshot_key = f"{task.normalized_domain}/{int(time.time() * 1000)}.png"
             await uploader.put_object(screenshot_key, result.screenshot, "image/png")
             await store.upsert_tool_asset(
@@ -4184,11 +5232,14 @@ async def process_asset_task(
                     None,
                 )
 
+            if not await store.renew_lease(task):
+                return "stale"
             await store.save_tool_enrichment(task, result)
             if not has_asset_enrichment_payload(result) and not await store.has_tool_enrichment(task.tool_id):
                 raise RuntimeError("asset enrichment returned no description or key features")
 
-            await store.complete_task(task, "done")
+            if not await store.complete_task(task, "done"):
+                return "stale"
             log_info(
                 "asset_task.fetch_attempt.done",
                 tool_id=task.tool_id,
@@ -4212,8 +5263,8 @@ async def process_asset_task(
             if attempt < max_retries:
                 await asyncio.sleep(random.uniform(1.0, 3.0))
 
-    await store.complete_task(task, "failed", last_error)
-    return "failed"
+    completed = await store.complete_task(task, "failed", last_error)
+    return "failed" if completed else "stale"
 
 
 async def run_openai_pricing_extraction(
@@ -4291,6 +5342,8 @@ async def discover_missing_pricing_sources(
             official_url=candidate.official_url,
             attempts=0,
             max_attempts=1,
+            generation=1,
+            lease_token="",
         )
         result = await client.choose_pricing_page(task)
         text = parse_pricing_html(result.html).text if result.html else ""
@@ -4313,12 +5366,11 @@ async def discover_missing_pricing_sources(
             )
         else:
             skip_error = result.error or f"{result.page_status}: HTTP {result.status}; text_score={text_score}"
-            if result.status:
-                await store.mark_pricing_source_discovery_skipped(
-                    candidate.tool_id,
-                    result.final_url or candidate.official_url,
-                    skip_error,
-                )
+            await store.mark_pricing_source_discovery_skipped(
+                candidate.tool_id,
+                result.final_url or candidate.official_url,
+                skip_error,
+            )
             log_info(
                 "pricing_source.discovery.skipped",
                 tool_id=candidate.tool_id,
@@ -4477,6 +5529,8 @@ async def process_pricing_task(
         )
         return "dry_run"
 
+    if not await store.renew_lease(task):
+        return "stale"
     snapshot_id = await store.insert_snapshot(task, result)
     await store.insert_extraction(
         snapshot_id,
@@ -4489,29 +5543,30 @@ async def process_pricing_task(
     )
 
     if review_status == "approved":
+        if not await store.renew_lease(task):
+            return "stale"
         plans = list(payload.get("plans") or [])
         await store.save_catalog(task, result, plans)
         await store.update_summary(task, plans)
-        await store.finish_task(task, "succeeded", None, result)
-        return "succeeded"
+        completed = await store.finish_task(task, "succeeded", None, result)
+        return "succeeded" if completed else "stale"
 
     error = "; ".join(validation_errors)[:900] or result.error or "manual review"
-    await store.finish_task(task, "manual_review", error, result)
-    return "manual_review"
+    completed = await store.finish_task(task, "manual_review", error, result)
+    return "manual_review" if completed else "stale"
 
 
-async def run_assets_once(config: Config, limit: int | None = None) -> dict[str, int]:
+async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = None) -> dict[str, int]:
     effective_limit = limit or config.asset_limit
     log_info("assets_runner.batch.start", limit=effective_limit, concurrency=config.concurrency)
     browser_client = CloudflareBrowserRunAssetClient(config)
     uploader = R2AssetUploader(config)
     await uploader.check_access()
-    d1 = D1Client(config)
     store = D1AssetStore(d1)
     category_options = await store.category_options()
     queued = await store.queue_missing_asset_tasks(effective_limit)
     log_info("assets_runner.queue_missing_asset_tasks.done", queued=queued)
-    tasks = await store.claim_due_tasks(effective_limit)
+    tasks = await store.claim_due_tasks(effective_limit, config.runner_instance_id)
     log_info("assets_runner.claim_due_tasks.done", claimed=len(tasks))
 
     semaphore = asyncio.Semaphore(config.concurrency)
@@ -4520,6 +5575,9 @@ async def run_assets_once(config: Config, limit: int | None = None) -> dict[str,
         "claimed": len(tasks),
         "done": 0,
         "failed": 0,
+        "stale": 0,
+        "enrichment_ready": 0,
+        "enrichment_blocked": 0,
     }
 
     async def guarded(task: AssetTask) -> None:
@@ -4543,26 +5601,88 @@ async def run_assets_once(config: Config, limit: int | None = None) -> dict[str,
                     domain=task.normalized_domain,
                     error=str(error)[:300],
                 )
-                await store.complete_task(task, "failed", str(error)[:900])
+                if not await store.complete_task(task, "failed", str(error)[:900]):
+                    status = "stale"
             counts[status] = counts.get(status, 0) + 1
             log_info("asset_task.done", tool_id=task.tool_id, slug=task.canonical_slug, status=status)
 
     if tasks:
         await asyncio.gather(*(guarded(task) for task in tasks))
+        enrichment = D1EnrichmentStore(d1)
+        for tool_id in dict.fromkeys(task.tool_id for task in tasks):
+            readiness = await enrichment.evaluate_tool(tool_id)
+            if readiness in ("ready", "blocked"):
+                counts[f"enrichment_{readiness}"] += 1
 
     return counts
 
 
-async def run_once(config: Config, limit: int | None = None) -> dict[str, int]:
+async def run_assets_once(config: Config, limit: int | None = None) -> dict[str, int]:
+    async with D1Client(config) as d1:
+        return await run_with_telemetry(
+            config,
+            d1,
+            "assets",
+            lambda: _run_assets_once(config, d1, limit),
+        )
+
+
+async def _run_once(config: Config, d1: D1Client, limit: int | None = None) -> dict[str, int]:
     effective_limit = limit or config.limit
     log_info("runner.batch.start", limit=effective_limit, concurrency=config.concurrency)
-    d1 = D1Client(config)
     store = D1TaskStore(d1)
-    similarweb = SimilarWebClient(config)
     traffic_month = previous_traffic_month()
-    queued = await store.queue_missing_traffic_tasks(effective_limit, traffic_month)
+    if not traffic_release_probe_window_open(config):
+        log_info(
+            "traffic_release_gate.not_scheduled",
+            traffic_month=traffic_month,
+            probe_start_day=config.traffic_release_probe_start_day,
+        )
+        return {
+            "traffic_queued": 0,
+            "claimed": 0,
+            "done": 0,
+            "no_data": 0,
+            "forbidden": 0,
+            "failed": 0,
+            "stale": 0,
+            "release_available": 0,
+            "release_probe_attempted": 0,
+            "release_not_scheduled": 1,
+            "release_waiting": 0,
+        }
+
+    similarweb = SimilarWebClient(config)
+    release = await D1TrafficReleaseStore(d1).check_or_probe(
+        traffic_month,
+        config.traffic_release_probe_domain,
+        config.traffic_release_probe_interval_seconds,
+        similarweb,
+    )
+    if not release.available:
+        log_info(
+            "traffic_release_gate.blocked",
+            traffic_month=traffic_month,
+            status=release.status,
+            observed_latest_month=release.observed_latest_month,
+        )
+        return {
+            "traffic_queued": 0,
+            "claimed": 0,
+            "done": 0,
+            "no_data": 0,
+            "forbidden": 0,
+            "failed": 0,
+            "stale": 0,
+            "release_available": 0,
+            "release_probe_attempted": 1 if release.probe_attempted else 0,
+            "release_not_scheduled": 0,
+            "release_waiting": 0 if release.probe_attempted else 1,
+        }
+
+    queued = await store.queue_missing_traffic_tasks(config.traffic_release_queue_limit, traffic_month)
     log_info("runner.queue_missing_traffic_tasks.done", queued=queued, traffic_month=traffic_month)
-    tasks = await store.claim_due_tasks(effective_limit)
+    tasks = await store.claim_due_tasks(effective_limit, config.runner_instance_id)
     log_info("runner.claim_due_tasks.done", claimed=len(tasks))
 
     semaphore = asyncio.Semaphore(config.concurrency)
@@ -4573,6 +5693,11 @@ async def run_once(config: Config, limit: int | None = None) -> dict[str, int]:
         "no_data": 0,
         "forbidden": 0,
         "failed": 0,
+        "stale": 0,
+        "release_available": 1,
+        "release_probe_attempted": 1 if release.probe_attempted else 0,
+        "release_not_scheduled": 0,
+        "release_waiting": 0,
     }
 
     async def guarded(task: TrafficTask) -> None:
@@ -4588,7 +5713,8 @@ async def run_once(config: Config, limit: int | None = None) -> dict[str, int]:
                     traffic_month=task.traffic_month,
                     error=str(error)[:300],
                 )
-                await store.complete_task(task, FetchResult(status="failed", monthly_rows=[], error=str(error)[:300]))
+                if not await store.complete_task(task, FetchResult(status="failed", monthly_rows=[], error=str(error)[:300])):
+                    status = "stale"
             counts[status] = counts.get(status, 0) + 1
             log_info("task.done", domain=task.normalized_domain, traffic_month=task.traffic_month, status=status)
 
@@ -4598,8 +5724,19 @@ async def run_once(config: Config, limit: int | None = None) -> dict[str, int]:
     return counts
 
 
-async def run_pricing_once(
+async def run_once(config: Config, limit: int | None = None) -> dict[str, int]:
+    async with D1Client(config) as d1:
+        return await run_with_telemetry(
+            config,
+            d1,
+            "traffic",
+            lambda: _run_once(config, d1, limit),
+        )
+
+
+async def _run_pricing_once(
     config: Config,
+    d1: D1Client,
     limit: int | None = None,
     task_ids: list[int] | None = None,
     approve_pricing: bool = False,
@@ -4614,8 +5751,23 @@ async def run_pricing_once(
         dry_run=dry_run,
         approve_pricing=approve_pricing,
     )
-    d1 = D1Client(config)
     store = D1PricingStore(d1)
+    materialized = 0
+    materialization_failed = 0
+    if not dry_run:
+        reviewed_extractions = await store.claim_reviewed_extractions(effective_limit)
+        for extraction in reviewed_extractions:
+            try:
+                await store.materialize_reviewed_extraction(extraction)
+                materialized += 1
+            except Exception as error:
+                materialization_failed += 1
+                await store.fail_materialization(extraction.extraction_id, str(error))
+                log_error(
+                    "pricing_materialization.failed",
+                    extraction_id=extraction.extraction_id,
+                    error=str(error)[:300],
+                )
     client = PricingClient(timeout_seconds or config.pricing_timeout_seconds)
     openai_models: list[str] = []
     if config.openai_api_key:
@@ -4654,18 +5806,26 @@ async def run_pricing_once(
             if discovered_sources:
                 queued += await store.queue_due_tasks(effective_limit - queued)
                 log_info("pricing_runner.queue_discovered_tasks.done", queued=queued)
-    tasks = await store.claim_due_tasks(effective_limit, task_ids=task_ids, claim=not dry_run)
+    tasks = await store.claim_due_tasks(
+        effective_limit,
+        task_ids=task_ids,
+        claim=not dry_run,
+        lease_owner=config.runner_instance_id,
+    )
     log_info("pricing_runner.claim_due_tasks.done", claimed=len(tasks), dry_run=dry_run)
 
     semaphore = asyncio.Semaphore(config.concurrency)
     counts = {
         "queued": queued,
         "discovered_sources": discovered_sources,
+        "materialized": materialized,
+        "materialization_failed": materialization_failed,
         "claimed": len(tasks),
         "succeeded": 0,
         "manual_review": 0,
         "failed": 0,
         "dry_run": 0,
+        "stale": 0,
     }
 
     async def guarded(task: PricingTask) -> None:
@@ -4691,7 +5851,8 @@ async def run_pricing_once(
                     error=str(error)[:300],
                 )
                 if not dry_run:
-                    await store.finish_task(task, "manual_review", str(error)[:900], None)
+                    if not await store.finish_task(task, "manual_review", str(error)[:900], None):
+                        status = "stale"
             counts[status] = counts.get(status, 0) + 1
             log_info("pricing_task.done", task_id=task.task_id, slug=task.canonical_slug, status=status)
 
@@ -4699,6 +5860,41 @@ async def run_pricing_once(
         await asyncio.gather(*(guarded(task) for task in tasks))
 
     return counts
+
+
+async def run_pricing_once(
+    config: Config,
+    limit: int | None = None,
+    task_ids: list[int] | None = None,
+    approve_pricing: bool = False,
+    dry_run: bool = False,
+    timeout_seconds: int | None = None,
+) -> dict[str, int]:
+    async with D1Client(config) as d1:
+        if dry_run:
+            return await _run_pricing_once(
+                config,
+                d1,
+                limit,
+                task_ids=task_ids,
+                approve_pricing=False,
+                dry_run=True,
+                timeout_seconds=timeout_seconds,
+            )
+        return await run_with_telemetry(
+            config,
+            d1,
+            "pricing",
+            lambda: _run_pricing_once(
+                config,
+                d1,
+                limit,
+                task_ids=task_ids,
+                approve_pricing=approve_pricing,
+                dry_run=dry_run,
+                timeout_seconds=timeout_seconds,
+            ),
+        )
 
 
 async def run_assets_loop(config: Config, limit: int | None, interval_seconds: int) -> None:
@@ -4715,8 +5911,13 @@ async def run_assets_loop(config: Config, limit: int | None, interval_seconds: i
 async def run_loop(config: Config, limit: int | None, interval_seconds: int) -> None:
     log_info("runner.loop.start", interval_seconds=interval_seconds)
     while True:
-        counts = await run_once(config, limit)
-        log_info("runner.batch.summary", **counts)
+        try:
+            counts = await run_once(config, limit)
+            log_info("runner.batch.summary", **counts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log_error("runner.batch.failed", error=str(error)[:500])
         await asyncio.sleep(interval_seconds)
 
 
@@ -4731,15 +5932,20 @@ async def run_pricing_loop(
 ) -> None:
     log_info("pricing_runner.loop.start", interval_seconds=interval_seconds)
     while True:
-        counts = await run_pricing_once(
-            config,
-            limit,
-            task_ids=task_ids,
-            approve_pricing=approve_pricing,
-            dry_run=dry_run,
-            timeout_seconds=timeout_seconds,
-        )
-        log_info("pricing_runner.batch.summary", **counts)
+        try:
+            counts = await run_pricing_once(
+                config,
+                limit,
+                task_ids=task_ids,
+                approve_pricing=approve_pricing,
+                dry_run=dry_run,
+                timeout_seconds=timeout_seconds,
+            )
+            log_info("pricing_runner.batch.summary", **counts)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log_error("pricing_runner.batch.failed", error=str(error)[:500])
         await asyncio.sleep(interval_seconds)
 
 
@@ -4771,7 +5977,7 @@ async def run_all_loop(config: Config, limit: int | None, interval_seconds: int,
         run_assets_loop(config, config.asset_limit, assets_interval),
         run_loop(config, limit or config.limit, traffic_interval),
         run_domain_state_loop(config, config.domain_state_limit, domain_state_interval),
-        run_pricing_loop(config, config.pricing_limit, pricing_interval, None, True, False, timeout_seconds),
+        run_pricing_loop(config, config.pricing_limit, pricing_interval, None, False, False, timeout_seconds),
     )
 
 
@@ -4796,6 +6002,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("--pricing, --assets, --domain-state, and --all are mutually exclusive")
     if args.all and not args.loop:
         parser.error("--all requires --loop")
+    if args.approve_pricing:
+        parser.error("--approve-pricing is retired; approve the stored extraction in ainav Admin")
+    if (args.approve_pricing or args.task_id or args.dry_run) and not args.pricing:
+        parser.error("--approve-pricing, --task-id, and --dry-run require --pricing")
     return args
 
 
@@ -4804,7 +6014,7 @@ def main() -> None:
     config = load_config(require_brightdata=not (args.pricing or args.assets or args.domain_state))
     interval_seconds = args.interval_seconds or config.poll_interval_seconds
     if args.all:
-        asyncio.run(run_all_loop(config, args.limit, args.interval_seconds, args.timeout))
+        asyncio.run(run_all_loop(config, args.limit, interval_seconds, args.timeout))
         return
 
     if args.assets:
@@ -4819,7 +6029,7 @@ def main() -> None:
     if args.domain_state:
         if args.loop:
             asyncio.run(run_domain_state_loop(config, args.limit, interval_seconds))
-            return
+            return True
 
         counts = asyncio.run(run_domain_state_once(config, args.limit))
         log_info("domain_state_runner.batch.summary", **counts)
