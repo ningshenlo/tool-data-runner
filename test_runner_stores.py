@@ -66,8 +66,9 @@ class FakeD1:
         status: str,
         row: dict[str, Any],
         error: str | None,
+        raw_payload: dict[str, Any] | None = None,
     ) -> None:
-        await runner.D1Client.insert_snapshot(self, domain, task_month, status, row, error)
+        await runner.D1Client.insert_snapshot(self, domain, task_month, status, row, error, raw_payload)
 
     async def upsert_tool_traffic_monthly(self, domain: str, rows: list[dict[str, Any]]) -> None:
         await runner.D1Client.upsert_tool_traffic_monthly(self, domain, rows)
@@ -247,6 +248,56 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             [tool_id, traffic_month],
         ).fetchone()
         self.assertEqual(monthly["visits"], 1234)
+
+    async def test_similarweb_keywords_and_raw_payload_are_preserved(self) -> None:
+        tool_id = self.add_tool("traffic-keywords", status="published")
+        traffic_month = "2026-06-01"
+        store = runner.D1TaskStore(self.d1)
+        self.assertEqual(await store.queue_missing_traffic_tasks(10, traffic_month), 1)
+        task = (await store.claim_due_tasks(10, "traffic-worker"))[0]
+        raw_payload = {
+            "SiteName": "traffic-keywords.example",
+            "SnapshotDate": traffic_month,
+            "EstimatedMonthlyVisits": {traffic_month: 4321},
+            "TopKeywords": [
+                {"Name": "keyword one", "Volume": 1200, "EstimatedValue": 900, "Cpc": 1.25},
+                {"Name": "keyword two", "Volume": None, "EstimatedValue": 40, "Cpc": None},
+            ],
+        }
+        rows = runner.parse_monthly_rows(raw_payload, task.normalized_domain, traffic_month)
+        self.assertEqual(rows[0]["top_keywords"][0]["name"], "keyword one")
+        self.assertEqual(rows[0]["top_keywords"][0]["volume"], 1200)
+
+        result = runner.FetchResult(
+            status="done",
+            monthly_rows=rows,
+            observed_latest_month=traffic_month,
+            raw_payload=raw_payload,
+        )
+        await self.d1.insert_result(task, result)
+
+        monthly = self.connection.execute(
+            "SELECT raw_payload FROM tool_traffic_monthly WHERE tool_id = ? AND traffic_month = ?",
+            [tool_id, traffic_month],
+        ).fetchone()
+        self.assertIn('"top_keywords"', monthly["raw_payload"])
+        snapshot = self.connection.execute(
+            "SELECT raw_payload FROM domain_traffic_snapshots WHERE normalized_domain = ? ORDER BY id DESC LIMIT 1",
+            [task.normalized_domain],
+        ).fetchone()
+        self.assertIn('"TopKeywords"', snapshot["raw_payload"])
+
+        await self.d1.upsert_tool_traffic_monthly(
+            task.normalized_domain,
+            [{"traffic_month": traffic_month, "visits": 5000, "website": task.normalized_domain}],
+        )
+        preserved = self.connection.execute(
+            "SELECT visits, json_array_length(raw_payload, '$.top_keywords') AS keyword_count "
+            "FROM tool_traffic_monthly WHERE tool_id = ? AND traffic_month = ?",
+            [tool_id, traffic_month],
+        ).fetchone()
+        self.assertEqual(preserved["visits"], 5000)
+        self.assertEqual(preserved["keyword_count"], 2)
 
     async def test_done_traffic_task_without_materialization_starts_new_generation(self) -> None:
         self.add_tool("traffic-missing-materialization", status="published")

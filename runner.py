@@ -293,6 +293,7 @@ class FetchResult:
     monthly_rows: list[dict[str, Any]]
     error: str | None = None
     observed_latest_month: str | None = None
+    raw_payload: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -2075,6 +2076,29 @@ def parse_top_countries(payload: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def parse_top_keywords(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_keywords = payload.get("TopKeywords")
+    if not isinstance(raw_keywords, list):
+        return []
+
+    keywords: list[dict[str, Any]] = []
+    for raw_keyword in raw_keywords:
+        if not isinstance(raw_keyword, dict):
+            continue
+        name = str(raw_keyword.get("Name") or "").strip()
+        if not name:
+            continue
+        keywords.append(
+            {
+                "name": name,
+                "volume": to_integer(raw_keyword.get("Volume")),
+                "estimated_value": to_number(raw_keyword.get("EstimatedValue")),
+                "cpc": to_number(raw_keyword.get("Cpc")),
+            }
+        )
+    return keywords
+
+
 def parse_monthly_rows(payload: dict[str, Any], domain: str, requested_month: str) -> list[dict[str, Any]]:
     engagements = payload.get("Engagments") or {}
     estimated_visits = payload.get("EstimatedMonthlyVisits") or {}
@@ -2095,6 +2119,9 @@ def parse_monthly_rows(payload: dict[str, Any], domain: str, requested_month: st
         **parse_traffic_sources(payload),
         **parse_top_countries(payload),
     }
+    top_keywords = parse_top_keywords(payload)
+    if top_keywords:
+        base_fields["top_keywords"] = top_keywords
 
     monthly_rows: list[dict[str, Any]] = []
     if isinstance(estimated_visits, dict):
@@ -2285,6 +2312,7 @@ class SimilarWebClient:
             monthly_rows=monthly_rows,
             error=error,
             observed_latest_month=observed_latest_month,
+            raw_payload=payload,
         )
 
 
@@ -2689,7 +2717,15 @@ class D1Client:
             return result["meta"]
         return {}
 
-    async def insert_snapshot(self, domain: str, task_month: str, status: str, row: dict[str, Any], error: str | None) -> None:
+    async def insert_snapshot(
+        self,
+        domain: str,
+        task_month: str,
+        status: str,
+        row: dict[str, Any],
+        error: str | None,
+        raw_payload: dict[str, Any] | None = None,
+    ) -> None:
         await self.execute(
             """
             INSERT INTO domain_traffic_snapshots (
@@ -2700,11 +2736,11 @@ class D1Client:
               search_traffic_share, direct_traffic_share, referrals_traffic_share,
               top_country_1, top_country_1_traffic_share, top_country_2, top_country_2_traffic_share,
               top_country_3, top_country_3_traffic_share, top_country_4, top_country_4_traffic_share,
-              top_country_5, top_country_5_traffic_share, fetched_at, last_error
+              top_country_5, top_country_5_traffic_share, fetched_at, raw_payload, last_error
             )
             VALUES (
               ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-              CURRENT_TIMESTAMP, ?
+              CURRENT_TIMESTAMP, ?, ?
             )
             """,
             [
@@ -2739,6 +2775,7 @@ class D1Client:
                 row.get("top_country_4_traffic_share"),
                 row.get("top_country_5"),
                 row.get("top_country_5_traffic_share"),
+                json.dumps(raw_payload or {}, ensure_ascii=False),
                 error,
             ],
         )
@@ -2753,7 +2790,23 @@ class D1Client:
             rows=len(rows),
         )
         for row in rows:
-            await self.insert_snapshot(task.normalized_domain, task.traffic_month, result.status, row, result.error)
+            snapshot_payload = (
+                result.raw_payload
+                if result.raw_payload
+                and (
+                    row.get("traffic_month") == result.observed_latest_month
+                    or (len(rows) == 1 and result.observed_latest_month is None)
+                )
+                else None
+            )
+            await self.insert_snapshot(
+                task.normalized_domain,
+                task.traffic_month,
+                result.status,
+                row,
+                result.error,
+                snapshot_payload,
+            )
         if result.monthly_rows:
             await self.upsert_tool_traffic_monthly(task.normalized_domain, result.monthly_rows)
         log_info(
@@ -2806,7 +2859,7 @@ class D1Client:
                         pages_per_visit = excluded.pages_per_visit,
                         avg_visit_duration_seconds = excluded.avg_visit_duration_seconds,
                         captured_at = excluded.captured_at,
-                        raw_payload = excluded.raw_payload,
+                        raw_payload = json_patch(tool_traffic_monthly.raw_payload, excluded.raw_payload),
                         updated_at = ?
                     """,
                     [
