@@ -425,7 +425,7 @@ def load_config(require_brightdata: bool = True) -> Config:
         traffic_release_queue_limit=max(1, read_int_env("TRAFFIC_RELEASE_QUEUE_LIMIT", 5000)),
         asset_limit=read_int_env("RUNNER_ASSET_LIMIT", 5),
         domain_state_limit=read_int_env("RUNNER_DOMAIN_STATE_LIMIT", 50),
-        domain_state_max_age_days=read_int_env("RUNNER_DOMAIN_STATE_MAX_AGE_DAYS", 30),
+        domain_state_max_age_days=read_int_env("RUNNER_DOMAIN_STATE_MAX_AGE_DAYS", 15),
         pricing_limit=read_int_env("RUNNER_PRICING_LIMIT", 20),
         pricing_timeout_seconds=read_int_env("RUNNER_PRICING_TIMEOUT_SECONDS", 20),
         openai_api_key=os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API", ""),
@@ -780,10 +780,6 @@ def clean_key_features(value: Any) -> list[dict[str, str]]:
         if len(features) >= 6:
             break
     return features
-
-
-def has_asset_enrichment_payload(result: AssetFetchResult) -> bool:
-    return bool(clean_asset_text(result.description, 500) or clean_key_features(result.key_features))
 
 
 def read_html_title(html_body: str) -> str:
@@ -3126,6 +3122,28 @@ class D1EnrichmentStore:
             )
         return readiness
 
+    async def reconcile_pending_tools(self, limit: int) -> dict[str, int]:
+        rows = await self.d1.query(
+            """
+            SELECT t.id AS tool_id
+            FROM tools t
+            LEFT JOIN tool_enrichment_states state ON state.tool_id = t.id
+            WHERE t.status = 'pending_enrich'
+              AND t.duplicate_of_tool_id IS NULL
+            ORDER BY CASE WHEN state.evaluated_at IS NULL THEN 0 ELSE 1 END,
+                     state.evaluated_at,
+                     t.id
+            LIMIT ?
+            """,
+            [max(1, limit)],
+        )
+        counts = {"evaluated": 0, "ready": 0, "blocked": 0, "missing": 0}
+        for row in rows:
+            readiness = await self.evaluate_tool(int(row.get("tool_id") or 0))
+            counts["evaluated"] += 1
+            counts[readiness] = counts.get(readiness, 0) + 1
+        return counts
+
 
 class D1AssetStore:
     def __init__(self, d1: D1Client):
@@ -3585,12 +3603,22 @@ class D1AssetStore:
                   AND tl.translation_status = 'published'
                   AND tl.published_at IS NOT NULL
                   AND json_array_length(coalesce(tl.feature_highlights, '[]')) > 0
-              ) THEN 1 ELSE 0 END AS has_features
+              ) THEN 1 ELSE 0 END AS has_features,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM tools t
+                WHERE t.id = ? AND t.primary_category_id IS NOT NULL
+              ) OR EXISTS (
+                SELECT 1 FROM tool_categories tc WHERE tc.tool_id = ?
+              ) THEN 1 ELSE 0 END AS has_category
             """,
-            [tool_id, tool_id, tool_id],
+            [tool_id, tool_id, tool_id, tool_id, tool_id],
         )
         row = rows[0] if rows else {}
-        return bool(int(row.get("has_description") or 0) and int(row.get("has_features") or 0))
+        return bool(
+            int(row.get("has_description") or 0)
+            and int(row.get("has_features") or 0)
+            and int(row.get("has_category") or 0)
+        )
 
     async def save_tool_enrichment(self, task: AssetTask, result: AssetFetchResult) -> None:
         await self.save_tool_localization(task, result)
@@ -4049,7 +4077,6 @@ class D1DomainStateStore:
 
     async def queue_due_tasks(self, limit: int, max_age_days: int) -> int:
         stale_before = iso_delta(days=-max_age_days)
-        missing_created_at_before = iso_delta(days=-1)
         now = utc_now_iso()
         meta = await self.d1.run(
             """
@@ -4070,10 +4097,6 @@ class D1DomainStateStore:
                 AND (
                   ds.last_crawled_at IS NULL
                   OR ds.last_crawled_at < ?
-                  OR (
-                    ds.domain_created_at IS NULL
-                    AND ds.last_crawled_at < ?
-                  )
                 )
               GROUP BY t.normalized_domain
               ORDER BY CASE WHEN min(ds.last_crawled_at) IS NULL THEN 0 ELSE 1 END,
@@ -4103,7 +4126,6 @@ class D1DomainStateStore:
                 now,
                 DOMAIN_STATE_SOURCE,
                 stale_before,
-                missing_created_at_before,
                 limit,
             ],
         )
@@ -4176,7 +4198,39 @@ class D1DomainStateStore:
     async def complete_task(self, task: DomainStateTask, result: DomainStateResult) -> bool:
         now = utc_now_iso()
         if result.status in ("done", "no_data"):
-            batch_results = await self.d1.batch(
+            statements: list[tuple[str, list[Any]]] = []
+            if result.domain_rating is not None:
+                statements.append(
+                    (
+                        """
+                        INSERT INTO domain_rating_history (
+                          normalized_domain, source, observed_date, domain_rating, observed_at
+                        )
+                        SELECT ?, ?, substr(?, 1, 10), ?, ?
+                        WHERE EXISTS (
+                          SELECT 1 FROM domain_state_tasks
+                          WHERE normalized_domain = ? AND source = ?
+                            AND status = 'processing' AND generation = ? AND lease_token = ?
+                        )
+                        ON CONFLICT (normalized_domain, source, observed_date) DO UPDATE SET
+                          domain_rating = excluded.domain_rating,
+                          observed_at = excluded.observed_at,
+                          updated_at = excluded.observed_at
+                        """,
+                        [
+                            task.normalized_domain,
+                            DOMAIN_STATE_SOURCE,
+                            now,
+                            result.domain_rating,
+                            now,
+                            task.normalized_domain,
+                            DOMAIN_STATE_SOURCE,
+                            task.generation,
+                            task.lease_token,
+                        ],
+                    )
+                )
+            statements.extend(
                 [
                     (
                         """
@@ -4231,6 +4285,7 @@ class D1DomainStateStore:
                     ),
                 ]
             )
+            batch_results = await self.d1.batch(statements)
             task_meta = batch_results[-1].get("meta") if batch_results else {}
             return int((task_meta or {}).get("changes") or 0) > 0
 
@@ -4269,6 +4324,7 @@ class D1PricingStore:
         self.d1 = d1
 
     async def missing_source_candidates(self, limit: int) -> list[PricingSourceCandidate]:
+        now = utc_now_iso()
         rows = await self.d1.query(
             """
             SELECT
@@ -4276,16 +4332,30 @@ class D1PricingStore:
               t.canonical_slug,
               t.official_url
             FROM tools t
-            LEFT JOIN pricing_sources ps ON ps.tool_id = t.id
             WHERE t.status IN ('published', 'pending_enrich')
               AND t.duplicate_of_tool_id IS NULL
-              AND ps.id IS NULL
               AND t.official_url IS NOT NULL
               AND trim(t.official_url) <> ''
+              AND NOT EXISTS (
+                SELECT 1 FROM pricing_sources active_source
+                WHERE active_source.tool_id = t.id AND active_source.is_active = 1
+              )
+              AND (
+                NOT EXISTS (SELECT 1 FROM pricing_sources any_source WHERE any_source.tool_id = t.id)
+                OR EXISTS (
+                  SELECT 1 FROM pricing_sources retry_source
+                  WHERE retry_source.tool_id = t.id
+                    AND retry_source.is_active = 0
+                    AND retry_source.discovery_status IN ('retryable', 'not_found')
+                    AND retry_source.discovery_attempts < retry_source.discovery_max_attempts
+                    AND retry_source.next_discovery_at IS NOT NULL
+                    AND retry_source.next_discovery_at <= ?
+                )
+              )
             ORDER BY t.id
             LIMIT ?
             """,
-            [limit],
+            [now, limit],
         )
         return [
             PricingSourceCandidate(
@@ -4321,19 +4391,27 @@ class D1PricingStore:
               unchanged_runs,
               next_run_at,
               last_error,
+              discovery_status,
+              discovery_attempts,
+              last_discovery_at,
+              next_discovery_at,
               created_at,
               updated_at
             )
-            VALUES (?, ?, 'marketing_pricing', 'individual', 'en-US', 'US', 'USD', 'static', ?, ?, 1, 0, NULL, NULL, ?, ?)
+            VALUES (?, ?, 'marketing_pricing', 'individual', 'en-US', 'US', 'USD', 'static', ?, ?, 1, 0, NULL, NULL, 'found', 0, ?, NULL, ?, ?)
             ON CONFLICT (tool_id, url, locale, region, scope) DO UPDATE SET
               is_active = 1,
               discovery_method = excluded.discovery_method,
               source_confidence = excluded.source_confidence,
               next_run_at = NULL,
               last_error = NULL,
+              discovery_status = 'found',
+              discovery_attempts = 0,
+              last_discovery_at = excluded.last_discovery_at,
+              next_discovery_at = NULL,
               updated_at = ?
             """,
-            [tool_id, url, discovery_method, source_confidence, now, now, now],
+            [tool_id, url, discovery_method, source_confidence, now, now, now, now],
         )
 
     async def mark_pricing_source_discovery_skipped(
@@ -4341,11 +4419,14 @@ class D1PricingStore:
         tool_id: int,
         url: str,
         error: str,
+        retryable: bool,
     ) -> None:
         clean_url = (url or "").strip()
         if not clean_url:
             return
         now = utc_now_iso()
+        discovery_status = "retryable" if retryable else "not_found"
+        next_discovery_at = iso_delta(days=1 if retryable else 30)
         await self.d1.run(
             """
             INSERT INTO pricing_sources (
@@ -4363,18 +4444,44 @@ class D1PricingStore:
               unchanged_runs,
               next_run_at,
               last_error,
+              discovery_status,
+              discovery_attempts,
+              last_discovery_at,
+              next_discovery_at,
               created_at,
               updated_at
             )
-            VALUES (?, ?, 'marketing_pricing', 'individual', 'en-US', 'US', 'USD', 'static', 'homepage_link', 0, 0, 0, NULL, ?, ?, ?)
+            VALUES (?, ?, 'marketing_pricing', 'individual', 'en-US', 'US', 'USD', 'static', 'homepage_link', 0, 0, 0, NULL, ?, ?, 1, ?, ?, ?, ?)
             ON CONFLICT (tool_id, url, locale, region, scope) DO UPDATE SET
               is_active = 0,
               source_confidence = 0,
               next_run_at = NULL,
               last_error = excluded.last_error,
+              discovery_attempts = pricing_sources.discovery_attempts + 1,
+              discovery_status = CASE
+                WHEN pricing_sources.discovery_attempts + 1 >= pricing_sources.discovery_max_attempts
+                THEN 'exhausted'
+                ELSE excluded.discovery_status
+              END,
+              last_discovery_at = excluded.last_discovery_at,
+              next_discovery_at = CASE
+                WHEN pricing_sources.discovery_attempts + 1 >= pricing_sources.discovery_max_attempts
+                THEN NULL
+                ELSE excluded.next_discovery_at
+              END,
               updated_at = ?
             """,
-            [tool_id, clean_url, error[:2000], now, now, now],
+            [
+                tool_id,
+                clean_url,
+                error[:2000],
+                discovery_status,
+                now,
+                next_discovery_at,
+                now,
+                now,
+                now,
+            ],
         )
 
     async def queue_due_tasks(self, limit: int) -> int:
@@ -4396,14 +4503,10 @@ class D1PricingStore:
             WHERE ps.is_active = 1
               AND t.status IN ('published', 'pending_enrich')
               AND t.duplicate_of_tool_id IS NULL
-              AND (
-                ps.next_run_at IS NULL
-                OR ps.next_run_at <= ?
-                OR t.pricing_model = 'unknown'
-              )
+              AND (ps.next_run_at IS NULL OR ps.next_run_at <= ?)
               AND (
                 task.id IS NULL
-                OR task.status IN ('succeeded', 'failed')
+                OR task.status = 'succeeded'
               )
             ORDER BY coalesce(ps.next_run_at, ''), ps.id
             LIMIT ?
@@ -4452,8 +4555,19 @@ class D1PricingStore:
             where = f"task.id IN ({placeholders}) AND task.status IN ('queued', 'manual_review', 'failed')"
             params = [*task_ids, limit]
         else:
-            where = "task.status = 'queued' AND task.run_after <= ? AND task.attempts < task.max_attempts"
-            params = [now, limit]
+            where = """
+              task.dead_letter_at IS NULL
+              AND task.attempts < task.max_attempts
+              AND (
+                (task.status IN ('queued', 'failed') AND task.run_after <= ?)
+                OR (
+                  task.status = 'running'
+                  AND task.lease_expires_at IS NOT NULL
+                  AND task.lease_expires_at <= ?
+                )
+              )
+            """
+            params = [now, now, limit]
 
         rows = await self.d1.query(
             f"""
@@ -4508,12 +4622,20 @@ class D1PricingStore:
                     lease_expires_at = ?,
                     updated_at = ?
                 WHERE id = ?
-                  AND status IN ('queued', 'manual_review', 'failed')
                   AND dead_letter_at IS NULL
                   AND attempts < max_attempts
+                  AND (
+                    (? = 1 AND status IN ('queued', 'manual_review', 'failed'))
+                    OR (status IN ('queued', 'failed') AND run_after <= ?)
+                    OR (
+                      status = 'running'
+                      AND lease_expires_at IS NOT NULL
+                      AND lease_expires_at <= ?
+                    )
+                  )
                 RETURNING attempts, max_attempts, generation, lease_token
                 """,
-                [now, lease_owner, lease_expires_at, now, task.task_id],
+                [now, lease_owner, lease_expires_at, now, task.task_id, 1 if task_ids else 0, now, now],
             )
             if claimed_rows:
                 claimed_row = claimed_rows[0]
@@ -4780,6 +4902,7 @@ class D1PricingStore:
             UPDATE pricing_tasks
             SET status = ?,
                 last_error = ?,
+                run_after = ?,
                 finished_at = ?,
                 dead_letter_at = ?,
                 last_completed_at = ?,
@@ -4795,6 +4918,7 @@ class D1PricingStore:
             [
                 status,
                 (error or "")[:2000] or None,
+                iso_delta(hours=6) if status == "failed" and not exhausted else now,
                 now,
                 now if status not in ("succeeded", "manual_review") and exhausted else None,
                 now,
@@ -5288,8 +5412,8 @@ async def process_asset_task(
             if not await store.renew_lease(task):
                 return "stale"
             await store.save_tool_enrichment(task, result)
-            if not has_asset_enrichment_payload(result) and not await store.has_tool_enrichment(task.tool_id):
-                raise RuntimeError("asset enrichment returned no description or key features")
+            if not await store.has_tool_enrichment(task.tool_id):
+                raise RuntimeError("asset enrichment is missing a description, key features, or category")
 
             if not await store.complete_task(task, "done"):
                 return "stale"
@@ -5423,6 +5547,11 @@ async def discover_missing_pricing_sources(
                 candidate.tool_id,
                 result.final_url or candidate.official_url,
                 skip_error,
+                retryable=(
+                    result.status == 0
+                    or result.status in (408, 425, 429)
+                    or result.status >= 500
+                ),
             )
             log_info(
                 "pricing_source.discovery.skipped",
@@ -5631,6 +5760,7 @@ async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = Non
         "stale": 0,
         "enrichment_ready": 0,
         "enrichment_blocked": 0,
+        "enrichment_evaluated": 0,
     }
 
     async def guarded(task: AssetTask) -> None:
@@ -5659,13 +5789,18 @@ async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = Non
             counts[status] = counts.get(status, 0) + 1
             log_info("asset_task.done", tool_id=task.tool_id, slug=task.canonical_slug, status=status)
 
+    enrichment = D1EnrichmentStore(d1)
     if tasks:
         await asyncio.gather(*(guarded(task) for task in tasks))
-        enrichment = D1EnrichmentStore(d1)
         for tool_id in dict.fromkeys(task.tool_id for task in tasks):
             readiness = await enrichment.evaluate_tool(tool_id)
             if readiness in ("ready", "blocked"):
                 counts[f"enrichment_{readiness}"] += 1
+
+    reconciliation = await enrichment.reconcile_pending_tools(effective_limit)
+    counts["enrichment_evaluated"] += reconciliation["evaluated"]
+    counts["enrichment_ready"] += reconciliation["ready"]
+    counts["enrichment_blocked"] += reconciliation["blocked"]
 
     return counts
 

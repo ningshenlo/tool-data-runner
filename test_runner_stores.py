@@ -555,6 +555,55 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             [task.normalized_domain, runner.DOMAIN_STATE_SOURCE],
         ).fetchone()
         self.assertEqual(state["domain_rating"], 42.0)
+        history = self.connection.execute(
+            "SELECT domain_rating, observed_date FROM domain_rating_history "
+            "WHERE normalized_domain = ? AND source = ?",
+            [task.normalized_domain, runner.DOMAIN_STATE_SOURCE],
+        ).fetchall()
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["domain_rating"], 42.0)
+        self.assertEqual(len(history[0]["observed_date"]), 10)
+
+    async def test_similarweb_three_month_windows_accumulate_long_term_history(self) -> None:
+        tool_id = self.add_tool("traffic-history", status="published")
+        first_payload = {
+            "EstimatedMonthlyVisits": {
+                "2026-01-01": 100,
+                "2026-02-01": 200,
+                "2026-03-01": 300,
+            }
+        }
+        second_payload = {
+            "EstimatedMonthlyVisits": {
+                "2026-02-01": 220,
+                "2026-03-01": 330,
+                "2026-04-01": 400,
+            }
+        }
+
+        await self.d1.upsert_tool_traffic_monthly(
+            "traffic-history.example",
+            runner.parse_monthly_rows(first_payload, "traffic-history.example", "2026-03-01"),
+        )
+        await self.d1.upsert_tool_traffic_monthly(
+            "traffic-history.example",
+            runner.parse_monthly_rows(second_payload, "traffic-history.example", "2026-04-01"),
+        )
+
+        rows = self.connection.execute(
+            "SELECT traffic_month, visits FROM tool_traffic_monthly "
+            "WHERE tool_id = ? ORDER BY traffic_month",
+            [tool_id],
+        ).fetchall()
+        self.assertEqual(
+            [(row["traffic_month"], row["visits"]) for row in rows],
+            [
+                ("2026-01-01", 100),
+                ("2026-02-01", 220),
+                ("2026-03-01", 330),
+                ("2026-04-01", 400),
+            ],
+        )
 
     async def test_pricing_queue_claim_lease_complete(self) -> None:
         tool_id = self.add_tool("pricing-flow")
@@ -615,7 +664,7 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source["url"], "https://pricing-source-discovery.example/pricing")
         self.assertEqual(source["is_active"], 1)
 
-    async def test_failed_pricing_source_discovery_is_recorded_and_not_reprobed(self) -> None:
+    async def test_failed_pricing_source_discovery_retries_with_backoff_and_exhausts(self) -> None:
         tool_id = self.add_tool("pricing-source-unreachable", status="published")
         store = runner.D1PricingStore(self.d1)
 
@@ -635,13 +684,76 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(created, 0)
         source = self.connection.execute(
-            "SELECT is_active, source_confidence, last_error FROM pricing_sources WHERE tool_id = ?",
+            "SELECT is_active, source_confidence, last_error, discovery_status, discovery_attempts, next_discovery_at "
+            "FROM pricing_sources WHERE tool_id = ?",
             [tool_id],
         ).fetchone()
         self.assertEqual(source["is_active"], 0)
         self.assertEqual(source["source_confidence"], 0)
         self.assertEqual(source["last_error"], "connection failed")
+        self.assertEqual(source["discovery_status"], "retryable")
+        self.assertEqual(source["discovery_attempts"], 1)
+        self.assertTrue(source["next_discovery_at"])
         self.assertEqual(await store.missing_source_candidates(1), [])
+
+        self.connection.execute(
+            "UPDATE pricing_sources SET next_discovery_at = '2000-01-01T00:00:00Z' WHERE tool_id = ?",
+            [tool_id],
+        )
+        self.connection.commit()
+        self.assertEqual(len(await store.missing_source_candidates(1)), 1)
+
+        for _ in range(4):
+            await store.mark_pricing_source_discovery_skipped(
+                tool_id,
+                "https://pricing-source-unreachable.example",
+                "connection failed",
+                retryable=True,
+            )
+        source = self.connection.execute(
+            "SELECT discovery_status, discovery_attempts, next_discovery_at FROM pricing_sources WHERE tool_id = ?",
+            [tool_id],
+        ).fetchone()
+        self.assertEqual(source["discovery_status"], "exhausted")
+        self.assertEqual(source["discovery_attempts"], 5)
+        self.assertIsNone(source["next_discovery_at"])
+        self.assertEqual(await store.missing_source_candidates(1), [])
+
+    async def test_dead_letter_pricing_task_is_not_recreated(self) -> None:
+        tool_id = self.add_tool("pricing-dead-letter", status="published")
+        store = runner.D1PricingStore(self.d1)
+        await store.insert_pricing_source(tool_id, "https://pricing-dead-letter.example/pricing", "manual", 100)
+        self.assertEqual(await store.queue_due_tasks(10), 1)
+        self.connection.execute(
+            "UPDATE pricing_tasks SET status = 'failed', attempts = max_attempts, dead_letter_at = ? WHERE tool_id = ?",
+            [runner.utc_now_iso(), tool_id],
+        )
+        self.connection.commit()
+
+        self.assertEqual(await store.queue_due_tasks(10), 0)
+        task_count = self.connection.execute(
+            "SELECT count(*) AS total FROM pricing_tasks WHERE tool_id = ?",
+            [tool_id],
+        ).fetchone()["total"]
+        self.assertEqual(task_count, 1)
+
+    async def test_failed_pricing_task_retries_same_row_after_backoff(self) -> None:
+        tool_id = self.add_tool("pricing-bounded-retry", status="published")
+        store = runner.D1PricingStore(self.d1)
+        await store.insert_pricing_source(tool_id, "https://pricing-bounded-retry.example/pricing", "manual", 100)
+        self.assertEqual(await store.queue_due_tasks(10), 1)
+        first = (await store.claim_due_tasks(10, lease_owner="pricing-retry-one"))[0]
+        self.assertTrue(await store.finish_task(first, "failed", "temporary failure", None))
+        self.connection.execute(
+            "UPDATE pricing_tasks SET run_after = '2000-01-01T00:00:00Z' WHERE id = ?",
+            [first.task_id],
+        )
+        self.connection.commit()
+
+        self.assertEqual(await store.queue_due_tasks(10), 0)
+        second = (await store.claim_due_tasks(10, lease_owner="pricing-retry-two"))[0]
+        self.assertEqual(second.task_id, first.task_id)
+        self.assertEqual(second.attempts, 2)
 
     async def test_approved_pricing_review_materializes_once(self) -> None:
         tool_id = self.add_tool("pricing-review-flow")
@@ -781,6 +893,45 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertEqual(state["readiness"], "ready")
         self.assertEqual(state["blocking_json"], "[]")
+
+    async def test_enrichment_reconciliation_promotes_after_manual_category_fix(self) -> None:
+        tool_id = self.add_tool("enrichment-reconcile")
+        self.connection.execute(
+            """
+            INSERT INTO tool_assets (tool_id, asset_kind, storage_bucket, storage_object_path, is_current)
+            VALUES (?, 'screenshot', 'sitesimgs', 'enrichment-reconcile/screenshot.png', 1)
+            """,
+            [tool_id],
+        )
+        self.connection.execute(
+            """
+            INSERT INTO tool_localizations (
+              tool_id, locale_code, localized_slug, name, short_description,
+              feature_highlights, translation_status, published_at
+            ) VALUES (?, 'en', 'enrichment-reconcile', 'Reconcile', 'Complete description',
+                      '["Feature one"]', 'published', ?)
+            """,
+            [tool_id, runner.utc_now_iso()],
+        )
+        self.connection.execute(
+            "INSERT INTO tool_sources (tool_id, source_type, source_url, is_primary) "
+            "VALUES (?, 'official_site', 'https://enrichment-reconcile.example', 1)",
+            [tool_id],
+        )
+        self.connection.commit()
+        enrichment = runner.D1EnrichmentStore(self.d1)
+        self.assertEqual(await enrichment.evaluate_tool(tool_id), "blocked")
+
+        category_id = self.connection.execute(
+            "SELECT id FROM categories WHERE status = 'active' ORDER BY id LIMIT 1"
+        ).fetchone()["id"]
+        self.connection.execute("UPDATE tools SET primary_category_id = ? WHERE id = ?", [category_id, tool_id])
+        self.connection.commit()
+        counts = await enrichment.reconcile_pending_tools(10)
+
+        self.assertEqual(counts["ready"], 1)
+        tool = self.connection.execute("SELECT status FROM tools WHERE id = ?", [tool_id]).fetchone()
+        self.assertEqual(tool["status"], "pending_review")
 
     async def test_telemetry_marks_partial_failure_batch_degraded(self) -> None:
         class TelemetryConfig:

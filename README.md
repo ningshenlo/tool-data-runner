@@ -12,14 +12,14 @@ If static fetching and OpenAI still cannot produce trusted pricing from a likely
 
 Pricing extraction payloads include `final_pipeline_stage` for tracking the final path: `rule`, `openai`, `browser_run_rule`, `browser_run_openai`, `contact_sales`, `manual_review`, or `browser_run_manual_review`.
 
-Assets mode scans published tools missing a current screenshot or favicon, claims `asset_tasks`, captures homepage screenshots with Cloudflare Browser Run, uploads screenshots/favicons to R2, and writes `tool_assets` directly.
+Assets mode scans published and `pending_enrich` tools missing required catalog data, claims `asset_tasks`, captures homepage screenshots with Cloudflare Browser Run, uploads screenshots/favicons to R2, and writes assets, localization, categories, and key features. Every assets batch also reconciles `pending_enrich` readiness independently of whether an asset task was claimed, so manual fixes can advance a tool to `pending_review`.
 
 Domain-state mode queues stale or missing domains into `domain_state_tasks`, then claims them with expiring leases and fenced completion tokens before updating `domain_states`. Every workload writes D1-backed runner heartbeats and batch history to `runner_instances` and `runner_runs`.
 
 ## Setup
 
 ```bash
-cd traffic-runner
+cd tool-data-runner
 python -m venv .venv
 .\.venv\Scripts\pip install -r requirements.txt
 copy .env.example .env
