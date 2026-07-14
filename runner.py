@@ -2819,7 +2819,7 @@ class D1Client:
             SELECT id
             FROM tools
             WHERE normalized_domain = ?
-              AND status IN ('published', 'pending_enrich')
+              AND status IN ('published', 'pending_enrich', 'pending_review')
               AND duplicate_of_tool_id IS NULL
             """,
             [domain],
@@ -3122,15 +3122,16 @@ class D1EnrichmentStore:
             )
         return readiness
 
-    async def reconcile_pending_tools(self, limit: int) -> dict[str, int]:
+    async def reconcile_active_tools(self, limit: int) -> dict[str, int]:
         rows = await self.d1.query(
             """
             SELECT t.id AS tool_id
             FROM tools t
             LEFT JOIN tool_enrichment_states state ON state.tool_id = t.id
-            WHERE t.status = 'pending_enrich'
+            WHERE t.status IN ('pending_enrich', 'pending_review', 'published')
               AND t.duplicate_of_tool_id IS NULL
-            ORDER BY CASE WHEN state.evaluated_at IS NULL THEN 0 ELSE 1 END,
+            ORDER BY CASE WHEN t.status = 'pending_enrich' THEN 0 ELSE 1 END,
+                     CASE WHEN state.evaluated_at IS NULL THEN 0 ELSE 1 END,
                      state.evaluated_at,
                      t.id
             LIMIT ?
@@ -3143,6 +3144,10 @@ class D1EnrichmentStore:
             counts["evaluated"] += 1
             counts[readiness] = counts.get(readiness, 0) + 1
         return counts
+
+    async def reconcile_pending_tools(self, limit: int) -> dict[str, int]:
+        """Backward-compatible entrypoint for callers predating active-catalog reconciliation."""
+        return await self.reconcile_active_tools(limit)
 
 
 class D1AssetStore:
@@ -3163,7 +3168,7 @@ class D1AssetStore:
             LEFT JOIN asset_tasks task
               ON task.tool_id = t.id
              AND task.source = ?
-            WHERE t.status IN ('published', 'pending_enrich')
+            WHERE t.status IN ('published', 'pending_enrich', 'pending_review')
               AND t.duplicate_of_tool_id IS NULL
               AND trim(t.normalized_domain) <> ''
               AND (
@@ -3804,7 +3809,7 @@ class D1TaskStore:
               ON task.normalized_domain = t.normalized_domain
              AND task.source = ?
              AND task.traffic_month = ?
-            WHERE t.status IN ('published', 'pending_enrich')
+            WHERE t.status IN ('published', 'pending_enrich', 'pending_review')
               AND t.duplicate_of_tool_id IS NULL
               AND trim(t.normalized_domain) <> ''
               AND tm.traffic_month IS NULL
@@ -4049,7 +4054,7 @@ class D1TaskStore:
               ?
             FROM tools
             WHERE normalized_domain = ?
-              AND status IN ('published', 'pending_enrich')
+              AND status IN ('published', 'pending_enrich', 'pending_review')
               AND duplicate_of_tool_id IS NULL
             ON CONFLICT (tool_id, source) DO UPDATE
             SET normalized_domain = excluded.normalized_domain,
@@ -4091,7 +4096,7 @@ class D1DomainStateStore:
               LEFT JOIN domain_states ds
                 ON ds.normalized_domain = t.normalized_domain
                AND ds.source = ?
-              WHERE t.status IN ('published', 'pending_enrich')
+              WHERE t.status IN ('published', 'pending_enrich', 'pending_review')
                 AND t.duplicate_of_tool_id IS NULL
                 AND trim(t.normalized_domain) <> ''
                 AND (
@@ -4332,7 +4337,7 @@ class D1PricingStore:
               t.canonical_slug,
               t.official_url
             FROM tools t
-            WHERE t.status IN ('published', 'pending_enrich')
+            WHERE t.status IN ('published', 'pending_enrich', 'pending_review')
               AND t.duplicate_of_tool_id IS NULL
               AND t.official_url IS NOT NULL
               AND trim(t.official_url) <> ''
@@ -4501,7 +4506,7 @@ class D1PricingStore:
             LEFT JOIN latest_task lt ON lt.pricing_source_id = ps.id
             LEFT JOIN pricing_tasks task ON task.id = lt.task_id
             WHERE ps.is_active = 1
-              AND t.status IN ('published', 'pending_enrich')
+              AND t.status IN ('published', 'pending_enrich', 'pending_review')
               AND t.duplicate_of_tool_id IS NULL
               AND (ps.next_run_at IS NULL OR ps.next_run_at <= ?)
               AND (
@@ -5797,7 +5802,7 @@ async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = Non
             if readiness in ("ready", "blocked"):
                 counts[f"enrichment_{readiness}"] += 1
 
-    reconciliation = await enrichment.reconcile_pending_tools(effective_limit)
+    reconciliation = await enrichment.reconcile_active_tools(effective_limit)
     counts["enrichment_evaluated"] += reconciliation["evaluated"]
     counts["enrichment_ready"] += reconciliation["ready"]
     counts["enrichment_blocked"] += reconciliation["blocked"]

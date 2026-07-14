@@ -12,7 +12,7 @@ If static fetching and OpenAI still cannot produce trusted pricing from a likely
 
 Pricing extraction payloads include `final_pipeline_stage` for tracking the final path: `rule`, `openai`, `browser_run_rule`, `browser_run_openai`, `contact_sales`, `manual_review`, or `browser_run_manual_review`.
 
-Assets mode scans published and `pending_enrich` tools missing required catalog data, claims `asset_tasks`, captures homepage screenshots with Cloudflare Browser Run, uploads screenshots/favicons to R2, and writes assets, localization, categories, and key features. Every assets batch also reconciles `pending_enrich` readiness independently of whether an asset task was claimed, so manual fixes can advance a tool to `pending_review`.
+Assets mode scans active catalog tools (`pending_enrich`, `pending_review`, and `published`) missing required catalog data, claims `asset_tasks`, captures homepage screenshots with Cloudflare Browser Run, uploads screenshots/favicons to R2, and writes assets, localization, categories, and key features. Every assets batch also refreshes the canonical readiness projection for the active catalog independently of whether an asset task was claimed, so manual fixes can advance a `pending_enrich` tool to `pending_review` and published records retain current quality signals.
 
 Domain-state mode queues stale or missing domains into `domain_state_tasks`, then claims them with expiring leases and fenced completion tokens before updating `domain_states`. Every workload writes D1-backed runner heartbeats and batch history to `runner_instances` and `runner_runs`.
 
