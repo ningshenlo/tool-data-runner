@@ -77,6 +77,50 @@ class FakeD1:
         await runner.D1Client.insert_result(self, task, result)
 
 
+class AssetExtractionContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_browser_run_json_request_uses_current_json_schema_contract(self) -> None:
+        class RecordingClient(runner.CloudflareBrowserRunAssetClient):
+            def __init__(self) -> None:
+                self.timeout_seconds = 30
+                self.calls: list[tuple[str, dict[str, Any]]] = []
+
+            async def call_quick_action(self, endpoint: str, body: dict[str, Any]) -> Any:
+                self.calls.append((endpoint, body))
+                return {
+                    "title": "Example",
+                    "description": "Example description",
+                    "favicon_href": "",
+                    "category_l1": "image-processing",
+                    "category_l2": "image-editing",
+                    "key_features": [
+                        {"name": "Feature one", "description": "Description one"},
+                        {"name": "Feature two", "description": "Description two"},
+                        {"name": "Feature three", "description": "Description three"},
+                    ],
+                }
+
+        client = RecordingClient()
+        result = await client.fetch_homepage_metadata(
+            "https://example.com",
+            ["image-processing", "image-editing"],
+        )
+
+        self.assertEqual(result["category_l2"], "image-editing")
+        self.assertEqual(len(client.calls), 1)
+        endpoint, body = client.calls[0]
+        self.assertEqual(endpoint, "json")
+        response_format = body["response_format"]
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertNotIn("schema", response_format)
+        schema = response_format["json_schema"]
+        self.assertEqual(schema["properties"]["key_features"]["minItems"], 3)
+        self.assertEqual(schema["properties"]["key_features"]["maxItems"], 6)
+        self.assertEqual(
+            set(schema["required"]),
+            {"title", "description", "favicon_href", "category_l1", "category_l2", "key_features"},
+        )
+
+
 class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.connection = sqlite3.connect(":memory:")
@@ -135,6 +179,55 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await store.complete_task(task, "done")
         row = self.task_row("asset_tasks", "tool_id = ? AND source = ?", [tool_id, runner.ASSET_SOURCE])
         self.assert_completed_lease(row, "done")
+
+    async def test_asset_queue_includes_category_only_gap(self) -> None:
+        tool_id = self.add_tool("asset-category-gap")
+        self.connection.executemany(
+            """
+            INSERT INTO tool_assets (tool_id, asset_kind, storage_bucket, storage_object_path, is_current)
+            VALUES (?, ?, 'sitesimgs', ?, 1)
+            """,
+            [
+                [tool_id, "screenshot", "asset-category-gap/screenshot.png"],
+                [tool_id, "favicon", "asset-category-gap/favicon.png"],
+            ],
+        )
+        self.connection.execute(
+            """
+            INSERT INTO tool_localizations (
+              tool_id, locale_code, localized_slug, name, short_description,
+              feature_highlights, translation_status, published_at
+            ) VALUES (?, 'en', 'asset-category-gap', 'Category Gap', 'Complete description',
+                      '["Feature one"]', 'published', ?)
+            """,
+            [tool_id, runner.utc_now_iso()],
+        )
+        self.connection.commit()
+
+        queued = await runner.D1AssetStore(self.d1).queue_missing_asset_tasks(10)
+
+        self.assertEqual(queued, 1)
+        row = self.task_row("asset_tasks", "tool_id = ? AND source = ?", [tool_id, runner.ASSET_SOURCE])
+        self.assertEqual(row["status"], "queued")
+
+    async def test_non_retryable_asset_failure_is_dead_lettered_immediately(self) -> None:
+        tool_id = self.add_tool("asset-contract-error")
+        store = runner.D1AssetStore(self.d1)
+        self.assertEqual(await store.queue_missing_asset_tasks(10), 1)
+        task = (await store.claim_due_tasks(10, "asset-worker"))[0]
+
+        completed = await store.complete_task(
+            task,
+            "failed",
+            "browser_run_json_api_error: invalid schema",
+            retryable=False,
+        )
+
+        self.assertTrue(completed)
+        row = self.task_row("asset_tasks", "tool_id = ? AND source = ?", [tool_id, runner.ASSET_SOURCE])
+        self.assertEqual(row["status"], "failed")
+        self.assertIsNone(row["next_retry_at"])
+        self.assertTrue(row["dead_letter_at"])
 
     async def test_asset_failed_task_is_not_reset_or_revived_by_normal_queue(self) -> None:
         tool_id = self.add_tool("asset-failed")

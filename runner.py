@@ -323,6 +323,14 @@ class AssetFetchResult:
     category_l1: str = ""
     category_l2: str = ""
     key_features: list[dict[str, str]] | None = None
+    metadata_error: str = ""
+    metadata_retryable: bool = True
+
+
+class AssetPipelineError(RuntimeError):
+    def __init__(self, message: str, *, retryable: bool = True):
+        super().__init__(message)
+        self.retryable = retryable
 
 
 @dataclass(frozen=True)
@@ -1750,12 +1758,35 @@ class CloudflareBrowserRunAssetClient:
         except ValueError:
             parsed = None
         if response.status_code < 200 or response.status_code >= 300 or (isinstance(parsed, dict) and parsed.get("success") is False):
-            message = ""
+            messages: list[str] = []
             if isinstance(parsed, dict):
                 errors = parsed.get("errors")
                 if isinstance(errors, list):
-                    message = "; ".join(str(error.get("message") or "") for error in errors if isinstance(error, dict))
-            raise RuntimeError(message or text[:300] or f"HTTP {response.status_code}")
+                    for error in errors:
+                        if not isinstance(error, dict):
+                            continue
+                        code = error.get("code")
+                        message = str(error.get("message") or "").strip()
+                        if message and code is not None:
+                            messages.append(f"{code}: {message}")
+                        elif message:
+                            messages.append(message)
+                        elif code is not None:
+                            messages.append(f"code={code}")
+            detail = "; ".join(messages)
+            if not detail and parsed is not None:
+                detail = json.dumps(parsed, ensure_ascii=False, separators=(",", ":"))[:300]
+            if not detail:
+                detail = text[:300] or f"HTTP {response.status_code}"
+            retryable = (
+                response.status_code in (408, 425, 429)
+                or response.status_code >= 500
+                or (200 <= response.status_code < 300 and isinstance(parsed, dict) and parsed.get("success") is False)
+            )
+            raise AssetPipelineError(
+                f"browser_run_{endpoint}_api_error: {detail}",
+                retryable=retryable,
+            )
         return parsed.get("result") if isinstance(parsed, dict) and "result" in parsed else parsed
 
     async def fetch_homepage_metadata(self, target_url: str, category_options: list[str]) -> dict[str, Any]:
@@ -1767,13 +1798,14 @@ class CloudflareBrowserRunAssetClient:
                 "userAgent": random_pricing_user_agent(),
                 "prompt": (
                     "Extract the product title, short description, favicon href, 3 to 6 concrete product "
-                    "features, and the best category slugs for this AI tool. Use only category slugs from "
-                    f"this list when possible: {category_hint}. Return empty strings when unsure."
+                    "features, and the best category slugs for this AI tool. Category values must be exact "
+                    f"slugs from this list: {category_hint}. Return empty strings when unsure."
                 ),
                 "response_format": {
                     "type": "json_schema",
-                    "schema": {
+                    "json_schema": {
                         "type": "object",
+                        "additionalProperties": False,
                         "properties": {
                             "title": {"type": "string"},
                             "description": {"type": "string"},
@@ -1782,17 +1814,27 @@ class CloudflareBrowserRunAssetClient:
                             "category_l2": {"type": "string"},
                             "key_features": {
                                 "type": "array",
+                                "minItems": 3,
+                                "maxItems": 6,
                                 "items": {
                                     "type": "object",
+                                    "additionalProperties": False,
                                     "properties": {
                                         "name": {"type": "string"},
                                         "description": {"type": "string"},
                                     },
-                                    "required": ["name"],
+                                    "required": ["name", "description"],
                                 },
                             },
                         },
-                        "required": ["title", "description"],
+                        "required": [
+                            "title",
+                            "description",
+                            "favicon_href",
+                            "category_l1",
+                            "category_l2",
+                            "key_features",
+                        ],
                     },
                 },
                 "gotoOptions": {
@@ -1811,6 +1853,7 @@ class CloudflareBrowserRunAssetClient:
             candidates.append(f"http://{parsed.netloc}{parsed.path or '/'}")
 
         errors: list[str] = []
+        retryable_errors: list[bool] = []
         for target_url in candidates:
             payload = {
                 "url": target_url,
@@ -1833,10 +1876,14 @@ class CloudflareBrowserRunAssetClient:
                 screenshot = base64.b64decode(str(screenshot_raw), validate=False)
                 html_body = ""
                 metadata: dict[str, Any] = {}
+                metadata_error = ""
+                metadata_retryable = True
                 try:
                     metadata = await self.fetch_homepage_metadata(target_url, category_options)
-                except Exception as metadata_error:
-                    log_info("assets.browser_metadata.failed", url=target_url, error=str(metadata_error)[:300])
+                except Exception as error:
+                    metadata_error = str(error)[:500] or type(error).__name__
+                    metadata_retryable = bool(getattr(error, "retryable", True))
+                    log_info("assets.browser_metadata.failed", url=target_url, error=metadata_error[:300])
                     try:
                         content = await self.call_quick_action(
                             "content",
@@ -1856,6 +1903,30 @@ class CloudflareBrowserRunAssetClient:
                     html_body,
                     {"description", "og:description", "twitter:description"},
                 )
+                valid_categories = set(category_options)
+                extracted_category_l1 = clean_category_slug(metadata.get("category_l1"))
+                extracted_category_l2 = clean_category_slug(metadata.get("category_l2"))
+                category_l1 = extracted_category_l1 if extracted_category_l1 in valid_categories else ""
+                category_l2 = extracted_category_l2 if extracted_category_l2 in valid_categories else ""
+                key_features = clean_key_features(metadata.get("key_features"))
+                validation_errors: list[str] = []
+                if not key_features:
+                    validation_errors.append("features_empty")
+                if not category_l1 and not category_l2:
+                    rejected_categories = [
+                        slug
+                        for slug in (extracted_category_l1, extracted_category_l2)
+                        if slug and slug not in valid_categories
+                    ]
+                    validation_errors.append(
+                        "category_unmatched=" + ",".join(rejected_categories)
+                        if rejected_categories
+                        else "category_empty"
+                    )
+                if validation_errors:
+                    metadata_error = "; ".join(
+                        value for value in (metadata_error, *validation_errors) if value
+                    )[:500]
                 return AssetFetchResult(
                     final_url=target_url,
                     screenshot=screenshot,
@@ -1863,14 +1934,20 @@ class CloudflareBrowserRunAssetClient:
                     title=title,
                     description=description,
                     favicon_href=clean_asset_text(metadata.get("favicon_href"), 1000),
-                    category_l1=clean_category_slug(metadata.get("category_l1")),
-                    category_l2=clean_category_slug(metadata.get("category_l2")),
-                    key_features=clean_key_features(metadata.get("key_features")),
+                    category_l1=category_l1,
+                    category_l2=category_l2,
+                    key_features=key_features,
+                    metadata_error=metadata_error,
+                    metadata_retryable=metadata_retryable,
                 )
             except Exception as error:
                 errors.append(f"{target_url}: {str(error)[:220]}")
+                retryable_errors.append(bool(getattr(error, "retryable", True)))
 
-        raise RuntimeError("Browser Run asset capture failed. " + " | ".join(errors))
+        raise AssetPipelineError(
+            "Browser Run asset capture failed. " + " | ".join(errors),
+            retryable=any(retryable_errors),
+        )
 
 
 class R2AssetUploader:
@@ -3210,6 +3287,14 @@ class D1AssetStore:
                       AND json_array_length(coalesce(tl.feature_highlights, '[]')) > 0
                   )
                 )
+                OR (
+                  t.primary_category_id IS NULL
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM tool_categories tc
+                    WHERE tc.tool_id = t.id
+                  )
+                )
               )
               AND (
                 task.tool_id IS NULL
@@ -3585,7 +3670,7 @@ class D1AssetStore:
             [feature_highlights, task.tool_id],
         )
 
-    async def has_tool_enrichment(self, tool_id: int) -> bool:
+    async def missing_tool_enrichment_requirements(self, tool_id: int) -> list[str]:
         rows = await self.d1.query(
             """
             SELECT
@@ -3619,11 +3704,18 @@ class D1AssetStore:
             [tool_id, tool_id, tool_id, tool_id, tool_id],
         )
         row = rows[0] if rows else {}
-        return bool(
-            int(row.get("has_description") or 0)
-            and int(row.get("has_features") or 0)
-            and int(row.get("has_category") or 0)
-        )
+        return [
+            name
+            for name, column in (
+                ("description", "has_description"),
+                ("key_features", "has_features"),
+                ("category", "has_category"),
+            )
+            if not int(row.get(column) or 0)
+        ]
+
+    async def has_tool_enrichment(self, tool_id: int) -> bool:
+        return not await self.missing_tool_enrichment_requirements(tool_id)
 
     async def save_tool_enrichment(self, task: AssetTask, result: AssetFetchResult) -> None:
         await self.save_tool_localization(task, result)
@@ -3642,9 +3734,16 @@ class D1AssetStore:
         )
         return int(meta.get("changes") or 0) > 0
 
-    async def complete_task(self, task: AssetTask, status: str, error: str | None = None) -> bool:
+    async def complete_task(
+        self,
+        task: AssetTask,
+        status: str,
+        error: str | None = None,
+        *,
+        retryable: bool = True,
+    ) -> bool:
         now = utc_now_iso()
-        exhausted = task.attempts >= task.max_attempts
+        exhausted = task.attempts >= task.max_attempts or not retryable
         meta = await self.d1.run(
             """
             UPDATE asset_tasks
@@ -5376,6 +5475,7 @@ async def process_asset_task(
     category_options: list[str],
 ) -> str:
     last_error = "not_started"
+    last_retryable = True
     for attempt in range(max_retries + 1):
         try:
             log_info(
@@ -5417,8 +5517,15 @@ async def process_asset_task(
             if not await store.renew_lease(task):
                 return "stale"
             await store.save_tool_enrichment(task, result)
-            if not await store.has_tool_enrichment(task.tool_id):
-                raise RuntimeError("asset enrichment is missing a description, key features, or category")
+            missing_requirements = await store.missing_tool_enrichment_requirements(task.tool_id)
+            if missing_requirements:
+                details = [f"missing={','.join(missing_requirements)}"]
+                if result.metadata_error:
+                    details.append(f"metadata={result.metadata_error}")
+                raise AssetPipelineError(
+                    "asset_enrichment_incomplete: " + "; ".join(details),
+                    retryable=result.metadata_retryable,
+                )
 
             if not await store.complete_task(task, "done"):
                 return "stale"
@@ -5434,6 +5541,7 @@ async def process_asset_task(
             return "done"
         except Exception as error:
             last_error = str(error)[:900]
+            last_retryable = bool(getattr(error, "retryable", True))
             log_error(
                 "asset_task.fetch_attempt.failed",
                 tool_id=task.tool_id,
@@ -5442,10 +5550,12 @@ async def process_asset_task(
                 attempt=attempt + 1,
                 error=last_error,
             )
-            if attempt < max_retries:
+            if attempt < max_retries and last_retryable:
                 await asyncio.sleep(random.uniform(1.0, 3.0))
+            else:
+                break
 
-    completed = await store.complete_task(task, "failed", last_error)
+    completed = await store.complete_task(task, "failed", last_error, retryable=last_retryable)
     return "failed" if completed else "stale"
 
 
