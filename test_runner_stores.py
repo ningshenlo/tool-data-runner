@@ -210,6 +210,53 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         row = self.task_row("asset_tasks", "tool_id = ? AND source = ?", [tool_id, runner.ASSET_SOURCE])
         self.assertEqual(row["status"], "queued")
 
+    async def test_asset_category_materialization_writes_parent_and_child(self) -> None:
+        tool_id = self.add_tool("asset-category-materialization")
+        category = self.connection.execute(
+            """
+            SELECT child.id AS child_id, child.canonical_slug AS child_slug,
+                   parent.id AS parent_id, parent.canonical_slug AS parent_slug
+            FROM categories child
+            JOIN categories parent ON parent.id = child.parent_category_id
+            WHERE child.status = 'active' AND parent.status = 'active'
+            ORDER BY child.id
+            LIMIT 1
+            """
+        ).fetchone()
+        self.assertIsNotNone(category)
+        task = runner.AssetTask(
+            tool_id=tool_id,
+            canonical_slug="asset-category-materialization",
+            normalized_domain="asset-category-materialization.example",
+            official_url="https://asset-category-materialization.example",
+            attempts=1,
+            max_attempts=5,
+            generation=1,
+            lease_token="test-lease",
+        )
+        result = runner.AssetFetchResult(
+            final_url=task.official_url,
+            screenshot=b"",
+            category_l1=category["parent_slug"],
+            category_l2=category["child_slug"],
+        )
+
+        await runner.D1AssetStore(self.d1).save_tool_categories(task, result)
+
+        assigned_ids = {
+            row["category_id"]
+            for row in self.connection.execute(
+                "SELECT category_id FROM tool_categories WHERE tool_id = ?",
+                [tool_id],
+            ).fetchall()
+        }
+        self.assertEqual(assigned_ids, {category["parent_id"], category["child_id"]})
+        tool = self.connection.execute(
+            "SELECT primary_category_id FROM tools WHERE id = ?",
+            [tool_id],
+        ).fetchone()
+        self.assertEqual(tool["primary_category_id"], category["parent_id"])
+
     async def test_non_retryable_asset_failure_is_dead_lettered_immediately(self) -> None:
         tool_id = self.add_tool("asset-contract-error")
         store = runner.D1AssetStore(self.d1)

@@ -3592,6 +3592,7 @@ class D1AssetStore:
         slugs = list(dict.fromkeys(slugs))
         if not slugs:
             return
+        slug_placeholders = ",".join("?" for _ in slugs)
         rows = await self.d1.query(
             f"""
             SELECT
@@ -3605,7 +3606,7 @@ class D1AssetStore:
               ON parent.id = c.parent_category_id
              AND parent.status = 'active'
             WHERE c.status = 'active'
-              AND c.canonical_slug IN ({placeholders(len(slugs))})
+              AND c.canonical_slug IN ({slug_placeholders})
             """,
             slugs,
         )
