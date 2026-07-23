@@ -40,9 +40,11 @@ SIMILARWEB_USER_AGENT = (
     "(KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36"
 )
 TRAFFIC_SOURCE = "similarweb"
+TRAFFIC_METRICS_SCHEMA_VERSION = 2
 ASSET_SOURCE = "site_scraper"
 ASSET_DB_STORAGE_BUCKET = "sitesimgs"
 DEFAULT_R2_BUCKET = "sitesimgs"
+ASSET_REQUIREMENT_ORDER = ("screenshot", "favicon", "description", "key_features", "category")
 D1_API_BASE = "https://api.cloudflare.com/client/v4"
 DOMAIN_STATE_SOURCE = "ahrefs"
 AHREFS_DOMAIN_RATING_URL = "https://api.ahrefs.com/v3/public/domain-rating-free"
@@ -188,6 +190,7 @@ class Config:
     cloudflare_account_id: str
     cloudflare_d1_database_id: str
     cloudflare_api_token: str
+    ahref_api_key: str
     brightdata_proxy_host: str
     brightdata_proxy_port: int
     brightdata_proxy_user: str
@@ -315,7 +318,7 @@ class DomainStateResult:
 @dataclass(frozen=True)
 class AssetFetchResult:
     final_url: str
-    screenshot: bytes
+    screenshot: bytes = b""
     html: str = ""
     title: str = ""
     description: str = ""
@@ -419,6 +422,7 @@ def load_config(require_brightdata: bool = True) -> Config:
         cloudflare_account_id=os.environ["CLOUDFLARE_ACCOUNT_ID"],
         cloudflare_d1_database_id=os.environ["CLOUDFLARE_D1_DATABASE_ID"],
         cloudflare_api_token=os.environ["CLOUDFLARE_API_TOKEN"],
+        ahref_api_key=(os.getenv("AHREF_API_KEY") or os.getenv("AHREFS_API_KEY", "")).strip(),
         brightdata_proxy_host=os.getenv("BRIGHTDATA_PROXY_HOST", "brd.superproxy.io"),
         brightdata_proxy_port=read_int_env("BRIGHTDATA_PROXY_PORT", 33335),
         brightdata_proxy_user=os.environ["BRIGHTDATA_PROXY_USER"] if require_brightdata else os.getenv("BRIGHTDATA_PROXY_USER", ""),
@@ -766,6 +770,28 @@ def clean_asset_text(value: Any, limit: int) -> str:
 def clean_category_slug(value: Any) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
     return slug if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,119}", slug) and slug != "uncategorized" else ""
+
+
+def clean_public_slug(value: Any) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+    return slug[:120].rstrip("-")
+
+
+def public_tool_slug_base(task: AssetTask, title: str = "") -> str:
+    canonical_base = re.sub(r"-[0-9a-f]{8}$", "", task.canonical_slug.strip().lower())
+    registrable_domain = get_registrable_domain(task.normalized_domain)
+    domain_label = registrable_domain.split(".", 1)[0]
+    for value in (canonical_base, domain_label, title, task.canonical_slug):
+        slug = clean_public_slug(value)
+        if slug:
+            return slug
+    return f"tool-{task.tool_id}"
+
+
+def numbered_public_slug(base: str, number: int) -> str:
+    suffix = "" if number <= 1 else f"-{number}"
+    trimmed_base = base[: 120 - len(suffix)].rstrip("-") or "tool"
+    return f"{trimmed_base}{suffix}"
 
 
 def clean_key_features(value: Any) -> list[dict[str, str]]:
@@ -1779,7 +1805,8 @@ class CloudflareBrowserRunAssetClient:
             if not detail:
                 detail = text[:300] or f"HTTP {response.status_code}"
             retryable = (
-                response.status_code in (408, 425, 429)
+                (endpoint == "json" and response.status_code in (400, 409, 422))
+                or response.status_code in (408, 425, 429)
                 or response.status_code >= 500
                 or (200 <= response.status_code < 300 and isinstance(parsed, dict) and parsed.get("success") is False)
             )
@@ -1789,156 +1816,257 @@ class CloudflareBrowserRunAssetClient:
             )
         return parsed.get("result") if isinstance(parsed, dict) and "result" in parsed else parsed
 
-    async def fetch_homepage_metadata(self, target_url: str, category_options: list[str]) -> dict[str, Any]:
-        category_hint = ", ".join(category_options[:180])
-        extracted = await self.call_quick_action(
-            "json",
-            {
-                "url": target_url,
-                "userAgent": random_pricing_user_agent(),
-                "prompt": (
-                    "Extract the product title, short description, favicon href, 3 to 6 concrete product "
-                    "features, and the best category slugs for this AI tool. Category values must be exact "
-                    f"slugs from this list: {category_hint}. Return empty strings when unsure."
-                ),
-                "response_format": {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "title": {"type": "string"},
-                            "description": {"type": "string"},
-                            "favicon_href": {"type": "string"},
-                            "category_l1": {"type": "string"},
-                            "category_l2": {"type": "string"},
-                            "key_features": {
-                                "type": "array",
-                                "minItems": 3,
-                                "maxItems": 6,
-                                "items": {
-                                    "type": "object",
-                                    "additionalProperties": False,
-                                    "properties": {
-                                        "name": {"type": "string"},
-                                        "description": {"type": "string"},
-                                    },
-                                    "required": ["name", "description"],
-                                },
-                            },
-                        },
-                        "required": [
-                            "title",
-                            "description",
-                            "favicon_href",
-                            "category_l1",
-                            "category_l2",
-                            "key_features",
-                        ],
-                    },
-                },
-                "gotoOptions": {
-                    "waitUntil": "domcontentloaded",
-                    "timeout": self.timeout_seconds * 1000,
-                },
-            },
-        )
-        return extracted if isinstance(extracted, dict) else {}
-
-    async def fetch_homepage_asset(self, task: AssetTask, category_options: list[str]) -> AssetFetchResult:
+    def asset_candidate_urls(self, task: AssetTask) -> list[str]:
         primary_url = asset_page_url(task)
         parsed = urlsplit(primary_url)
         candidates = [primary_url]
         if parsed.scheme == "https":
             candidates.append(f"http://{parsed.netloc}{parsed.path or '/'}")
+        return candidates
+
+    def browser_payload(self, target_url: str, *, reject_heavy_resources: bool = False) -> dict[str, Any]:
+        payload: dict[str, Any] = {
+            "url": target_url,
+            "userAgent": random_pricing_user_agent(),
+            "setExtraHTTPHeaders": {
+                "Accept-Language": "en-US,en;q=0.9",
+            },
+            "gotoOptions": {
+                "waitUntil": "domcontentloaded",
+                "timeout": self.timeout_seconds * 1000,
+            },
+        }
+        if reject_heavy_resources:
+            payload["rejectResourceTypes"] = ["image", "media", "font"]
+        return payload
+
+    async def fetch_structured_asset_data(
+        self,
+        task: AssetTask,
+        *,
+        prompt: str,
+        json_schema: dict[str, Any],
+        stage: str,
+    ) -> tuple[str, dict[str, Any]]:
+        errors: list[str] = []
+        retryable_errors: list[bool] = []
+        for target_url in self.asset_candidate_urls(task):
+            try:
+                extracted = await self.call_quick_action(
+                    "json",
+                    {
+                        **self.browser_payload(target_url),
+                        "prompt": prompt,
+                        "response_format": {
+                            "type": "json_schema",
+                            "json_schema": json_schema,
+                        },
+                    },
+                )
+                return target_url, extracted if isinstance(extracted, dict) else {}
+            except Exception as error:
+                errors.append(f"{target_url}: {str(error)[:220]}")
+                retryable_errors.append(bool(getattr(error, "retryable", True)))
+
+        raise AssetPipelineError(
+            f"Browser Run {stage} extraction failed. " + " | ".join(errors),
+            retryable=any(retryable_errors),
+        )
+
+    async def fetch_homepage_content(self, task: AssetTask) -> tuple[str, str]:
+        errors: list[str] = []
+        retryable_errors: list[bool] = []
+        for target_url in self.asset_candidate_urls(task):
+            try:
+                content = await self.call_quick_action(
+                    "content",
+                    self.browser_payload(target_url, reject_heavy_resources=True),
+                )
+                if isinstance(content, dict):
+                    html_body = str(content.get("content") or content.get("html") or "")
+                else:
+                    html_body = str(content or "")
+                if html_body.strip():
+                    return target_url, html_body
+                raise RuntimeError("content returned no HTML")
+            except Exception as error:
+                errors.append(f"{target_url}: {str(error)[:220]}")
+                retryable_errors.append(bool(getattr(error, "retryable", True)))
+
+        raise AssetPipelineError(
+            "Browser Run content extraction failed. " + " | ".join(errors),
+            retryable=any(retryable_errors),
+        )
+
+    async def fetch_homepage_core_metadata(self, task: AssetTask) -> AssetFetchResult:
+        metadata: dict[str, Any] = {}
+        final_url = asset_page_url(task)
+        html_body = ""
+        metadata_error = ""
+        metadata_retryable = True
+        try:
+            final_url, metadata = await self.fetch_structured_asset_data(
+                task,
+                stage="core metadata",
+                prompt=(
+                    "Extract the product title, a concise factual product description, and the favicon href "
+                    "from this product homepage. Return empty strings only when the value is unavailable."
+                ),
+                json_schema={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "title": {"type": "string"},
+                        "description": {"type": "string"},
+                        "favicon_href": {"type": "string"},
+                    },
+                    "required": ["title", "description", "favicon_href"],
+                },
+            )
+        except Exception as error:
+            metadata_error = str(error)[:500] or type(error).__name__
+            metadata_retryable = bool(getattr(error, "retryable", True))
+            log_info("assets.browser_core_metadata.failed", url=final_url, error=metadata_error[:300])
+
+        title = clean_asset_text(metadata.get("title"), 120)
+        description = clean_asset_text(metadata.get("description"), 500)
+        if not title or not description:
+            try:
+                content_url, html_body = await self.fetch_homepage_content(task)
+                final_url = content_url
+                title = title or read_html_title(html_body)
+                description = description or read_html_meta(
+                    html_body,
+                    {"description", "og:description", "twitter:description"},
+                )
+            except Exception as content_error:
+                content_message = str(content_error)[:500] or type(content_error).__name__
+                metadata_error = "; ".join(
+                    value for value in (metadata_error, content_message) if value
+                )[:500]
+                metadata_retryable = metadata_retryable or bool(getattr(content_error, "retryable", True))
+                log_info("assets.browser_content.failed", url=final_url, error=content_message[:300])
+
+        validation_errors = []
+        if not description:
+            validation_errors.append("description_empty")
+        if validation_errors:
+            metadata_error = "; ".join(
+                value for value in (metadata_error, *validation_errors) if value
+            )[:500]
+        return AssetFetchResult(
+            final_url=final_url,
+            html=html_body,
+            title=title,
+            description=description,
+            favicon_href=clean_asset_text(metadata.get("favicon_href"), 1000),
+            metadata_error=metadata_error,
+            metadata_retryable=metadata_retryable,
+        )
+
+    async def fetch_homepage_key_features(self, task: AssetTask) -> AssetFetchResult:
+        final_url, metadata = await self.fetch_structured_asset_data(
+            task,
+            stage="key features",
+            prompt=(
+                "Extract 1 to 6 concrete product capabilities from this product homepage. "
+                "Use short feature names and factual one-sentence descriptions."
+            ),
+            json_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "key_features": {
+                        "type": "array",
+                        "minItems": 1,
+                        "maxItems": 6,
+                        "items": {
+                            "type": "object",
+                            "additionalProperties": False,
+                            "properties": {
+                                "name": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["name", "description"],
+                        },
+                    },
+                },
+                "required": ["key_features"],
+            },
+        )
+        key_features = clean_key_features(metadata.get("key_features"))
+        return AssetFetchResult(
+            final_url=final_url,
+            key_features=key_features,
+            metadata_error="" if key_features else "features_empty",
+            metadata_retryable=True,
+        )
+
+    async def fetch_homepage_categories(
+        self,
+        task: AssetTask,
+        category_options: list[str],
+    ) -> AssetFetchResult:
+        category_hint = ", ".join(category_options[:180])
+        final_url, metadata = await self.fetch_structured_asset_data(
+            task,
+            stage="category",
+            prompt=(
+                "Choose the best category slugs for this AI product. Category values must be exact slugs "
+                f"from this list: {category_hint}. Use category_l1 for the broad category and category_l2 "
+                "for the most specific category. Return empty strings when unsure."
+            ),
+            json_schema={
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "category_l1": {"type": "string"},
+                    "category_l2": {"type": "string"},
+                },
+                "required": ["category_l1", "category_l2"],
+            },
+        )
+        valid_categories = set(category_options)
+        extracted_category_l1 = clean_category_slug(metadata.get("category_l1"))
+        extracted_category_l2 = clean_category_slug(metadata.get("category_l2"))
+        category_l1 = extracted_category_l1 if extracted_category_l1 in valid_categories else ""
+        category_l2 = extracted_category_l2 if extracted_category_l2 in valid_categories else ""
+        rejected_categories = [
+            slug
+            for slug in (extracted_category_l1, extracted_category_l2)
+            if slug and slug not in valid_categories
+        ]
+        metadata_error = ""
+        if not category_l1 and not category_l2:
+            metadata_error = (
+                "category_unmatched=" + ",".join(rejected_categories)
+                if rejected_categories
+                else "category_empty"
+            )
+        return AssetFetchResult(
+            final_url=final_url,
+            category_l1=category_l1,
+            category_l2=category_l2,
+            metadata_error=metadata_error,
+            metadata_retryable=True,
+        )
+
+    async def capture_homepage_screenshot(self, task: AssetTask) -> AssetFetchResult:
 
         errors: list[str] = []
         retryable_errors: list[bool] = []
-        for target_url in candidates:
-            payload = {
-                "url": target_url,
-                "userAgent": random_pricing_user_agent(),
-                "setExtraHTTPHeaders": {
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-                "gotoOptions": {
-                    "waitUntil": "domcontentloaded",
-                    "timeout": self.timeout_seconds * 1000,
-                },
-            }
+        for target_url in self.asset_candidate_urls(task):
             try:
-                snapshot = await self.call_quick_action("snapshot", payload)
+                snapshot = await self.call_quick_action("snapshot", self.browser_payload(target_url))
                 screenshot_raw = snapshot.get("screenshot") if isinstance(snapshot, dict) else None
                 if not screenshot_raw:
                     raise RuntimeError("snapshot returned no screenshot")
                 if isinstance(screenshot_raw, str) and "," in screenshot_raw[:40]:
                     screenshot_raw = screenshot_raw.split(",", 1)[1]
                 screenshot = base64.b64decode(str(screenshot_raw), validate=False)
-                html_body = ""
-                metadata: dict[str, Any] = {}
-                metadata_error = ""
-                metadata_retryable = True
-                try:
-                    metadata = await self.fetch_homepage_metadata(target_url, category_options)
-                except Exception as error:
-                    metadata_error = str(error)[:500] or type(error).__name__
-                    metadata_retryable = bool(getattr(error, "retryable", True))
-                    log_info("assets.browser_metadata.failed", url=target_url, error=metadata_error[:300])
-                    try:
-                        content = await self.call_quick_action(
-                            "content",
-                            {
-                                **payload,
-                                "rejectResourceTypes": ["image", "media", "font"],
-                            },
-                        )
-                        if isinstance(content, dict):
-                            html_body = str(content.get("content") or content.get("html") or "")
-                        elif isinstance(content, str):
-                            html_body = content
-                    except Exception as content_error:
-                        log_info("assets.browser_content.failed", url=target_url, error=str(content_error)[:300])
-                title = clean_asset_text(metadata.get("title"), 120) or read_html_title(html_body)
-                description = clean_asset_text(metadata.get("description"), 500) or read_html_meta(
-                    html_body,
-                    {"description", "og:description", "twitter:description"},
-                )
-                valid_categories = set(category_options)
-                extracted_category_l1 = clean_category_slug(metadata.get("category_l1"))
-                extracted_category_l2 = clean_category_slug(metadata.get("category_l2"))
-                category_l1 = extracted_category_l1 if extracted_category_l1 in valid_categories else ""
-                category_l2 = extracted_category_l2 if extracted_category_l2 in valid_categories else ""
-                key_features = clean_key_features(metadata.get("key_features"))
-                validation_errors: list[str] = []
-                if not key_features:
-                    validation_errors.append("features_empty")
-                if not category_l1 and not category_l2:
-                    rejected_categories = [
-                        slug
-                        for slug in (extracted_category_l1, extracted_category_l2)
-                        if slug and slug not in valid_categories
-                    ]
-                    validation_errors.append(
-                        "category_unmatched=" + ",".join(rejected_categories)
-                        if rejected_categories
-                        else "category_empty"
-                    )
-                if validation_errors:
-                    metadata_error = "; ".join(
-                        value for value in (metadata_error, *validation_errors) if value
-                    )[:500]
                 return AssetFetchResult(
                     final_url=target_url,
                     screenshot=screenshot,
-                    html=html_body,
-                    title=title,
-                    description=description,
-                    favicon_href=clean_asset_text(metadata.get("favicon_href"), 1000),
-                    category_l1=category_l1,
-                    category_l2=category_l2,
-                    key_features=key_features,
-                    metadata_error=metadata_error,
-                    metadata_retryable=metadata_retryable,
                 )
             except Exception as error:
                 errors.append(f"{target_url}: {str(error)[:220]}")
@@ -2129,13 +2257,41 @@ def parse_country_rank(payload: dict[str, Any]) -> dict[str, Any]:
 
 def parse_traffic_sources(payload: dict[str, Any]) -> dict[str, Any]:
     sources = payload.get("TrafficSources") or {}
+    if not isinstance(sources, dict):
+        sources = {}
+
+    social_organic = to_number(sources.get("SocialOrganic"))
+    social_paid = to_number(sources.get("SocialPaid"))
+    search_organic = to_number(sources.get("SearchOrganic"))
+    search_paid = to_number(sources.get("SearchPaid"))
+
+    def sum_present(*values: float | None) -> float | None:
+        present = [value for value in values if value is not None]
+        return sum(present) if present else None
+
+    def prefer_explicit(explicit: float | None, fallback: float | None) -> float | None:
+        return explicit if explicit is not None else fallback
+
     return {
-        "social_traffic_share": to_number(sources.get("Social")),
+        "social_traffic_share": prefer_explicit(
+            to_number(sources.get("Social")),
+            sum_present(social_organic, social_paid),
+        ),
+        "social_organic_traffic_share": social_organic,
+        "social_paid_traffic_share": social_paid,
         "paid_referrals_traffic_share": to_number(sources.get("Paid Referrals")),
         "mail_traffic_share": to_number(sources.get("Mail")),
-        "search_traffic_share": to_number(sources.get("Search")),
+        "search_traffic_share": prefer_explicit(
+            to_number(sources.get("Search")),
+            sum_present(search_organic, search_paid),
+        ),
+        "search_organic_traffic_share": search_organic,
+        "search_paid_traffic_share": search_paid,
         "direct_traffic_share": to_number(sources.get("Direct")),
         "referrals_traffic_share": to_number(sources.get("Referrals")),
+        "display_ads_traffic_share": to_number(sources.get("DisplayAds")),
+        "gen_ai_traffic_share": to_number(sources.get("GenAi")),
+        "affiliate_traffic_share": to_number(sources.get("Affiliate")),
     }
 
 
@@ -2172,6 +2328,141 @@ def parse_top_keywords(payload: dict[str, Any]) -> list[dict[str, Any]]:
     return keywords
 
 
+def parse_ai_traffic(payload: dict[str, Any]) -> dict[str, Any] | None:
+    ai_details = payload.get("AiTrafficDetails")
+    if not isinstance(ai_details, dict):
+        return None
+
+    traffic = ai_details.get("Traffic")
+    traffic = traffic if isinstance(traffic, dict) else {}
+    distribution = traffic.get("Distribution")
+    distribution = distribution if isinstance(distribution, dict) else {}
+
+    sources: list[dict[str, Any]] = []
+    raw_sources = distribution.get("Chatbots")
+    if isinstance(raw_sources, list):
+        for raw_source in raw_sources:
+            if not isinstance(raw_source, dict):
+                continue
+            name = str(raw_source.get("Name") or "").strip()
+            share = to_number(raw_source.get("Value"))
+            if name and share is not None:
+                sources.append({"name": name, "share": share})
+
+    history: list[dict[str, Any]] = []
+    raw_history = distribution.get("Chart")
+    if isinstance(raw_history, list):
+        for raw_series in raw_history:
+            if not isinstance(raw_series, dict):
+                continue
+            name = str(raw_series.get("Name") or "").strip()
+            points: list[dict[str, Any]] = []
+            raw_points = raw_series.get("History")
+            if isinstance(raw_points, list):
+                for raw_point in raw_points:
+                    if not isinstance(raw_point, dict):
+                        continue
+                    date = to_month_start(raw_point.get("Date"))
+                    share = to_number(raw_point.get("Value"))
+                    if date and share is not None:
+                        points.append({"date": date, "share": share})
+            if name and points:
+                history.append({"name": name, "points": points})
+
+    rankings: list[dict[str, Any]] = []
+    raw_rankings = traffic.get("Split")
+    if isinstance(raw_rankings, list):
+        for raw_ranking in raw_rankings:
+            if not isinstance(raw_ranking, dict):
+                continue
+            name = str(raw_ranking.get("Name") or "").strip()
+            rank = to_integer(raw_ranking.get("Rank"))
+            if name:
+                rankings.append({"name": name, "rank": rank})
+
+    top_prompts = ai_details.get("TopPrompts")
+    top_prompts = top_prompts if isinstance(top_prompts, dict) else {}
+    prompts = top_prompts.get("Prompts")
+    prompt_count = len(prompts) if isinstance(prompts, list) else 0
+    prompt_error = str(top_prompts.get("ErrorMessage") or "").strip() or None
+
+    return {
+        "total_visits": to_number(ai_details.get("TotalVisits")),
+        "referral_share": to_number(ai_details.get("ReferralTraffic")),
+        "boundary": str(distribution.get("Boundary") or "").strip() or None,
+        "sources": sources,
+        "history": history,
+        "rankings": rankings,
+        "top_prompts": {
+            "status": to_integer(top_prompts.get("Status")),
+            "error": prompt_error,
+            "count": prompt_count,
+        },
+    }
+
+
+def build_traffic_metrics(row: dict[str, Any]) -> dict[str, Any]:
+    metrics: dict[str, Any] = {}
+    website = str(row.get("website") or "").strip()
+    if website:
+        metrics["website"] = website
+    if row.get("query_date"):
+        metrics["query_date"] = row["query_date"]
+    if row.get("engagement_visits") is not None:
+        metrics["engagement_visits"] = row["engagement_visits"]
+
+    traffic_source_fields = {
+        "social": "social_traffic_share",
+        "social_organic": "social_organic_traffic_share",
+        "social_paid": "social_paid_traffic_share",
+        "paid_referrals": "paid_referrals_traffic_share",
+        "mail": "mail_traffic_share",
+        "search": "search_traffic_share",
+        "search_organic": "search_organic_traffic_share",
+        "search_paid": "search_paid_traffic_share",
+        "direct": "direct_traffic_share",
+        "referrals": "referrals_traffic_share",
+        "display_ads": "display_ads_traffic_share",
+        "gen_ai": "gen_ai_traffic_share",
+        "affiliate": "affiliate_traffic_share",
+    }
+    traffic_sources = {
+        key: row[field]
+        for key, field in traffic_source_fields.items()
+        if row.get(field) is not None
+    }
+    if traffic_sources:
+        metrics["traffic_sources"] = traffic_sources
+
+    geographies = []
+    for index in range(1, 6):
+        country_code = row.get(f"top_country_{index}")
+        share = row.get(f"top_country_{index}_traffic_share")
+        if country_code and share is not None:
+            geographies.append({"country_code": country_code, "share": share})
+    if geographies:
+        metrics["top_geographies"] = geographies
+
+    raw_keywords = row.get("top_keywords")
+    if isinstance(raw_keywords, list) and raw_keywords:
+        metrics["top_search_keywords"] = [
+            {
+                "name": keyword.get("name"),
+                "volume": keyword.get("volume"),
+                "estimated_traffic": keyword.get("estimated_value"),
+                "cpc": keyword.get("cpc"),
+            }
+            for keyword in raw_keywords
+            if isinstance(keyword, dict) and keyword.get("name")
+        ]
+
+    ai_traffic = row.get("ai_traffic")
+    if isinstance(ai_traffic, dict):
+        metrics["ai_traffic"] = ai_traffic
+
+    return metrics
+
+
 def parse_monthly_rows(payload: dict[str, Any], domain: str, requested_month: str) -> list[dict[str, Any]]:
     engagements = payload.get("Engagments") or {}
     estimated_visits = payload.get("EstimatedMonthlyVisits") or {}
@@ -2180,6 +2471,7 @@ def parse_monthly_rows(payload: dict[str, Any], domain: str, requested_month: st
     if to_integer(engagements.get("Year")) and to_integer(engagements.get("Month")):
         query_date = f"{to_integer(engagements.get('Year'))}-{to_integer(engagements.get('Month')):02d}-01"
 
+    ai_traffic = parse_ai_traffic(payload)
     base_fields = {
         "website": payload.get("SiteName") or domain,
         "query_date": query_date,
@@ -2195,6 +2487,8 @@ def parse_monthly_rows(payload: dict[str, Any], domain: str, requested_month: st
     top_keywords = parse_top_keywords(payload)
     if top_keywords:
         base_fields["top_keywords"] = top_keywords
+    if ai_traffic is not None:
+        base_fields["ai_traffic"] = ai_traffic
 
     monthly_rows: list[dict[str, Any]] = []
     if isinstance(estimated_visits, dict):
@@ -2228,6 +2522,89 @@ def requested_month_has_traffic_data(rows: list[dict[str, Any]], requested_month
 def latest_observed_traffic_month(rows: list[dict[str, Any]]) -> str | None:
     months = [str(row.get("traffic_month") or "") for row in rows if row.get("traffic_month")]
     return max(months) if months else None
+
+
+DOMAIN_TRAFFIC_MONTHLY_UPSERT_SQL = """
+    INSERT INTO domain_traffic_monthly (
+      normalized_domain, source, traffic_month, visits, global_rank,
+      country_rank_country, country_rank, bounce_rate, pages_per_visit,
+      avg_visit_duration_seconds, gen_ai_traffic_share, ai_visits,
+      ai_referral_share, metrics_json, metrics_schema_version,
+      source_snapshot_id, captured_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (normalized_domain, source, traffic_month) DO UPDATE
+    SET visits = coalesce(excluded.visits, domain_traffic_monthly.visits),
+        global_rank = coalesce(excluded.global_rank, domain_traffic_monthly.global_rank),
+        country_rank_country = coalesce(
+          excluded.country_rank_country,
+          domain_traffic_monthly.country_rank_country
+        ),
+        country_rank = coalesce(excluded.country_rank, domain_traffic_monthly.country_rank),
+        bounce_rate = coalesce(excluded.bounce_rate, domain_traffic_monthly.bounce_rate),
+        pages_per_visit = coalesce(
+          excluded.pages_per_visit,
+          domain_traffic_monthly.pages_per_visit
+        ),
+        avg_visit_duration_seconds = coalesce(
+          excluded.avg_visit_duration_seconds,
+          domain_traffic_monthly.avg_visit_duration_seconds
+        ),
+        gen_ai_traffic_share = coalesce(
+          excluded.gen_ai_traffic_share,
+          domain_traffic_monthly.gen_ai_traffic_share
+        ),
+        ai_visits = coalesce(excluded.ai_visits, domain_traffic_monthly.ai_visits),
+        ai_referral_share = coalesce(
+          excluded.ai_referral_share,
+          domain_traffic_monthly.ai_referral_share
+        ),
+        metrics_json = json_patch(domain_traffic_monthly.metrics_json, excluded.metrics_json),
+        metrics_schema_version = max(
+          domain_traffic_monthly.metrics_schema_version,
+          excluded.metrics_schema_version
+        ),
+        source_snapshot_id = coalesce(
+          excluded.source_snapshot_id,
+          domain_traffic_monthly.source_snapshot_id
+        ),
+        captured_at = excluded.captured_at,
+        updated_at = excluded.captured_at
+"""
+
+
+def build_domain_traffic_monthly_upsert(
+    domain: str,
+    row: dict[str, Any],
+    *,
+    captured_at: str | None = None,
+    source_snapshot_id: int | None = None,
+) -> tuple[str, list[Any]]:
+    ai_traffic = row.get("ai_traffic")
+    ai_traffic = ai_traffic if isinstance(ai_traffic, dict) else {}
+    fetched_at = captured_at or utc_now_iso()
+    return (
+        DOMAIN_TRAFFIC_MONTHLY_UPSERT_SQL,
+        [
+            domain,
+            TRAFFIC_SOURCE,
+            row.get("traffic_month"),
+            row.get("visits"),
+            row.get("global_rank") or None,
+            row.get("country_rank_country"),
+            row.get("country_rank") or None,
+            row.get("bounce_rate"),
+            row.get("pages_per_visit"),
+            row.get("avg_visit_duration_seconds"),
+            row.get("gen_ai_traffic_share"),
+            to_integer(ai_traffic.get("total_visits")),
+            to_number(ai_traffic.get("referral_share")),
+            json.dumps(build_traffic_metrics(row), ensure_ascii=False),
+            TRAFFIC_METRICS_SCHEMA_VERSION,
+            source_snapshot_id,
+            fetched_at,
+        ],
+    )
 
 
 async def fetch_similarweb_extension_version(timeout: float = 10.0) -> str | None:
@@ -2435,6 +2812,9 @@ def find_rdap_base_urls(domain: str, bootstrap: dict[str, Any]) -> list[str]:
 
 
 class DomainStateClient:
+    def __init__(self, ahref_api_key: str) -> None:
+        self.ahref_api_key = ahref_api_key.strip()
+
     async def fetch(self, domain: str) -> DomainStateResult:
         ahrefs_result, whois_result = await asyncio.gather(
             self.fetch_ahrefs_domain_rating(domain),
@@ -2461,11 +2841,19 @@ class DomainStateClient:
         clean_domain = normalize_domain(domain)
         if not clean_domain:
             return DomainStateResult(status="failed", domain_rating=None, domain_created_at=None, error="invalid_domain")
+        if not self.ahref_api_key:
+            raise RuntimeError("AHREF_API_KEY is required for Ahrefs Domain Rating requests")
 
         endpoint = httpx.URL(AHREFS_DOMAIN_RATING_URL).copy_add_param("target", clean_domain)
         try:
             async with httpx.AsyncClient(timeout=25.0) as client:
-                response = await client.get(endpoint, headers={"Accept": "application/json,text/plain,*/*"})
+                response = await client.get(
+                    endpoint,
+                    headers={
+                        "Accept": "application/json,text/plain,*/*",
+                        "Authorization": f"Bearer {self.ahref_api_key}",
+                    },
+                )
         except Exception as error:
             return DomainStateResult(status="failed", domain_rating=None, domain_created_at=None, error=str(error)[:300])
 
@@ -2798,8 +3186,8 @@ class D1Client:
         row: dict[str, Any],
         error: str | None,
         raw_payload: dict[str, Any] | None = None,
-    ) -> None:
-        await self.execute(
+    ) -> int | None:
+        meta = await self.run(
             """
             INSERT INTO domain_traffic_snapshots (
               normalized_domain, source, website, query_date, traffic_month, status,
@@ -2852,6 +3240,8 @@ class D1Client:
                 error,
             ],
         )
+        last_row_id = to_integer(meta.get("last_row_id"))
+        return last_row_id if last_row_id and last_row_id > 0 else None
 
     async def insert_result(self, task: TrafficTask, result: FetchResult) -> None:
         rows = result.monthly_rows or [{"traffic_month": task.traffic_month}]
@@ -2862,6 +3252,7 @@ class D1Client:
             status=result.status,
             rows=len(rows),
         )
+        projection_rows: list[dict[str, Any]] = []
         for row in rows:
             snapshot_payload = (
                 result.raw_payload
@@ -2872,7 +3263,7 @@ class D1Client:
                 )
                 else None
             )
-            await self.insert_snapshot(
+            snapshot_id = await self.insert_snapshot(
                 task.normalized_domain,
                 task.traffic_month,
                 result.status,
@@ -2880,7 +3271,13 @@ class D1Client:
                 result.error,
                 snapshot_payload,
             )
+            if result.monthly_rows:
+                projection_rows.append({**row, "_source_snapshot_id": snapshot_id})
         if result.monthly_rows:
+            await self.upsert_domain_traffic_monthly(
+                task.normalized_domain,
+                projection_rows,
+            )
             await self.upsert_tool_traffic_monthly(task.normalized_domain, result.monthly_rows)
         log_info(
             "d1.insert_result.done",
@@ -2889,6 +3286,26 @@ class D1Client:
             status=result.status,
             rows=len(rows),
         )
+
+    async def upsert_domain_traffic_monthly(
+        self,
+        domain: str,
+        rows: list[dict[str, Any]],
+        *,
+        captured_at: str | None = None,
+    ) -> None:
+        statements = [
+            build_domain_traffic_monthly_upsert(
+                domain,
+                row,
+                captured_at=captured_at,
+                source_snapshot_id=to_integer(row.get("_source_snapshot_id")),
+            )
+            for row in rows
+            if row.get("traffic_month")
+        ]
+        if statements:
+            await self.batch(statements)
 
     async def upsert_tool_traffic_monthly(self, domain: str, rows: list[dict[str, Any]]) -> None:
         tools = await self.query(
@@ -2950,8 +3367,113 @@ class D1Client:
                         captured_at,
                         json.dumps(row, ensure_ascii=False),
                         captured_at,
-            ],
-        )
+                    ],
+                )
+
+
+async def backfill_domain_traffic_monthly(
+    config: Config,
+    limit: int | None = None,
+    *,
+    page_size: int = 100,
+    write_batch_size: int = 40,
+) -> dict[str, int]:
+    """Rebuild the domain projection from append-only Similarweb snapshots.
+
+    Snapshots are replayed from oldest to newest. The projection upsert is
+    idempotent, so this command is safe to resume or run again after a parser
+    change.
+    """
+    counts = {
+        "snapshots_scanned": 0,
+        "snapshots_projected": 0,
+        "snapshots_invalid": 0,
+        "monthly_rows_upserted": 0,
+    }
+    last_snapshot_id = 0
+
+    async with D1Client(config) as d1:
+        while limit is None or counts["snapshots_scanned"] < limit:
+            remaining = page_size if limit is None else min(page_size, limit - counts["snapshots_scanned"])
+            if remaining <= 0:
+                break
+            snapshots = await d1.query(
+                """
+                SELECT id, normalized_domain, traffic_month, fetched_at, raw_payload
+                FROM domain_traffic_snapshots
+                WHERE source = ?
+                  AND status = 'done'
+                  AND id > ?
+                  AND json_valid(raw_payload)
+                  AND raw_payload <> '{}'
+                ORDER BY id ASC
+                LIMIT ?
+                """,
+                [TRAFFIC_SOURCE, last_snapshot_id, remaining],
+            )
+            if not snapshots:
+                break
+
+            statements: list[tuple[str, list[Any]]] = []
+            for snapshot in snapshots:
+                snapshot_id = to_integer(snapshot.get("id")) or 0
+                last_snapshot_id = max(last_snapshot_id, snapshot_id)
+                counts["snapshots_scanned"] += 1
+                raw_payload = snapshot.get("raw_payload")
+                try:
+                    payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+                except (TypeError, json.JSONDecodeError):
+                    payload = None
+                if not isinstance(payload, dict):
+                    counts["snapshots_invalid"] += 1
+                    continue
+
+                domain = normalize_domain(str(snapshot.get("normalized_domain") or ""))
+                requested_month = to_month_start(snapshot.get("traffic_month"))
+                if not domain or not requested_month:
+                    counts["snapshots_invalid"] += 1
+                    continue
+                try:
+                    rows = parse_monthly_rows(payload, domain, requested_month)
+                except Exception as error:
+                    counts["snapshots_invalid"] += 1
+                    log_error(
+                        "traffic_projection_backfill.parse_failed",
+                        snapshot_id=snapshot_id,
+                        domain=domain,
+                        error=str(error)[:300],
+                    )
+                    continue
+
+                captured_at = str(snapshot.get("fetched_at") or "").strip() or utc_now_iso()
+                row_statements = [
+                    build_domain_traffic_monthly_upsert(
+                        domain,
+                        row,
+                        captured_at=captured_at,
+                        source_snapshot_id=snapshot_id,
+                    )
+                    for row in rows
+                    if row.get("traffic_month")
+                ]
+                if not row_statements:
+                    counts["snapshots_invalid"] += 1
+                    continue
+                statements.extend(row_statements)
+                counts["snapshots_projected"] += 1
+
+            for offset in range(0, len(statements), write_batch_size):
+                batch = statements[offset : offset + write_batch_size]
+                await d1.batch(batch)
+                counts["monthly_rows_upserted"] += len(batch)
+
+            log_info(
+                "traffic_projection_backfill.page",
+                last_snapshot_id=last_snapshot_id,
+                **counts,
+            )
+
+    return counts
 
 
 class RunnerTelemetry:
@@ -3119,7 +3641,10 @@ class D1EnrichmentStore:
               CASE WHEN EXISTS (SELECT 1 FROM tool_sources s WHERE s.tool_id = t.id)
                    THEN 1 ELSE 0 END AS has_source,
               CASE WHEN EXISTS (
-                SELECT 1 FROM tool_traffic_monthly tm WHERE tm.tool_id = t.id
+                SELECT 1
+                FROM domain_traffic_monthly tm
+                WHERE tm.normalized_domain = t.normalized_domain
+                  AND tm.source = ?
               ) THEN 1 ELSE 0 END AS has_traffic,
               CASE WHEN EXISTS (
                 SELECT 1 FROM domain_states ds
@@ -3135,7 +3660,7 @@ class D1EnrichmentStore:
             WHERE t.id = ?
             LIMIT 1
             """,
-            [DOMAIN_STATE_SOURCE, tool_id],
+            [TRAFFIC_SOURCE, DOMAIN_STATE_SOURCE, tool_id],
         )
         if not rows:
             return "missing"
@@ -3540,17 +4065,35 @@ class D1AssetStore:
             locale = str(locale_rows[0].get("code") or "") if locale_rows else ""
             if not locale:
                 return
-            await self.d1.run(
-                """
-                INSERT OR IGNORE INTO tool_localizations (
-                  tool_id, locale_code, localized_slug, name, tagline, short_description, feature_highlights,
-                  translation_status, published_at
+            slug_base = public_tool_slug_base(task, title)
+            for number in range(1, 1001):
+                localized_slug = numbered_public_slug(slug_base, number)
+                meta = await self.d1.run(
+                    """
+                    INSERT OR IGNORE INTO tool_localizations (
+                      tool_id, locale_code, localized_slug, name, tagline, short_description, feature_highlights,
+                      translation_status, published_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, '[]', 'published', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    """,
+                    [
+                        task.tool_id,
+                        locale,
+                        localized_slug,
+                        title or localized_slug,
+                        description or None,
+                        description or None,
+                    ],
                 )
-                VALUES (?, ?, ?, ?, ?, ?, '[]', 'published', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
-                """,
-                [task.tool_id, locale, task.canonical_slug, title or task.canonical_slug, description or None, description or None],
-            )
-            return
+                if int(meta.get("changes") or 0) > 0:
+                    return
+                existing_rows = await self.d1.query(
+                    "SELECT localized_slug FROM tool_localizations WHERE tool_id = ? AND locale_code = ? LIMIT 1",
+                    [task.tool_id, locale],
+                )
+                if existing_rows:
+                    return
+            raise RuntimeError(f"Unable to allocate public slug for tool {task.tool_id}")
 
         await self.d1.run(
             """
@@ -3713,6 +4256,81 @@ class D1AssetStore:
                 ("category", "has_category"),
             )
             if not int(row.get(column) or 0)
+        ]
+
+    async def missing_asset_requirements(self, tool_id: int) -> list[str]:
+        rows = await self.d1.query(
+            """
+            SELECT
+              CASE WHEN EXISTS (
+                SELECT 1
+                FROM tool_assets ta
+                WHERE ta.tool_id = ?
+                  AND ta.asset_kind = 'screenshot'
+                  AND ta.storage_bucket = ?
+                  AND ta.is_current = 1
+              ) THEN 1 ELSE 0 END AS has_screenshot,
+              CASE WHEN EXISTS (
+                SELECT 1
+                FROM tool_assets ta
+                WHERE ta.tool_id = ?
+                  AND ta.asset_kind = 'favicon'
+                  AND ta.is_current = 1
+              ) THEN 1 ELSE 0 END AS has_favicon,
+              CASE WHEN EXISTS (
+                SELECT 1
+                FROM tool_localizations tl
+                WHERE tl.tool_id = ?
+                  AND tl.translation_status = 'published'
+                  AND tl.published_at IS NOT NULL
+                  AND trim(coalesce(tl.short_description, '')) <> ''
+              ) THEN 1 ELSE 0 END AS has_description,
+              CASE WHEN EXISTS (
+                SELECT 1
+                FROM tool_key_features tkf
+                WHERE tkf.tool_id = ?
+              ) OR EXISTS (
+                SELECT 1
+                FROM tool_localizations tl
+                WHERE tl.tool_id = ?
+                  AND tl.translation_status = 'published'
+                  AND tl.published_at IS NOT NULL
+                  AND json_array_length(coalesce(tl.feature_highlights, '[]')) > 0
+              ) THEN 1 ELSE 0 END AS has_key_features,
+              CASE WHEN EXISTS (
+                SELECT 1
+                FROM tools t
+                WHERE t.id = ?
+                  AND t.primary_category_id IS NOT NULL
+              ) OR EXISTS (
+                SELECT 1
+                FROM tool_categories tc
+                WHERE tc.tool_id = ?
+              ) THEN 1 ELSE 0 END AS has_category
+            """,
+            [
+                tool_id,
+                ASSET_DB_STORAGE_BUCKET,
+                tool_id,
+                tool_id,
+                tool_id,
+                tool_id,
+                tool_id,
+                tool_id,
+            ],
+        )
+        row = rows[0] if rows else {}
+        columns = {
+            "screenshot": "has_screenshot",
+            "favicon": "has_favicon",
+            "description": "has_description",
+            "key_features": "has_key_features",
+            "category": "has_category",
+        }
+        return [
+            requirement
+            for requirement in ASSET_REQUIREMENT_ORDER
+            if not int(row.get(columns[requirement]) or 0)
         ]
 
     async def has_tool_enrichment(self, tool_id: int) -> bool:
@@ -3901,7 +4519,7 @@ class D1TaskStore:
             """
             SELECT t.normalized_domain
             FROM tools t
-            LEFT JOIN tool_traffic_monthly tm
+            LEFT JOIN domain_traffic_monthly tm
               ON tm.normalized_domain = t.normalized_domain
              AND tm.source = ?
              AND tm.traffic_month = ?
@@ -5351,7 +5969,7 @@ async def _run_domain_state_once(config: Config, d1: D1Client, limit: int | None
     effective_limit = limit or config.domain_state_limit
     log_info("domain_state_runner.batch.start", limit=effective_limit, concurrency=config.concurrency)
     store = D1DomainStateStore(d1)
-    client = DomainStateClient()
+    client = DomainStateClient(config.ahref_api_key)
     queued = await store.queue_due_tasks(effective_limit, config.domain_state_max_age_days)
     log_info("domain_state_runner.queue_due_tasks.done", queued=queued)
     tasks = await store.claim_due_tasks(effective_limit, config.runner_instance_id)
@@ -5478,6 +6096,32 @@ async def process_asset_task(
     last_error = "not_started"
     last_retryable = True
     for attempt in range(max_retries + 1):
+        missing_before = await store.missing_asset_requirements(task.tool_id)
+        if not missing_before:
+            if not await store.complete_task(task, "done"):
+                return "stale"
+            log_info(
+                "asset_task.fetch_attempt.skipped",
+                tool_id=task.tool_id,
+                slug=task.canonical_slug,
+                domain=task.normalized_domain,
+                reason="requirements_already_complete",
+            )
+            return "done"
+
+        stage_errors: list[str] = []
+        stage_retryable: list[bool] = []
+        core_result: AssetFetchResult | None = None
+
+        def record_stage_error(stage: str, error: Any, *, retryable: bool | None = None) -> None:
+            message = str(error).strip()[:500] or type(error).__name__
+            stage_errors.append(f"{stage}={message}")
+            stage_retryable.append(
+                bool(getattr(error, "retryable", True))
+                if retryable is None
+                else retryable
+            )
+
         try:
             log_info(
                 "asset_task.fetch_attempt.start",
@@ -5486,47 +6130,112 @@ async def process_asset_task(
                 domain=task.normalized_domain,
                 attempt=attempt + 1,
                 max_attempts=max_retries + 1,
-            )
-            result = await browser_client.fetch_homepage_asset(task, category_options)
-            if not await store.renew_lease(task):
-                return "stale"
-            screenshot_key = f"{task.normalized_domain}/{int(time.time() * 1000)}.png"
-            await uploader.put_object(screenshot_key, result.screenshot, "image/png")
-            await store.upsert_tool_asset(
-                task,
-                "screenshot",
-                screenshot_key,
-                asset_public_url(public_base_url, screenshot_key),
-                "image/png",
-                1280,
-                720,
+                requirements=missing_before,
             )
 
-            favicon = await fetch_favicon_asset(result.final_url, task.normalized_domain, result.html, result.favicon_href)
-            if favicon is not None:
-                await uploader.put_object(favicon.key, favicon.body, favicon.mime_type)
-                await store.upsert_tool_asset(
-                    task,
-                    "favicon",
-                    favicon.key,
-                    asset_public_url(public_base_url, favicon.key),
-                    favicon.mime_type,
-                    None,
-                    None,
-                )
+            if "description" in missing_before:
+                try:
+                    core_result = await browser_client.fetch_homepage_core_metadata(task)
+                    if not await store.renew_lease(task):
+                        return "stale"
+                    await store.save_tool_localization(task, core_result)
+                    if core_result.metadata_error:
+                        record_stage_error(
+                            "description",
+                            core_result.metadata_error,
+                            retryable=core_result.metadata_retryable,
+                        )
+                except Exception as error:
+                    record_stage_error("description", error)
 
-            if not await store.renew_lease(task):
-                return "stale"
-            await store.save_tool_enrichment(task, result)
-            missing_requirements = await store.missing_tool_enrichment_requirements(task.tool_id)
-            if missing_requirements:
-                details = [f"missing={','.join(missing_requirements)}"]
-                if result.metadata_error:
-                    details.append(f"metadata={result.metadata_error}")
-                raise AssetPipelineError(
-                    "asset_enrichment_incomplete: " + "; ".join(details),
-                    retryable=result.metadata_retryable,
-                )
+            if "key_features" in missing_before:
+                try:
+                    feature_result = await browser_client.fetch_homepage_key_features(task)
+                    if not await store.renew_lease(task):
+                        return "stale"
+                    await store.save_tool_features(task, feature_result)
+                    if feature_result.metadata_error:
+                        record_stage_error(
+                            "key_features",
+                            feature_result.metadata_error,
+                            retryable=feature_result.metadata_retryable,
+                        )
+                except Exception as error:
+                    record_stage_error("key_features", error)
+
+            if "category" in missing_before:
+                try:
+                    category_result = await browser_client.fetch_homepage_categories(task, category_options)
+                    if not await store.renew_lease(task):
+                        return "stale"
+                    await store.save_tool_categories(task, category_result)
+                    if category_result.metadata_error:
+                        record_stage_error(
+                            "category",
+                            category_result.metadata_error,
+                            retryable=category_result.metadata_retryable,
+                        )
+                except Exception as error:
+                    record_stage_error("category", error)
+
+            if "screenshot" in missing_before:
+                try:
+                    screenshot_result = await browser_client.capture_homepage_screenshot(task)
+                    if not await store.renew_lease(task):
+                        return "stale"
+                    screenshot_key = f"{task.normalized_domain}/{int(time.time() * 1000)}.png"
+                    await uploader.put_object(screenshot_key, screenshot_result.screenshot, "image/png")
+                    await store.upsert_tool_asset(
+                        task,
+                        "screenshot",
+                        screenshot_key,
+                        asset_public_url(public_base_url, screenshot_key),
+                        "image/png",
+                        1280,
+                        720,
+                    )
+                except Exception as error:
+                    record_stage_error("screenshot", error)
+
+            favicon: FaviconAsset | None = None
+            if "favicon" in missing_before:
+                try:
+                    favicon = await fetch_favicon_asset(
+                        core_result.final_url if core_result else asset_page_url(task),
+                        task.normalized_domain,
+                        core_result.html if core_result else "",
+                        core_result.favicon_href if core_result else "",
+                    )
+                    if favicon is None:
+                        raise AssetPipelineError("favicon_empty", retryable=True)
+                    if not await store.renew_lease(task):
+                        return "stale"
+                    await uploader.put_object(favicon.key, favicon.body, favicon.mime_type)
+                    await store.upsert_tool_asset(
+                        task,
+                        "favicon",
+                        favicon.key,
+                        asset_public_url(public_base_url, favicon.key),
+                        favicon.mime_type,
+                        None,
+                        None,
+                    )
+                except Exception as error:
+                    record_stage_error("favicon", error)
+
+            missing_requirements = await store.missing_asset_requirements(task.tool_id)
+            blocking_requirements = [
+                requirement
+                for requirement in missing_requirements
+                if requirement != "favicon"
+            ]
+            if blocking_requirements:
+                details = [f"missing={','.join(blocking_requirements)}"]
+                if stage_errors:
+                    details.append("stages=" + "; ".join(stage_errors))
+                last_error = "asset_enrichment_incomplete: " + "; ".join(details)
+                last_retryable = any(stage_retryable) if stage_retryable else True
+                raise AssetPipelineError(last_error, retryable=last_retryable)
 
             if not await store.complete_task(task, "done"):
                 return "stale"
@@ -5537,7 +6246,8 @@ async def process_asset_task(
                 domain=task.normalized_domain,
                 status="done",
                 favicon=bool(favicon),
-                enriched=bool(result.title or result.description or result.category_l1 or result.category_l2 or result.key_features),
+                requirements_processed=missing_before,
+                remaining_warnings=missing_requirements,
             )
             return "done"
         except Exception as error:
@@ -6293,6 +7003,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pricing", action="store_true", help="process pricing_tasks instead of traffic_tasks")
     parser.add_argument("--assets", action="store_true", help="process asset_tasks instead of traffic_tasks")
     parser.add_argument("--domain-state", action="store_true", help="process domain rating and whois creation date tasks")
+    parser.add_argument(
+        "--backfill-traffic-monthly",
+        action="store_true",
+        help="rebuild domain_traffic_monthly from raw Similarweb snapshots",
+    )
     parser.add_argument("--all", action="store_true", help="run traffic, domain-state, pricing, and assets loops in one process")
     parser.add_argument("--approve-pricing", action="store_true", help="write approved pricing extractions into active catalogs")
     parser.add_argument("--dry-run", action="store_true", help="for pricing mode, fetch and extract without D1 writes")
@@ -6301,22 +7016,35 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--interval-seconds", type=int, default=None)
     args = parser.parse_args()
-    selected = [args.pricing, args.assets, args.domain_state, args.all]
+    selected = [args.pricing, args.assets, args.domain_state, args.backfill_traffic_monthly, args.all]
     if sum(1 for value in selected if value) > 1:
-        parser.error("--pricing, --assets, --domain-state, and --all are mutually exclusive")
+        parser.error("--pricing, --assets, --domain-state, --backfill-traffic-monthly, and --all are mutually exclusive")
     if args.all and not args.loop:
         parser.error("--all requires --loop")
     if args.approve_pricing:
         parser.error("--approve-pricing is retired; approve the stored extraction in ainav Admin")
     if (args.approve_pricing or args.task_id or args.dry_run) and not args.pricing:
         parser.error("--approve-pricing, --task-id, and --dry-run require --pricing")
+    if args.backfill_traffic_monthly and args.loop:
+        parser.error("--backfill-traffic-monthly cannot be combined with --loop")
     return args
 
 
 def main() -> None:
     args = parse_args()
-    config = load_config(require_brightdata=not (args.pricing or args.assets or args.domain_state))
+    config = load_config(
+        require_brightdata=not (
+            args.pricing
+            or args.assets
+            or args.domain_state
+            or args.backfill_traffic_monthly
+        )
+    )
     interval_seconds = args.interval_seconds or config.poll_interval_seconds
+    if args.backfill_traffic_monthly:
+        counts = asyncio.run(backfill_domain_traffic_monthly(config, args.limit))
+        log_info("traffic_projection_backfill.summary", **counts)
+        return
     if args.all:
         asyncio.run(run_all_loop(config, args.limit, interval_seconds, args.timeout))
         return

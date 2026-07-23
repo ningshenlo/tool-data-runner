@@ -14,6 +14,8 @@ Pricing extraction payloads include `final_pipeline_stage` for tracking the fina
 
 Assets mode scans active catalog tools (`pending_enrich`, `pending_review`, and `published`) missing required catalog data, claims `asset_tasks`, captures homepage screenshots with Cloudflare Browser Run, uploads screenshots/favicons to R2, and writes assets, localization, categories, and key features. Every assets batch also refreshes the canonical readiness projection for the active catalog independently of whether an asset task was claimed, so manual fixes can advance a `pending_enrich` tool to `pending_review` and published records retain current quality signals.
 
+Asset retries are requirement-driven. Before every attempt the runner checks the current screenshot, favicon, published description, key features, and category state, then runs only the missing stages. Core metadata, key-feature extraction, and category classification use separate Browser Run requests, so a category retry does not recapture or re-upload an existing screenshot. Favicon remains a non-blocking quality warning and is retried periodically without preventing otherwise complete enrichment from finishing.
+
 Domain-state mode queues stale or missing domains into `domain_state_tasks`, then claims them with expiring leases and fenced completion tokens before updating `domain_states`. Every workload writes D1-backed runner heartbeats and batch history to `runner_instances` and `runner_runs`.
 
 ## Setup
@@ -28,6 +30,7 @@ copy .env.example .env
 Fill `.env` with:
 
 - `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_D1_DATABASE_ID`, `CLOUDFLARE_API_TOKEN`: D1 REST API access.
+- `AHREF_API_KEY`: Ahrefs free Domain Rating API authentication. The runner sends it as `Authorization: Bearer <token>`.
 - `BRIGHTDATA_PROXY_USER`, `BRIGHTDATA_PROXY_PASSWORD`: Bright Data proxy credentials for traffic mode.
 - Optional runner identity and tuning: stable `RUNNER_INSTANCE_ID`, deploy label `RUNNER_VERSION`, `RUNNER_LIMIT`, `RUNNER_PRICING_LIMIT`, `RUNNER_PRICING_TIMEOUT_SECONDS`.
 - Traffic release gate: `TRAFFIC_RELEASE_PROBE_DOMAIN` (default `chatgpt.com`), `TRAFFIC_RELEASE_PROBE_START_DAY` (default `7`), `TRAFFIC_RELEASE_PROBE_INTERVAL_SECONDS` (default `21600`), and `TRAFFIC_RELEASE_QUEUE_LIMIT` (default `5000`).
