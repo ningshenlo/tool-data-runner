@@ -51,20 +51,18 @@ PROVIDER_BLOCKED_RE = re.compile(
     re.I,
 )
 
-try:
-    from runner import clean_category_slug as _clean_slug
-except Exception:  # pragma: no cover
-    def _clean_slug(value: Any) -> str:
-        slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
-        return slug if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,119}", slug) else ""
-
-
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def clean_slug(value: Any) -> str:
-    return _clean_slug(value)
+    # Keep this implementation local. Importing ``runner`` from a process that
+    # was launched as ``python runner.py`` loads the entire runner a second time
+    # under a different module name before the taxonomy loop can emit telemetry.
+    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
+    if slug == "uncategorized":
+        return ""
+    return slug if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,119}", slug) else ""
 
 
 def _clip(value: Any, limit: int) -> str:

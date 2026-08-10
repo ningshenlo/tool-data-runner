@@ -6035,12 +6035,15 @@ async def preview_market_snapshot(
 
 
 class RunnerTelemetry:
-    WORKLOADS = ["assets", "traffic", "domain_state", "pricing", "taxonomy", "enrichment"]
+    BASE_WORKLOADS = ["assets", "traffic", "domain_state", "pricing", "enrichment"]
 
     def __init__(self, d1: D1Client, config: Config):
         self.d1 = d1
         self.instance_id = config.runner_instance_id
         self.version = config.runner_version
+        self.workloads = list(self.BASE_WORKLOADS)
+        if getattr(config, "taxonomy_auto_enabled", False):
+            self.workloads.insert(-1, "taxonomy")
 
     async def start(self, workload: str) -> int:
         now = utc_now_iso()
@@ -6058,7 +6061,7 @@ class RunnerTelemetry:
               stopped_at = NULL,
               updated_at = excluded.updated_at
             """,
-            [self.instance_id, self.version, json.dumps(self.WORKLOADS), now, now, now],
+            [self.instance_id, self.version, json.dumps(self.workloads), now, now, now],
         )
         rows = await self.d1.query(
             """
@@ -11140,21 +11143,26 @@ async def run_domain_state_loop(config: Config, limit: int | None, interval_seco
 
 
 async def run_taxonomy_once(config: Config) -> dict[str, int]:
-    from taxonomy_shadow import run_shadow_taxonomy
+    async def operation() -> dict[str, int]:
+        # Import inside the telemetered operation so packaging/import failures
+        # are visible as failed taxonomy runs instead of disappearing in logs.
+        from taxonomy_shadow import run_shadow_taxonomy
+
+        return await run_shadow_taxonomy(
+            config,
+            config.taxonomy_limit,
+            allow_unresolved_entity=True,
+            include_capabilities=False,
+            concurrency=config.taxonomy_concurrency,
+            auto_accept_threshold=config.taxonomy_auto_accept_confidence,
+        )
 
     async with D1Client(config) as telemetry_d1:
         return await run_with_telemetry(
             config,
             telemetry_d1,
             "taxonomy",
-            lambda: run_shadow_taxonomy(
-                config,
-                config.taxonomy_limit,
-                allow_unresolved_entity=True,
-                include_capabilities=False,
-                concurrency=config.taxonomy_concurrency,
-                auto_accept_threshold=config.taxonomy_auto_accept_confidence,
-            ),
+            operation,
         )
 
 
