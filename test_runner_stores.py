@@ -4,10 +4,12 @@ import io
 import json
 import sqlite3
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
+
+import httpx
 
 import runner
 
@@ -23,11 +25,94 @@ class TrafficProjectionMathTests(unittest.TestCase):
         self.assertIsNone(runner.traffic_share_to_bps(1.00001))
 
 
+class D1RequestObservabilityTests(unittest.IsolatedAsyncioTestCase):
+    async def test_http_error_preserves_sanitized_response_and_operation(self) -> None:
+        class D1Config:
+            cloudflare_account_id = "account-id"
+            cloudflare_d1_database_id = "database-id"
+            cloudflare_api_token = "secret-token"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                400,
+                headers={"cf-ray": "test-ray-SIN"},
+                json={
+                    "success": False,
+                    "errors": [
+                        {"code": 7500, "message": "no such table: domain_traffic_country_monthly"}
+                    ],
+                    "api_token": "should-not-leak",
+                },
+                request=request,
+            )
+
+        d1 = runner.D1Client(D1Config())
+        await d1.client.aclose()
+        d1.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        stderr = io.StringIO()
+        try:
+            with redirect_stderr(stderr), self.assertRaises(runner.D1RequestError) as raised:
+                await d1.batch(
+                    [("INSERT INTO domain_traffic_country_monthly VALUES (?)", ["US"])],
+                    operation="traffic.domain_country_monthly.upsert",
+                )
+        finally:
+            await d1.close()
+
+        message = str(raised.exception)
+        self.assertIn("operation=traffic.domain_country_monthly.upsert", message)
+        self.assertIn("no such table: domain_traffic_country_monthly", message)
+        self.assertIn("request_id=test-ray-SIN", message)
+        self.assertNotIn("should-not-leak", message)
+        self.assertNotIn("secret-token", message)
+        self.assertTrue(runner.is_missing_market_country_schema_error(raised.exception))
+
+        event = json.loads(stderr.getvalue().strip())
+        self.assertEqual(event["message"], "d1.request.failed")
+        self.assertEqual(event["operation"], "traffic.domain_country_monthly.upsert")
+        self.assertEqual(event["http_status"], 400)
+        self.assertEqual(event["request_id"], "test-ray-SIN")
+        self.assertIn("<redacted>", event["response_body"])
+        self.assertEqual(event["statement_count"], 1)
+        self.assertEqual(event["sql_verbs"], ["INSERT"])
+
+    async def test_success_false_response_is_not_silently_reduced(self) -> None:
+        class D1Config:
+            cloudflare_account_id = "account-id"
+            cloudflare_d1_database_id = "database-id"
+            cloudflare_api_token = "secret-token"
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                json={"success": False, "errors": [{"message": "D1 rejected query"}]},
+                request=request,
+            )
+
+        d1 = runner.D1Client(D1Config())
+        await d1.client.aclose()
+        d1.client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        try:
+            with redirect_stderr(io.StringIO()), self.assertRaises(runner.D1RequestError) as raised:
+                await d1.run("UPDATE traffic_tasks SET status = ?", ["failed"])
+        finally:
+            await d1.close()
+
+        self.assertEqual(raised.exception.reason, "api_unsuccessful")
+        self.assertIn("D1 rejected query", str(raised.exception))
+
+
 class FakeD1:
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
 
-    async def execute(self, sql: str, params: list[Any] | None = None) -> dict[str, Any]:
+    async def execute(
+        self,
+        sql: str,
+        params: list[Any] | None = None,
+        *,
+        operation: str | None = None,
+    ) -> dict[str, Any]:
         before = self.connection.total_changes
         cursor = self.connection.execute(sql, params or [])
         rows = [dict(row) for row in cursor.fetchall()] if cursor.description else []
@@ -40,15 +125,32 @@ class FakeD1:
             },
         }
 
-    async def query(self, sql: str, params: list[Any] | None = None) -> list[dict[str, Any]]:
-        result = await self.execute(sql, params)
+    async def query(
+        self,
+        sql: str,
+        params: list[Any] | None = None,
+        *,
+        operation: str | None = None,
+    ) -> list[dict[str, Any]]:
+        result = await self.execute(sql, params, operation=operation)
         return result["results"]
 
-    async def run(self, sql: str, params: list[Any] | None = None) -> dict[str, Any]:
-        result = await self.execute(sql, params)
+    async def run(
+        self,
+        sql: str,
+        params: list[Any] | None = None,
+        *,
+        operation: str | None = None,
+    ) -> dict[str, Any]:
+        result = await self.execute(sql, params, operation=operation)
         return result["meta"]
 
-    async def batch(self, statements: list[tuple[str, list[Any]]]) -> list[dict[str, Any]]:
+    async def batch(
+        self,
+        statements: list[tuple[str, list[Any]]],
+        *,
+        operation: str | None = None,
+    ) -> list[dict[str, Any]]:
         results: list[dict[str, Any]] = []
         self.connection.execute("BEGIN")
         try:
@@ -2891,6 +2993,53 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(row["status"], "no_data")
 
+    async def test_traffic_queue_skips_existing_claimable_tasks(self) -> None:
+        self.add_tool("traffic-already-failed", status="published")
+        self.add_tool("traffic-already-queued", status="published")
+        traffic_month = "2026-06-01"
+        self.connection.executemany(
+            """
+            INSERT INTO traffic_tasks (
+              normalized_domain, source, traffic_month, status, attempts,
+              max_attempts, next_retry_at, last_queued_at
+            )
+            VALUES (?, ?, ?, ?, ?, 5, ?, ?)
+            """,
+            [
+                (
+                    "traffic-already-failed.example",
+                    runner.TRAFFIC_SOURCE,
+                    traffic_month,
+                    "failed",
+                    1,
+                    "2000-01-01T00:00:00Z",
+                    "2000-01-01T00:00:00Z",
+                ),
+                (
+                    "traffic-already-queued.example",
+                    runner.TRAFFIC_SOURCE,
+                    traffic_month,
+                    "queued",
+                    0,
+                    None,
+                    "2000-01-01T00:00:00Z",
+                ),
+            ],
+        )
+        self.connection.commit()
+        store = runner.D1TaskStore(self.d1)
+
+        with patch.object(self.d1, "run", wraps=self.d1.run) as run:
+            queued = await store.queue_missing_traffic_tasks(10, traffic_month)
+
+        self.assertEqual(queued, 0)
+        self.assertEqual(run.await_count, 0)
+        claimed = await store.claim_due_tasks(10, "traffic-worker")
+        self.assertEqual(
+            {task.normalized_domain for task in claimed},
+            {"traffic-already-failed.example", "traffic-already-queued.example"},
+        )
+
     async def test_release_gate_requires_the_exact_requested_month(self) -> None:
         self.assertFalse(
             runner.requested_month_has_traffic_data(
@@ -3742,8 +3891,8 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "SELECT status, error, counts_json FROM runner_runs WHERE id = ?",
             [run_id],
         ).fetchone()
-        self.assertEqual(run["status"], "succeeded")
-        self.assertIsNone(run["error"])
+        self.assertEqual(run["status"], "failed")
+        self.assertEqual(run["error"], "Batch completed with failed=1")
         self.assertEqual(run["counts_json"], '{"claimed": 1, "failed": 1}')
 
 

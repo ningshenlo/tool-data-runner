@@ -445,6 +445,59 @@ class ContentSafetyError(AssetPipelineError):
         self.assessment = assessment
 
 
+class D1RequestError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        operation: str,
+        reason: str,
+        status_code: int | None,
+        request_id: str,
+        request_kind: str,
+        statement_count: int,
+        sql_verbs: list[str],
+        sql_fingerprint: str,
+        body_sample: str,
+    ):
+        self.operation = operation
+        self.reason = reason
+        self.status_code = status_code
+        self.request_id = request_id
+        self.request_kind = request_kind
+        self.statement_count = statement_count
+        self.sql_verbs = sql_verbs
+        self.sql_fingerprint = sql_fingerprint
+        self.body_sample = body_sample
+        details = [
+            f"operation={operation}",
+            f"reason={reason}",
+            f"request_kind={request_kind}",
+            f"statement_count={statement_count}",
+            f"sql_verbs={','.join(sql_verbs) or 'unknown'}",
+            f"sql_fingerprint={sql_fingerprint}",
+        ]
+        if status_code is not None:
+            details.append(f"http_status={status_code}")
+        if request_id:
+            details.append(f"request_id={request_id}")
+        if body_sample:
+            details.append(f"response_body={body_sample}")
+        super().__init__("D1 request failed: " + " ".join(details))
+
+    def log_fields(self) -> dict[str, Any]:
+        return {
+            "operation": self.operation,
+            "reason": self.reason,
+            "http_status": self.status_code,
+            "request_id": self.request_id,
+            "request_kind": self.request_kind,
+            "statement_count": self.statement_count,
+            "sql_verbs": self.sql_verbs,
+            "sql_fingerprint": self.sql_fingerprint,
+            "response_body": self.body_sample,
+        }
+
+
 @dataclass(frozen=True)
 class FaviconAsset:
     body: bytes
@@ -532,6 +585,47 @@ def response_body_sample(response: httpx.Response, limit: int = 500) -> str:
     except Exception as error:
         return f"<unable_to_read_response_text:{type(error).__name__}>"
     return re.sub(r"\s+", " ", text).strip()[:limit]
+
+
+def redact_log_text(value: str) -> str:
+    redacted = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._~+\-/=]+", "Bearer <redacted>", value)
+    redacted = re.sub(
+        r'(?i)("?(?:authorization|api[_-]?token|password|secret|cookie)"?\s*[:=]\s*")([^"\r\n]+)(")',
+        r"\1<redacted>\3",
+        redacted,
+    )
+    return redacted
+
+
+def d1_request_metadata(body: dict[str, Any], operation: str | None = None) -> dict[str, Any]:
+    statements: list[str] = []
+    request_kind = "unknown"
+    if isinstance(body.get("sql"), str):
+        request_kind = "query"
+        statements.append(str(body["sql"]))
+    elif isinstance(body.get("batch"), list):
+        request_kind = "batch"
+        statements.extend(
+            str(statement.get("sql") or "")
+            for statement in body["batch"]
+            if isinstance(statement, dict)
+        )
+
+    normalized_statements = [re.sub(r"\s+", " ", sql).strip() for sql in statements if sql.strip()]
+    sql_verbs: list[str] = []
+    for sql in normalized_statements:
+        match = re.match(r"(?:--[^\n]*\n\s*)*([A-Za-z]+)", sql)
+        verb = match.group(1).upper() if match else "UNKNOWN"
+        if verb not in sql_verbs:
+            sql_verbs.append(verb)
+    fingerprint_source = "\n".join(normalized_statements)
+    return {
+        "operation": operation or f"d1.{request_kind}",
+        "request_kind": request_kind,
+        "statement_count": len(normalized_statements),
+        "sql_verbs": sql_verbs,
+        "sql_fingerprint": sha256_text(fingerprint_source)[:16] if fingerprint_source else "none",
+    }
 
 
 
@@ -4445,48 +4539,134 @@ class D1Client:
     async def __aexit__(self, exc_type: Any, exc: Any, traceback: Any) -> None:
         await self.close()
 
-    async def _request(self, body: dict[str, Any], retry_transient: bool = False) -> list[dict[str, Any]]:
+    def _response_error(
+        self,
+        response: httpx.Response,
+        request_meta: dict[str, Any],
+        reason: str,
+    ) -> D1RequestError:
+        return D1RequestError(
+            operation=str(request_meta["operation"]),
+            reason=reason,
+            status_code=response.status_code,
+            request_id=str(response.headers.get("cf-ray") or response.headers.get("x-request-id") or ""),
+            request_kind=str(request_meta["request_kind"]),
+            statement_count=int(request_meta["statement_count"]),
+            sql_verbs=list(request_meta["sql_verbs"]),
+            sql_fingerprint=str(request_meta["sql_fingerprint"]),
+            body_sample=redact_log_text(response_body_sample(response, 1200)),
+        )
+
+    async def _request(
+        self,
+        body: dict[str, Any],
+        retry_transient: bool = False,
+        *,
+        operation: str | None = None,
+    ) -> list[dict[str, Any]]:
         response: httpx.Response | None = None
         last_error: Exception | None = None
         max_attempts = 4 if retry_transient else 1
+        request_meta = d1_request_metadata(body, operation)
         for attempt in range(max_attempts):
             try:
                 response = await self.client.post(self.url, headers=self.headers, json=body)
                 if response.status_code not in {429, 502, 503, 504}:
-                    response.raise_for_status()
+                    if response.is_error:
+                        request_error = self._response_error(response, request_meta, "http_error")
+                        log_error(
+                            "d1.request.failed",
+                            attempt=attempt + 1,
+                            max_attempts=max_attempts,
+                            **request_error.log_fields(),
+                        )
+                        raise request_error
                     break
-                last_error = httpx.HTTPStatusError(
-                    f"D1 transient HTTP {response.status_code}",
-                    request=response.request,
-                    response=response,
-                )
-            except (httpx.TimeoutException, httpx.NetworkError, httpx.HTTPStatusError) as error:
+                last_error = self._response_error(response, request_meta, "transient_http_error")
+            except D1RequestError:
+                raise
+            except httpx.RequestError as error:
                 last_error = error
-                if isinstance(error, httpx.HTTPStatusError) and error.response.status_code not in {429, 502, 503, 504}:
-                    raise
             if attempt < max_attempts - 1:
+                retry_fields = {
+                    "operation": request_meta["operation"],
+                    "attempt": attempt + 1,
+                    "max_attempts": max_attempts,
+                    "error_type": type(last_error).__name__,
+                    "error": str(last_error)[:1500],
+                }
+                log_info("d1.request.retrying", **retry_fields)
                 await asyncio.sleep(min(8.0, (2**attempt) + random.uniform(0.0, 0.5)))
 
         if response is None or response.status_code in {429, 502, 503, 504}:
-            raise RuntimeError(f"D1 request failed after {max_attempts} attempt(s): {last_error}") from last_error
+            if isinstance(last_error, D1RequestError):
+                log_error(
+                    "d1.request.failed",
+                    attempt=max_attempts,
+                    max_attempts=max_attempts,
+                    **last_error.log_fields(),
+                )
+                raise last_error
+            message = (
+                f"D1 request failed after {max_attempts} attempt(s): "
+                f"operation={request_meta['operation']} request_kind={request_meta['request_kind']} "
+                f"statement_count={request_meta['statement_count']} "
+                f"sql_fingerprint={request_meta['sql_fingerprint']} error={last_error}"
+            )
+            log_error(
+                "d1.request.failed",
+                operation=request_meta["operation"],
+                reason="request_error",
+                request_kind=request_meta["request_kind"],
+                statement_count=request_meta["statement_count"],
+                sql_verbs=request_meta["sql_verbs"],
+                sql_fingerprint=request_meta["sql_fingerprint"],
+                error_type=type(last_error).__name__ if last_error else "unknown",
+                error=str(last_error)[:1200],
+            )
+            raise RuntimeError(message) from last_error
 
-        payload = response.json()
+        try:
+            payload = response.json()
+        except (json.JSONDecodeError, ValueError) as error:
+            request_error = self._response_error(response, request_meta, "invalid_json_response")
+            log_error("d1.request.failed", **request_error.log_fields())
+            raise request_error from error
         if not payload.get("success", False):
-            raise RuntimeError(f"D1 query failed: {payload}")
+            request_error = self._response_error(response, request_meta, "api_unsuccessful")
+            log_error("d1.request.failed", **request_error.log_fields())
+            raise request_error
         result = payload.get("result")
         results = result if isinstance(result, list) else [result or {}]
         for query_result in results:
             if isinstance(query_result, dict) and not query_result.get("success", True):
-                raise RuntimeError(f"D1 query failed: {payload}")
+                request_error = self._response_error(response, request_meta, "query_unsuccessful")
+                log_error("d1.request.failed", **request_error.log_fields())
+                raise request_error
         return [query_result for query_result in results if isinstance(query_result, dict)]
 
-    async def execute(self, sql: str, params: list[Any] | None = None) -> Any:
+    async def execute(
+        self,
+        sql: str,
+        params: list[Any] | None = None,
+        *,
+        operation: str | None = None,
+    ) -> Any:
         normalized_sql = sql.lstrip().upper()
         retry_transient = normalized_sql.startswith(("SELECT", "PRAGMA", "EXPLAIN"))
-        results = await self._request({"sql": sql, "params": params or []}, retry_transient=retry_transient)
+        results = await self._request(
+            {"sql": sql, "params": params or []},
+            retry_transient=retry_transient,
+            operation=operation,
+        )
         return results[0] if results else {}
 
-    async def batch(self, statements: list[tuple[str, list[Any]]]) -> list[dict[str, Any]]:
+    async def batch(
+        self,
+        statements: list[tuple[str, list[Any]]],
+        *,
+        operation: str | None = None,
+    ) -> list[dict[str, Any]]:
         if not statements:
             return []
         return await self._request(
@@ -4495,17 +4675,30 @@ class D1Client:
                     {"sql": sql, "params": params}
                     for sql, params in statements
                 ]
-            }
+            },
+            operation=operation,
         )
 
-    async def query(self, sql: str, params: list[Any] | None = None) -> list[dict[str, Any]]:
-        result = await self.execute(sql, params)
+    async def query(
+        self,
+        sql: str,
+        params: list[Any] | None = None,
+        *,
+        operation: str | None = None,
+    ) -> list[dict[str, Any]]:
+        result = await self.execute(sql, params, operation=operation)
         if isinstance(result, dict) and isinstance(result.get("results"), list):
             return result["results"]
         return []
 
-    async def run(self, sql: str, params: list[Any] | None = None) -> dict[str, Any]:
-        result = await self.execute(sql, params)
+    async def run(
+        self,
+        sql: str,
+        params: list[Any] | None = None,
+        *,
+        operation: str | None = None,
+    ) -> dict[str, Any]:
+        result = await self.execute(sql, params, operation=operation)
         if isinstance(result, dict) and isinstance(result.get("meta"), dict):
             return result["meta"]
         return {}
@@ -4571,6 +4764,7 @@ class D1Client:
                 json.dumps(raw_payload or {}, ensure_ascii=False),
                 error,
             ],
+            operation="traffic.snapshot.insert",
         )
         last_row_id = to_integer(meta.get("last_row_id"))
         return last_row_id if last_row_id and last_row_id > 0 else None
@@ -4638,7 +4832,7 @@ class D1Client:
             if row.get("traffic_month")
         ]
         if statements:
-            await self.batch(statements)
+            await self.batch(statements, operation="traffic.domain_monthly.upsert")
             await self.upsert_domain_traffic_country_monthly(
                 domain,
                 rows,
@@ -4663,7 +4857,10 @@ class D1Client:
             return
 
         try:
-            await self.batch(statements)
+            await self.batch(
+                statements,
+                operation="traffic.domain_country_monthly.upsert",
+            )
         except Exception as error:
             if not is_missing_market_country_schema_error(error):
                 raise
@@ -4690,6 +4887,7 @@ class D1Client:
               AND duplicate_of_tool_id IS NULL
             """,
             [domain],
+            operation="traffic.tool_monthly.lookup",
         )
         if not tools:
             log_info("d1.tool_traffic_monthly.no_matching_tools", domain=domain)
@@ -4741,6 +4939,7 @@ class D1Client:
                         json.dumps(row, ensure_ascii=False),
                         captured_at,
                     ],
+                    operation="traffic.tool_monthly.upsert",
                 )
 
 
@@ -6077,7 +6276,6 @@ class RunnerTelemetry:
 
     async def finish(self, run_id: int, counts: dict[str, int] | None = None, error: str | None = None) -> None:
         now = utc_now_iso()
-        status = "failed" if error else "succeeded"
         counts = counts or {}
         counts_json = json.dumps(counts, sort_keys=True)
         degraded_counts = {
@@ -6090,6 +6288,7 @@ class RunnerTelemetry:
             health_error = "Batch completed with " + ", ".join(
                 f"{key}={value}" for key, value in degraded_counts.items()
             )
+        status = "failed" if health_error else "succeeded"
         statements: list[tuple[str, list[Any]]] = [
             (
                 """
@@ -6097,7 +6296,7 @@ class RunnerTelemetry:
                 SET status = ?, finished_at = ?, counts_json = ?, error = ?
                 WHERE id = ? AND instance_id = ? AND status = 'running'
                 """,
-                [status, now, counts_json, error, run_id, self.instance_id],
+                [status, now, counts_json, health_error, run_id, self.instance_id],
             ),
             (
                 """
@@ -7929,25 +8128,12 @@ class D1TaskStore:
               AND (
                 task.normalized_domain IS NULL
                 OR task.status = 'done'
-                OR (
-                  task.status IN ('failed', 'sync_failed')
-                  AND task.dead_letter_at IS NULL
-                  AND task.attempts < task.max_attempts
-                  AND (task.next_retry_at IS NULL OR task.next_retry_at <= ?)
-                )
-                OR (task.status = 'queued' AND task.dead_letter_at IS NULL)
-                OR (
-                  task.status = 'processing'
-                  AND task.dead_letter_at IS NULL
-                  AND task.lease_expires_at IS NOT NULL
-                  AND task.lease_expires_at <= ?
-                )
               )
             GROUP BY monitored.normalized_domain
             ORDER BY min(coalesce(task.updated_at, '')) ASC, monitored.normalized_domain ASC
             LIMIT ?
             """,
-            [TRAFFIC_SOURCE, traffic_month, TRAFFIC_SOURCE, traffic_month, now, now, limit],
+            [TRAFFIC_SOURCE, traffic_month, TRAFFIC_SOURCE, traffic_month, limit],
         )
 
         queued = 0
@@ -10872,13 +11058,18 @@ async def _run_once(config: Config, d1: D1Client, limit: int | None = None) -> d
                 status = await process_task(task, similarweb, d1, store, config.max_retries)
             except Exception as error:
                 status = "failed"
+                error_message = str(error)[:2000]
                 log_error(
                     "task.failed_with_exception",
                     domain=task.normalized_domain,
                     traffic_month=task.traffic_month,
-                    error=str(error)[:300],
+                    error_type=type(error).__name__,
+                    error=error_message,
                 )
-                if not await store.complete_task(task, FetchResult(status="failed", monthly_rows=[], error=str(error)[:300])):
+                if not await store.complete_task(
+                    task,
+                    FetchResult(status="failed", monthly_rows=[], error=error_message),
+                ):
                     status = "stale"
             counts[status] = counts.get(status, 0) + 1
             log_info("task.done", domain=task.normalized_domain, traffic_month=task.traffic_month, status=status)
