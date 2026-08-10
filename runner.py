@@ -11175,6 +11175,10 @@ async def run_taxonomy_loop(config: Config) -> None:
         auto_accept_confidence=config.taxonomy_auto_accept_confidence,
         primary_only=True,
     )
+    # The other four workloads all create telemetry rows and queue work at
+    # process start. Stagger taxonomy slightly to avoid making its first D1
+    # write compete with that startup burst.
+    await asyncio.sleep(10)
     while True:
         delay = config.taxonomy_interval_seconds
         try:
@@ -11191,7 +11195,12 @@ async def run_taxonomy_loop(config: Config) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            # Startup/telemetry failures are usually transient. Retrying soon
+            # prevents a single D1 collision from hiding taxonomy for the full
+            # normal 15-minute cadence.
+            delay = min(60, config.taxonomy_interval_seconds)
             log_error("taxonomy_runner.batch.failed", error=str(error)[:500])
+            log_info("taxonomy_runner.batch.retry_scheduled", delay_seconds=delay)
         await asyncio.sleep(delay)
 
 
