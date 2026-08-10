@@ -1,7 +1,10 @@
+import asyncio
 import inspect
+import io
 import json
 import sqlite3
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
@@ -10,6 +13,14 @@ import runner
 
 
 MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "ainav" / "d1" / "migrations"
+TEST_SKIPPED_DATA_MIGRATIONS = {"0026_reject_catalog_fit_mismatches.sql"}
+
+
+class TrafficProjectionMathTests(unittest.TestCase):
+    def test_country_share_clamps_provider_floating_point_noise_at_one(self) -> None:
+        self.assertEqual(runner.traffic_share_to_bps(1.0000000000000007), 10000)
+        self.assertEqual(runner.estimate_visits_from_bps(12345, 10000), 12345)
+        self.assertIsNone(runner.traffic_share_to_bps(1.00001))
 
 
 class FakeD1:
@@ -85,6 +96,20 @@ class FakeD1:
             captured_at=captured_at,
         )
 
+    async def upsert_domain_traffic_country_monthly(
+        self,
+        domain: str,
+        rows: list[dict[str, Any]],
+        *,
+        captured_at: str,
+    ) -> None:
+        await runner.D1Client.upsert_domain_traffic_country_monthly(
+            self,
+            domain,
+            rows,
+            captured_at=captured_at,
+        )
+
     async def upsert_tool_traffic_monthly(self, domain: str, rows: list[dict[str, Any]]) -> None:
         await runner.D1Client.upsert_tool_traffic_monthly(self, domain, rows)
 
@@ -92,7 +117,311 @@ class FakeD1:
         await runner.D1Client.insert_result(self, task, result)
 
 
+class PageAndNameQualityTests(unittest.TestCase):
+    def test_cloudflare_challenge_is_not_a_valid_product_page(self) -> None:
+        assessment = runner.classify_page_state(
+            "<html><head><title>Just a moment...</title></head>"
+            "<body><script>window._cf_chl_opt = {}</script>Checking your browser</body></html>",
+            http_status=200,
+        )
+        self.assertEqual(assessment.state, "anti_bot")
+
+    def test_access_denied_and_home_are_invalid_names_but_home_assistant_is_valid(self) -> None:
+        self.assertEqual(runner.invalid_tool_name_reason("Access Denied"), "access_denied_name")
+        self.assertEqual(runner.invalid_tool_name_reason("Home"), "generic_page_name")
+        self.assertEqual(runner.invalid_tool_name_reason("Home Assistant"), "")
+
+    def test_json_ld_product_name_wins_over_marketing_page_title(self) -> None:
+        html_body = """
+        <html><head>
+          <title>Free AI Video Generator for Everyone | SeaArt AI</title>
+          <script type="application/ld+json">
+            {"@type":"SoftwareApplication","name":"SeaArt AI"}
+          </script>
+        </head><body>Create images and videos with AI.</body></html>
+        """
+        result = runner.resolve_tool_name(html_body, "seaart.ai")
+        self.assertEqual(result.product_name, "SeaArt AI")
+        self.assertEqual(result.source, "json_ld_product")
+        self.assertEqual(result.review_status, "auto_approved")
+
+    def test_domain_matching_title_segment_is_selected(self) -> None:
+        result = runner.resolve_tool_name(
+            "<html><head><title>Home - Tractable</title></head><body>AI claims platform</body></html>",
+            "tractable.ai",
+        )
+        self.assertEqual(result.product_name, "Tractable")
+        self.assertEqual(result.review_status, "auto_approved")
+
+    def test_unproven_name_falls_back_to_domain_and_needs_review(self) -> None:
+        result = runner.resolve_tool_name(
+            "<html><head><title>Free AI Image Generator Online</title></head>"
+            "<body>Create images from text.</body></html>",
+            "example-tool.ai",
+        )
+        self.assertEqual(result.product_name, "Example Tool")
+        self.assertEqual(result.review_status, "needs_review")
+
+    def test_explicit_adult_generator_is_nsfw(self) -> None:
+        result = runner.assess_content_safety(
+            "<html><body>Generate NSFW AI porn images and videos.</body></html>",
+            "createporn.com",
+            product_name="AI Porn Generator",
+            model_label="nsfw",
+            model_confidence=99,
+        )
+        self.assertEqual(result.status, "nsfw")
+        self.assertGreaterEqual(result.risk_score, 95)
+
+    def test_ambiguous_companion_product_requires_review(self) -> None:
+        result = runner.assess_content_safety(
+            "<html><body>Uncensored AI girlfriend roleplay chat.</body></html>",
+            "companion.example",
+            model_label="uncertain",
+            model_confidence=75,
+        )
+        self.assertEqual(result.status, "needs_review")
+
+    def test_explicit_domain_model_is_safe_not_nsfw(self) -> None:
+        result = runner.assess_content_safety(
+            "<html><body>Capture your business as an explicit domain model and generate backend code.</body></html>",
+            "modelarch.io",
+            model_label="safe",
+            model_confidence=94,
+        )
+        self.assertEqual(result.status, "safe")
+
+
+class CategoryPromptHelperTests(unittest.TestCase):
+    def test_normalize_structured_json_payload_unwraps_openai_chat_content(self) -> None:
+        payload = {
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {
+                        "content": '{"category_l1":"coding-development","category_l2":"code-generation-understanding"}'
+                    },
+                }
+            ]
+        }
+        normalized = runner.normalize_structured_json_payload(payload)
+        self.assertEqual(normalized["category_l1"], "coding-development")
+        self.assertEqual(normalized["category_l2"], "code-generation-understanding")
+
+    def test_normalize_structured_json_payload_reads_reasoning_when_content_null(self) -> None:
+        payload = {
+            "content": None,
+            "reasoning": (
+                "After checking boundaries, category_l1 = \"marketing-seo\". "
+                'Final object: {"category_l1":"marketing-seo"}'
+            ),
+        }
+        normalized = runner.normalize_structured_json_payload(payload)
+        self.assertEqual(normalized["category_l1"], "marketing-seo")
+
+    def test_normalize_structured_json_payload_keeps_flat_schema_objects(self) -> None:
+        payload = {"category_l1": "writing-text", "category_l2": "content-generation"}
+        self.assertEqual(runner.normalize_structured_json_payload(payload), payload)
+
+    def test_build_category_prompt_includes_definitions_when_present(self) -> None:
+        entries = [
+            runner.CategoryCatalogEntry(
+                slug="code-assistant",
+                parent_slug="developer-tools",
+                definition="Helps write or review code",
+                excludes="Low-code website builders",
+                examples="Cursor",
+            ),
+            runner.CategoryCatalogEntry(slug="image-editing"),
+        ]
+        prompt = runner.build_category_classification_prompt(entries)
+        self.assertIn("code-assistant", prompt)
+        self.assertIn("def=Helps write or review code", prompt)
+        self.assertIn("excludes=Low-code website builders", prompt)
+        self.assertIn("image-editing", prompt)
+        self.assertIn("exact slugs", prompt)
+
+    def test_normalize_category_catalog_accepts_string_slugs(self) -> None:
+        entries = runner.normalize_category_catalog(["Image Editing", "code-assistant", ""])
+        self.assertEqual([entry.slug for entry in entries], ["image-editing", "code-assistant"])
+
+    def test_l1_prompt_contains_only_supplied_top_level_boundaries(self) -> None:
+        prompt = runner.build_category_l1_prompt([
+            runner.CategoryCatalogEntry(
+                slug="writing-text",
+                definition="Written text outcomes",
+                excludes="Marketing operations",
+            ),
+            runner.CategoryCatalogEntry(
+                slug="coding-development",
+                definition="Software development outcomes",
+            ),
+        ])
+
+        self.assertIn("writing-text | def=Written text outcomes", prompt)
+        self.assertIn("excludes=Marketing operations", prompt)
+        self.assertIn("coding-development", prompt)
+        self.assertNotIn("content-generation", prompt)
+
+    def test_normalize_category_model_id_expands_deepseek_short_names(self) -> None:
+        self.assertEqual(
+            runner.normalize_category_model_id("deepseek-v4-flash"),
+            "deepseek/deepseek-v4-flash",
+        )
+        self.assertEqual(
+            runner.normalize_category_model_id("deepseek/deepseek-v4-flash"),
+            "deepseek/deepseek-v4-flash",
+        )
+        self.assertEqual(
+            runner.normalize_category_model_id("workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
+            "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        )
+
+    def test_build_browser_response_format_uses_json_object_for_deepseek(self) -> None:
+        schema = {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {"category_l1": {"type": "string"}},
+            "required": ["category_l1"],
+        }
+        deepseek_format = runner.build_browser_response_format(
+            schema,
+            model="deepseek/deepseek-v4-flash",
+            stage="category_l1",
+        )
+        self.assertEqual(deepseek_format, {"type": "json_object"})
+        workers_format = runner.build_browser_response_format(
+            schema,
+            model="workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+            stage="category_l1",
+        )
+        self.assertEqual(workers_format["type"], "json_schema")
+        self.assertEqual(workers_format["json_schema"]["schema"], schema)
+        self.assertEqual(workers_format["json_schema"]["name"], "category_l1")
+
+    def test_augment_prompt_for_json_object_lists_required_keys(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {"category_l1": {"type": "string"}, "category_l2": {"type": "string"}},
+            "required": ["category_l1", "category_l2"],
+        }
+        prompt = runner.augment_prompt_for_response_format(
+            "Classify the product.",
+            schema,
+            {"type": "json_object"},
+        )
+        self.assertIn("Required keys: category_l1, category_l2", prompt)
+        self.assertIn("Classify the product.", prompt)
+
+
 class AssetExtractionContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_category_classification_is_hierarchical_and_uses_deepseek_v4_flash(self) -> None:
+        class RecordingClient(runner.CloudflareBrowserRunAssetClient):
+            def __init__(self) -> None:
+                self.timeout_seconds = 30
+                self.category_api_token = "workers-ai-token"
+                self.category_deepseek_api_key = "deepseek-test-key"
+                self.category_model = runner.DEFAULT_CATEGORY_CLASSIFICATION_MODEL
+                self.category_fallback_model = runner.DEFAULT_CATEGORY_CLASSIFICATION_FALLBACK_MODEL
+                self.calls: list[dict[str, Any]] = []
+
+            async def call_quick_action(self, endpoint: str, body: dict[str, Any]) -> Any:
+                self.assert_json_endpoint(endpoint)
+                self.calls.append(body)
+                response_format = body.get("response_format") or {}
+                if response_format.get("type") == "json_object":
+                    # DeepSeek path: schema keys are described in the prompt.
+                    if "category_l2" in str(body.get("prompt") or "") and "Required keys: category_l2" in str(
+                        body.get("prompt") or ""
+                    ):
+                        return {"category_l2": "content-generation"}
+                    return {"category_l1": "writing-text"}
+                schema = response_format.get("json_schema") or {}
+                if isinstance(schema.get("schema"), dict):
+                    properties = schema["schema"].get("properties") or {}
+                else:
+                    properties = schema.get("properties") or {}
+                return (
+                    {"category_l1": "writing-text"}
+                    if "category_l1" in properties
+                    else {"category_l2": "content-generation"}
+                )
+
+            @staticmethod
+            def assert_json_endpoint(endpoint: str) -> None:
+                if endpoint != "json":
+                    raise AssertionError(endpoint)
+
+        client = RecordingClient()
+        task = runner.AssetTask(1, "example", "example.com", "https://example.com", 1, 5, 1, "lease")
+        catalog = [
+            runner.CategoryCatalogEntry(slug="writing-text", definition="Written text outcomes"),
+            runner.CategoryCatalogEntry(slug="coding-development", definition="Software development"),
+            runner.CategoryCatalogEntry(slug="content-generation", parent_slug="writing-text"),
+            runner.CategoryCatalogEntry(slug="text-editing", parent_slug="writing-text"),
+            runner.CategoryCatalogEntry(slug="code-generation-understanding", parent_slug="coding-development"),
+        ]
+
+        result = await client.fetch_homepage_categories(task, catalog)
+
+        self.assertEqual((result.category_l1, result.category_l2), ("writing-text", "content-generation"))
+        self.assertEqual(len(client.calls), 2)
+        # Models are tried one-by-one; first successful attempt uses DeepSeek only.
+        self.assertEqual(len(client.calls[0]["custom_ai"]), 1)
+        self.assertEqual(
+            client.calls[0]["custom_ai"][0]["model"],
+            "deepseek/deepseek-v4-flash",
+        )
+        self.assertEqual(client.calls[0]["custom_ai"][0]["authorization"], "Bearer deepseek-test-key")
+        self.assertEqual(client.calls[0]["response_format"], {"type": "json_object"})
+        self.assertIn("Required keys: category_l1", client.calls[0]["prompt"])
+        self.assertIn("coding-development", client.calls[0]["prompt"])
+        self.assertIn("content-generation", client.calls[1]["prompt"])
+        self.assertNotIn("code-generation-understanding", client.calls[1]["prompt"])
+        raw = json.loads(result.category_raw_output)
+        self.assertEqual(raw["prompt_version"], runner.CATEGORY_CLASSIFICATION_PROMPT_VERSION)
+        self.assertEqual(
+            raw["model_chain"],
+            [
+                "deepseek/deepseek-v4-flash",
+                "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+            ],
+        )
+
+    async def test_category_l2_outside_selected_parent_is_rejected(self) -> None:
+        class RecordingClient(runner.CloudflareBrowserRunAssetClient):
+            def __init__(self) -> None:
+                self.timeout_seconds = 30
+                self.category_api_token = "token"
+                self.category_deepseek_api_key = "deepseek-test-key"
+                self.category_model = runner.DEFAULT_CATEGORY_CLASSIFICATION_MODEL
+                self.category_fallback_model = ""
+                self.call_count = 0
+
+            async def call_quick_action(self, _endpoint: str, _body: dict[str, Any]) -> Any:
+                self.call_count += 1
+                return (
+                    {"category_l1": "writing-text"}
+                    if self.call_count == 1
+                    else {"category_l2": "code-generation-understanding"}
+                )
+
+        task = runner.AssetTask(1, "example", "example.com", "https://example.com", 1, 5, 1, "lease")
+        result = await RecordingClient().fetch_homepage_categories(task, [
+            runner.CategoryCatalogEntry(slug="writing-text"),
+            runner.CategoryCatalogEntry(slug="coding-development"),
+            runner.CategoryCatalogEntry(slug="content-generation", parent_slug="writing-text"),
+            runner.CategoryCatalogEntry(slug="code-generation-understanding", parent_slug="coding-development"),
+        ])
+
+        self.assertEqual(result.category_l1, "writing-text")
+        self.assertEqual(result.category_l2, "")
+        self.assertEqual(result.metadata_error, "category_l2_unmatched=code-generation-understanding")
+        self.assertEqual(
+            json.loads(result.category_raw_output)["l2_error"],
+            "category_l2_unmatched=code-generation-understanding",
+        )
+
     async def test_browser_run_json_requests_split_core_features_and_category_contracts(self) -> None:
         class RecordingClient(runner.CloudflareBrowserRunAssetClient):
             def __init__(self) -> None:
@@ -101,12 +430,20 @@ class AssetExtractionContractTests(unittest.IsolatedAsyncioTestCase):
 
             async def call_quick_action(self, endpoint: str, body: dict[str, Any]) -> Any:
                 self.calls.append((endpoint, body))
-                properties = body["response_format"]["json_schema"]["properties"]
+                schema = body["response_format"]["json_schema"]
+                properties = schema.get("schema", schema)["properties"]
                 if "description" in properties:
                     return {
-                        "title": "Example",
+                        "product_name": "Example",
+                        "page_title": "Example - AI workspace",
                         "description": "Example description",
                         "favicon_href": "",
+                        "name_confidence": 95,
+                        "name_source": "homepage_brand",
+                        "name_evidence": "Header brand",
+                        "content_safety_label": "safe",
+                        "content_safety_confidence": 96,
+                        "content_safety_evidence": "No adult content signals",
                     }
                 if "key_features" in properties:
                     return {"key_features": [
@@ -140,11 +477,28 @@ class AssetExtractionContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(features.key_features or []), 1)
         self.assertEqual(categories.category_l2, "image-editing")
         self.assertEqual(len(client.calls), 3)
-        schemas = [body["response_format"]["json_schema"] for endpoint, body in client.calls if endpoint == "json"]
+        schemas = [
+            body["response_format"]["json_schema"].get(
+                "schema", body["response_format"]["json_schema"]
+            )
+            for endpoint, body in client.calls
+            if endpoint == "json"
+        ]
         self.assertEqual(
             [set(schema["properties"]) for schema in schemas],
             [
-                {"title", "description", "favicon_href"},
+                {
+                    "product_name",
+                    "page_title",
+                    "description",
+                    "favicon_href",
+                    "name_confidence",
+                    "name_source",
+                    "name_evidence",
+                    "content_safety_label",
+                    "content_safety_confidence",
+                    "content_safety_evidence",
+                },
                 {"key_features"},
                 {"category_l1", "category_l2"},
             ],
@@ -187,6 +541,59 @@ class AssetExtractionContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(raised.exception.retryable)
 
 
+class BrowserStructuredPayloadValidationTests(unittest.TestCase):
+    def test_empty_required_array_can_be_valid_when_explicitly_allowed(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {"capability_slugs": {"type": "array"}},
+            "required": ["capability_slugs"],
+        }
+
+        self.assertFalse(
+            runner.CloudflareBrowserRunAssetClient.structured_payload_has_required_fields(
+                {"capability_slugs": []}, schema
+            )
+        )
+        self.assertTrue(
+            runner.CloudflareBrowserRunAssetClient.structured_payload_has_required_fields(
+                {"capability_slugs": []},
+                schema,
+                allow_empty_required_arrays=True,
+            )
+        )
+
+    def test_allow_empty_array_still_requires_the_declared_key(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {"capability_slugs": {"type": "array"}},
+            "required": ["capability_slugs"],
+        }
+
+        self.assertFalse(
+            runner.CloudflareBrowserRunAssetClient.structured_payload_has_required_fields(
+                {},
+                schema,
+                allow_empty_required_arrays=True,
+            )
+        )
+
+    def test_capability_stage_can_explicitly_treat_empty_object_as_no_matches(self) -> None:
+        schema = {
+            "type": "object",
+            "properties": {"capability_slugs": {"type": "array"}},
+            "required": ["capability_slugs"],
+        }
+
+        self.assertTrue(
+            runner.CloudflareBrowserRunAssetClient.structured_payload_has_required_fields(
+                {},
+                schema,
+                allow_empty_required_arrays=True,
+                empty_object_means_empty_required_arrays=True,
+            )
+        )
+
+
 class DomainStateClientContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_ahrefs_domain_rating_request_uses_bearer_token(self) -> None:
         observed: dict[str, Any] = {}
@@ -227,12 +634,142 @@ class DomainStateClientContractTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(RuntimeError, "AHREF_API_KEY"):
             await runner.DomainStateClient("").fetch_ahrefs_domain_rating("example.com")
 
+    async def test_monthly_dr_refresh_skips_previously_checked_rdap(self) -> None:
+        client = runner.DomainStateClient("test-ahrefs-token")
+        client.fetch_ahrefs_domain_rating = AsyncMock(
+            return_value=runner.DomainStateResult("done", 51.0, None)
+        )
+        client.fetch_domain_created_at = AsyncMock(
+            return_value=runner.DomainStateResult("done", None, "2020-01-02T00:00:00Z")
+        )
+
+        result = await client.fetch("example.com", fetch_domain_rating=True, fetch_rdap=False)
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(result.domain_rating, 51.0)
+        self.assertIsNone(result.rdap_status)
+        client.fetch_ahrefs_domain_rating.assert_awaited_once_with("example.com")
+        client.fetch_domain_created_at.assert_not_awaited()
+
+    async def test_one_time_rdap_failure_is_a_completed_observation(self) -> None:
+        client = runner.DomainStateClient("test-ahrefs-token")
+        client.fetch_ahrefs_domain_rating = AsyncMock()
+        client.fetch_domain_created_at = AsyncMock(
+            return_value=runner.DomainStateResult("failed", None, None, "rdap_timeout")
+        )
+
+        result = await client.fetch("example.com", fetch_domain_rating=False, fetch_rdap=True)
+
+        self.assertEqual(result.status, "done")
+        self.assertEqual(result.rdap_status, "failed")
+        self.assertEqual(result.rdap_error, "rdap_timeout")
+        client.fetch_ahrefs_domain_rating.assert_not_awaited()
+        client.fetch_domain_created_at.assert_awaited_once_with("example.com")
+
+    async def test_ahrefs_exception_does_not_discard_one_time_rdap_result(self) -> None:
+        client = runner.DomainStateClient("test-ahrefs-token")
+        client.fetch_ahrefs_domain_rating = AsyncMock(side_effect=RuntimeError("ahrefs_down"))
+        client.fetch_domain_created_at = AsyncMock(
+            return_value=runner.DomainStateResult("done", None, "2020-01-02T00:00:00Z")
+        )
+
+        result = await client.fetch("example.com")
+
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.error, "ahrefs_down")
+        self.assertEqual(result.rdap_status, "done")
+        self.assertEqual(result.domain_created_at, "2020-01-02T00:00:00Z")
+
+    async def test_dr_retry_does_not_repeat_rdap_within_the_same_task(self) -> None:
+        task = runner.DomainStateTask(
+            normalized_domain="example.com",
+            attempts=1,
+            max_attempts=5,
+            generation=1,
+            lease_token="lease-token",
+            fetch_domain_rating=True,
+            fetch_rdap=True,
+        )
+        client = AsyncMock()
+        client.fetch.side_effect = [
+            runner.DomainStateResult(
+                "failed",
+                None,
+                "2020-01-02T00:00:00Z",
+                "ahrefs_down",
+                rdap_status="done",
+            ),
+            runner.DomainStateResult("done", 55.0, None),
+        ]
+        store = AsyncMock()
+        store.renew_lease.return_value = True
+        store.complete_task.return_value = True
+
+        with patch.object(runner.asyncio, "sleep", AsyncMock()):
+            status = await runner.process_domain_state(task, client, store, max_retries=1)
+
+        self.assertEqual(status, "done")
+        self.assertEqual(client.fetch.await_count, 2)
+        self.assertTrue(client.fetch.await_args_list[0].kwargs["fetch_rdap"])
+        self.assertFalse(client.fetch.await_args_list[1].kwargs["fetch_rdap"])
+        completed_result = store.complete_task.await_args.args[1]
+        self.assertEqual(completed_result.rdap_status, "done")
+        self.assertEqual(completed_result.domain_created_at, "2020-01-02T00:00:00Z")
+
+
+class DomainStateMigrationContractTests(unittest.TestCase):
+    def test_legacy_domain_crawls_are_marked_checked_without_another_rdap_request(self) -> None:
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        try:
+            for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+                if migration.name in TEST_SKIPPED_DATA_MIGRATIONS or migration.name.startswith("0035_"):
+                    continue
+                connection.executescript(migration.read_text(encoding="utf-8"))
+            connection.execute(
+                """
+                INSERT INTO domain_states (
+                  normalized_domain, source, domain_rating, last_crawled_at, domain_created_at
+                ) VALUES
+                  ('known.example', 'ahrefs', 50, '2026-07-01T00:00:00Z', '2020-01-02T00:00:00Z'),
+                  ('missing.example', 'ahrefs', 20, '2026-07-01T00:00:00Z', NULL)
+                """
+            )
+            connection.executemany(
+                "INSERT INTO domain_state_tasks (normalized_domain, source, status) VALUES (?, 'ahrefs', 'done')",
+                [("known.example",), ("missing.example",)],
+            )
+
+            migration = next(MIGRATIONS_DIR.glob("0035_*.sql"))
+            connection.executescript(migration.read_text(encoding="utf-8"))
+
+            rows = {
+                row["normalized_domain"]: row
+                for row in connection.execute(
+                    "SELECT normalized_domain, rdap_status, rdap_checked_at, rdap_last_error "
+                    "FROM domain_states"
+                ).fetchall()
+            }
+            self.assertEqual(rows["known.example"]["rdap_status"], "done")
+            self.assertEqual(rows["missing.example"]["rdap_status"], "no_data")
+            self.assertEqual(rows["missing.example"]["rdap_last_error"], "legacy_rdap_no_result")
+            self.assertTrue(rows["known.example"]["rdap_checked_at"])
+            self.assertTrue(rows["missing.example"]["rdap_checked_at"])
+            fetch_flags = connection.execute(
+                "SELECT sum(fetch_rdap) AS fetch_rdap FROM domain_state_tasks"
+            ).fetchone()
+            self.assertEqual(fetch_flags["fetch_rdap"], 0)
+        finally:
+            connection.close()
+
 
 class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
         for migration in sorted(MIGRATIONS_DIR.glob("*.sql")):
+            if migration.name in TEST_SKIPPED_DATA_MIGRATIONS:
+                continue
             self.connection.executescript(migration.read_text(encoding="utf-8"))
         self.connection.execute("PRAGMA foreign_keys = ON")
         self.d1 = FakeD1(self.connection)
@@ -243,8 +780,11 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
     def add_tool(self, suffix: str, *, status: str = "pending_enrich") -> int:
         cursor = self.connection.execute(
             """
-            INSERT INTO tools (canonical_slug, official_url, normalized_domain, status)
-            VALUES (?, ?, ?, ?)
+            INSERT INTO tools (
+              canonical_slug, official_url, normalized_domain, status,
+              content_safety_status, content_safety_score, content_safety_confidence
+            )
+            VALUES (?, ?, ?, ?, 'safe', 0, 100)
             """,
             [suffix, f"https://{suffix}.example", f"{suffix}.example", status],
         )
@@ -286,6 +826,110 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         await store.complete_task(task, "done")
         row = self.task_row("asset_tasks", "tool_id = ? AND source = ?", [tool_id, runner.ASSET_SOURCE])
         self.assert_completed_lease(row, "done")
+
+    async def test_antibot_preflight_blocks_every_asset_write_and_schedules_retry(self) -> None:
+        tool_id = self.add_tool("asset-antibot")
+        store = runner.D1AssetStore(self.d1)
+        self.assertEqual(await store.queue_missing_asset_tasks(10), 1)
+        task = (await store.claim_due_tasks(10, "asset-worker"))[0]
+
+        class AntiBotClient:
+            async def preflight_homepage(self, _: runner.AssetTask) -> runner.PageQualityAssessment:
+                return runner.PageQualityAssessment(
+                    "anti_bot",
+                    "challenge_title",
+                    "Just a moment...",
+                )
+
+        status = await runner.process_asset_task(
+            task,
+            AntiBotClient(),  # type: ignore[arg-type]
+            object(),  # type: ignore[arg-type]
+            store,
+            "https://img.example.test",
+            2,
+            [],
+        )
+
+        self.assertEqual(status, "failed")
+        row = self.task_row("asset_tasks", "tool_id = ? AND source = ?", [tool_id, runner.ASSET_SOURCE])
+        self.assertEqual(row["status"], "failed")
+        self.assertEqual(row["page_state"], "anti_bot")
+        self.assertIn("page_invalid:anti_bot", row["last_error"])
+        self.assertIsNotNone(row["next_retry_at"])
+        self.assertIsNone(row["dead_letter_at"])
+        localization_count = self.connection.execute(
+            "SELECT count(*) FROM tool_localizations WHERE tool_id = ?",
+            [tool_id],
+        ).fetchone()[0]
+        asset_count = self.connection.execute(
+            "SELECT count(*) FROM tool_assets WHERE tool_id = ?",
+            [tool_id],
+        ).fetchone()[0]
+        self.assertEqual(localization_count, 0)
+        self.assertEqual(asset_count, 0)
+
+    async def test_nsfw_detection_blocks_asset_writes_and_requires_review(self) -> None:
+        tool_id = self.add_tool("asset-nsfw")
+        self.connection.execute(
+            "UPDATE tools SET content_safety_status = 'unknown' WHERE id = ?",
+            [tool_id],
+        )
+        self.connection.commit()
+        store = runner.D1AssetStore(self.d1)
+        self.assertEqual(await store.queue_missing_asset_tasks(10), 1)
+        task = (await store.claim_due_tasks(10, "asset-worker"))[0]
+
+        class NsfwClient:
+            async def preflight_homepage(self, _: runner.AssetTask) -> runner.PageQualityAssessment:
+                return runner.PageQualityAssessment("valid_product_page", "usable_html", "Adult generator")
+
+            async def fetch_homepage_core_metadata(self, current: runner.AssetTask) -> runner.AssetFetchResult:
+                return runner.AssetFetchResult(
+                    final_url=current.official_url,
+                    title="Explicit Generator",
+                    description="Generate adult images",
+                    content_safety_status="nsfw",
+                    content_safety_score=99,
+                    content_safety_confidence=98,
+                    content_safety_reason="explicit_adult_product_signal",
+                    content_safety_evidence=["strong:nsfw"],
+                    content_safety_source="deterministic_rules",
+                )
+
+        uploader = AsyncMock()
+        status = await runner.process_asset_task(
+            task,
+            NsfwClient(),  # type: ignore[arg-type]
+            uploader,
+            store,
+            "https://img.example.test",
+            0,
+            [],
+        )
+
+        self.assertEqual(status, "failed")
+        tool = self.connection.execute(
+            "SELECT status, content_safety_status FROM tools WHERE id = ?",
+            [tool_id],
+        ).fetchone()
+        self.assertEqual(tool["status"], "pending_enrich")
+        self.assertEqual(tool["content_safety_status"], "nsfw")
+        event = self.connection.execute(
+            "SELECT decision, reason FROM tool_content_safety_events WHERE tool_id = ?",
+            [tool_id],
+        ).fetchone()
+        self.assertEqual(event["decision"], "nsfw")
+        self.assertEqual(event["reason"], "explicit_adult_product_signal")
+        self.assertEqual(
+            self.connection.execute("SELECT count(*) FROM tool_assets WHERE tool_id = ?", [tool_id]).fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            self.connection.execute("SELECT count(*) FROM tool_localizations WHERE tool_id = ?", [tool_id]).fetchone()[0],
+            0,
+        )
+        uploader.put_object.assert_not_awaited()
 
     async def test_asset_queue_includes_category_only_gap(self) -> None:
         tool_id = self.add_tool("asset-category-gap")
@@ -465,6 +1109,266 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertEqual(tool["primary_category_id"], category["parent_id"])
 
+    def _seed_legacy_categories(self, tool_id: int, parent_id: int, child_id: int | None = None) -> None:
+        self.connection.execute(
+            "UPDATE tools SET primary_category_id = ? WHERE id = ?",
+            [parent_id, tool_id],
+        )
+        self.connection.execute(
+            "INSERT INTO tool_categories (tool_id, category_id, source) VALUES (?, ?, 'auto')",
+            [tool_id, parent_id],
+        )
+        if child_id is not None:
+            self.connection.execute(
+                "INSERT INTO tool_categories (tool_id, category_id, source) VALUES (?, ?, 'auto')",
+                [tool_id, child_id],
+            )
+        self.connection.commit()
+
+    def _active_parent_child(self) -> sqlite3.Row:
+        category = self.connection.execute(
+            """
+            SELECT child.id AS child_id, child.canonical_slug AS child_slug,
+                   parent.id AS parent_id, parent.canonical_slug AS parent_slug
+            FROM categories child
+            JOIN categories parent ON parent.id = child.parent_category_id
+            WHERE child.status = 'active' AND parent.status = 'active'
+            ORDER BY child.id
+            LIMIT 1
+            """
+        ).fetchone()
+        self.assertIsNotNone(category)
+        return category
+
+    def _second_parent_child(self, exclude_parent_id: int) -> sqlite3.Row:
+        category = self.connection.execute(
+            """
+            SELECT child.id AS child_id, child.canonical_slug AS child_slug,
+                   parent.id AS parent_id, parent.canonical_slug AS parent_slug
+            FROM categories child
+            JOIN categories parent ON parent.id = child.parent_category_id
+            WHERE child.status = 'active'
+              AND parent.status = 'active'
+              AND parent.id <> ?
+            ORDER BY child.id
+            LIMIT 1
+            """,
+            [exclude_parent_id],
+        ).fetchone()
+        self.assertIsNotNone(category)
+        return category
+
+    async def test_published_legacy_category_candidate_filters(self) -> None:
+        category = self._active_parent_child()
+        published_id = self.add_tool("pub-legacy", status="published")
+        rejected_id = self.add_tool("rej-legacy", status="rejected")
+        manual_id = self.add_tool("pub-manual", status="published")
+        done_id = self.add_tool("pub-done", status="published")
+        pending_id = self.add_tool("pend-legacy", status="pending_enrich")
+
+        self._seed_legacy_categories(published_id, category["parent_id"], category["child_id"])
+        self._seed_legacy_categories(rejected_id, category["parent_id"], category["child_id"])
+        self._seed_legacy_categories(manual_id, category["parent_id"], category["child_id"])
+        self.connection.execute(
+            "UPDATE tool_categories SET source = 'manual' WHERE tool_id = ?",
+            [manual_id],
+        )
+        self._seed_legacy_categories(done_id, category["parent_id"], category["child_id"])
+        raw_done = json.dumps(
+            {
+                "backfill": runner.PUBLISHED_CATEGORY_BACKFILL_VERSION,
+                "prompt_version": runner.CATEGORY_CLASSIFICATION_PROMPT_VERSION,
+                "mode": "hierarchical",
+            }
+        )
+        self.connection.execute(
+            """
+            UPDATE tools
+            SET category_classification_status = 'auto_ok',
+                category_classification_raw = ?
+            WHERE id = ?
+            """,
+            [raw_done, done_id],
+        )
+        self._seed_legacy_categories(pending_id, category["parent_id"], category["child_id"])
+        self.connection.commit()
+
+        store = runner.D1AssetStore(self.d1)
+        tasks = await store.published_legacy_category_tasks(50)
+        tool_ids = {task.tool_id for task in tasks}
+        self.assertIn(published_id, tool_ids)
+        self.assertNotIn(rejected_id, tool_ids)
+        self.assertNotIn(manual_id, tool_ids)
+        self.assertNotIn(done_id, tool_ids)
+        self.assertNotIn(pending_id, tool_ids)
+
+    async def test_published_category_backfill_replaces_atomically_and_is_resumable(self) -> None:
+        old = self._active_parent_child()
+        new = self._second_parent_child(old["parent_id"])
+        tool_id = self.add_tool("pub-backfill-apply", status="published")
+        self._seed_legacy_categories(tool_id, old["parent_id"], old["child_id"])
+
+        task = runner.AssetTask(
+            tool_id=tool_id,
+            canonical_slug="pub-backfill-apply",
+            normalized_domain="pub-backfill-apply.example",
+            official_url="https://pub-backfill-apply.example",
+            attempts=0,
+            max_attempts=1,
+            generation=0,
+            lease_token="published-category-backfill",
+        )
+        result = runner.AssetFetchResult(
+            final_url=task.official_url,
+            category_l1=new["parent_slug"],
+            category_l2=new["child_slug"],
+            category_raw_output=json.dumps(
+                {
+                    "prompt_version": runner.CATEGORY_CLASSIFICATION_PROMPT_VERSION,
+                    "mode": "hierarchical",
+                    "taxonomy_version": "test-tax",
+                    "model_chain": [runner.DEFAULT_CATEGORY_CLASSIFICATION_MODEL],
+                }
+            ),
+        )
+
+        store = runner.D1AssetStore(self.d1)
+        dry = await store.apply_published_category_backfill(task, result, dry_run=True)
+        self.assertFalse(dry["applied"])
+        still_old = self.connection.execute(
+            "SELECT primary_category_id FROM tools WHERE id = ?",
+            [tool_id],
+        ).fetchone()
+        self.assertEqual(still_old["primary_category_id"], old["parent_id"])
+
+        summary = await store.apply_published_category_backfill(task, result, dry_run=False)
+        self.assertTrue(summary["applied"])
+
+        tool = self.connection.execute(
+            """
+            SELECT primary_category_id, category_classification_status, category_classification_raw
+            FROM tools WHERE id = ?
+            """,
+            [tool_id],
+        ).fetchone()
+        self.assertEqual(tool["primary_category_id"], new["parent_id"])
+        self.assertEqual(tool["category_classification_status"], "auto_ok")
+        self.assertTrue(runner.raw_has_published_category_backfill(tool["category_classification_raw"]))
+
+        assigned = {
+            row["category_id"]
+            for row in self.connection.execute(
+                "SELECT category_id FROM tool_categories WHERE tool_id = ?",
+                [tool_id],
+            ).fetchall()
+        }
+        self.assertEqual(assigned, {new["parent_id"], new["child_id"]})
+
+        change = self.connection.execute(
+            "SELECT change_type, old_value, new_value FROM tool_change_log WHERE tool_id = ?",
+            [tool_id],
+        ).fetchone()
+        self.assertEqual(change["change_type"], "category_backfill")
+        self.assertIn(str(old["parent_id"]), change["old_value"])
+        self.assertIn(new["parent_slug"], change["new_value"])
+
+        event = self.connection.execute(
+            "SELECT outcome, category_l1_slug, category_l2_slug FROM tool_category_classification_events WHERE tool_id = ?",
+            [tool_id],
+        ).fetchone()
+        self.assertEqual(event["outcome"], "auto_ok")
+        self.assertEqual(event["category_l1_slug"], new["parent_slug"])
+        self.assertEqual(event["category_l2_slug"], new["child_slug"])
+
+        remaining = await store.published_legacy_category_tasks(50)
+        self.assertNotIn(tool_id, {item.tool_id for item in remaining})
+
+    async def test_published_category_backfill_failure_keeps_live_categories(self) -> None:
+        category = self._active_parent_child()
+        tool_id = self.add_tool("pub-backfill-fail", status="published")
+        self._seed_legacy_categories(tool_id, category["parent_id"], category["child_id"])
+        task = runner.AssetTask(
+            tool_id=tool_id,
+            canonical_slug="pub-backfill-fail",
+            normalized_domain="pub-backfill-fail.example",
+            official_url="https://pub-backfill-fail.example",
+            attempts=0,
+            max_attempts=1,
+            generation=0,
+            lease_token="published-category-backfill",
+        )
+        store = runner.D1AssetStore(self.d1)
+        await store.record_published_category_backfill_failure(
+            task,
+            error="category_l1_empty",
+            raw_output=json.dumps({"error": "category_l1_empty"}),
+        )
+
+        tool = self.connection.execute(
+            "SELECT primary_category_id, category_classification_last_error FROM tools WHERE id = ?",
+            [tool_id],
+        ).fetchone()
+        self.assertEqual(tool["primary_category_id"], category["parent_id"])
+        self.assertEqual(tool["category_classification_last_error"], "category_l1_empty")
+        assigned = {
+            row["category_id"]
+            for row in self.connection.execute(
+                "SELECT category_id FROM tool_categories WHERE tool_id = ?",
+                [tool_id],
+            ).fetchall()
+        }
+        self.assertEqual(assigned, {category["parent_id"], category["child_id"]})
+        outcomes = [
+            row["outcome"]
+            for row in self.connection.execute(
+                "SELECT outcome FROM tool_category_classification_events WHERE tool_id = ?",
+                [tool_id],
+            ).fetchall()
+        ]
+        self.assertEqual(outcomes, ["auto_failed"])
+
+    def test_published_category_backfill_success_helper(self) -> None:
+        ok = runner.AssetFetchResult(final_url="https://x", category_l1="writing-text", category_l2="")
+        self.assertTrue(runner.published_category_backfill_success(ok))
+        bad_l1 = runner.AssetFetchResult(final_url="https://x", category_l1="", metadata_error="category_l1_empty")
+        self.assertFalse(runner.published_category_backfill_success(bad_l1))
+        bad_l2 = runner.AssetFetchResult(
+            final_url="https://x",
+            category_l1="writing-text",
+            metadata_error="category_l2_unmatched=not-a-child",
+        )
+        self.assertFalse(runner.published_category_backfill_success(bad_l2))
+
+    async def test_category_failures_stop_retries_but_remain_readiness_blocker(self) -> None:
+        tool_id = self.add_tool("asset-category-manual-review")
+        store = runner.D1AssetStore(self.d1)
+
+        for attempt in range(runner.CATEGORY_CLASSIFICATION_MAX_ATTEMPTS):
+            state = await store.record_category_classification_failure(
+                tool_id,
+                f"classification failed {attempt + 1}",
+                raw_output=json.dumps({"attempt": attempt + 1}),
+            )
+
+        self.assertEqual(state["status"], "needs_manual")
+        self.assertEqual(state["attempts"], runner.CATEGORY_CLASSIFICATION_MAX_ATTEMPTS)
+        self.assertTrue(await store.category_is_waived(tool_id))
+
+        readiness = await runner.D1EnrichmentStore(self.d1).evaluate_tool(tool_id)
+        self.assertEqual(readiness, "blocked")
+        enrichment = self.task_row("tool_enrichment_states", "tool_id = ?", [tool_id])
+        self.assertIn("category", json.loads(enrichment["blocking_json"]))
+        self.assertIn("category_needs_manual", json.loads(enrichment["warnings_json"]))
+
+        outcomes = [
+            row["outcome"]
+            for row in self.connection.execute(
+                "select outcome from tool_category_classification_events where tool_id = ? order by id",
+                [tool_id],
+            ).fetchall()
+        ]
+        self.assertEqual(outcomes, ["auto_failed", "auto_failed", "needs_manual"])
+
     async def test_asset_localization_uses_clean_public_slug_and_numbers_real_collisions(self) -> None:
         existing_tool_id = self.add_tool("existing-hocoos")
         self.connection.execute(
@@ -507,6 +1411,42 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertEqual(localization["localized_slug"], "hocoos-2")
         self.assertEqual(localization["name"], "Hocoos AI Website Builder")
+
+    async def test_low_confidence_name_is_persisted_for_review_but_blocks_readiness(self) -> None:
+        tool_id = self.add_tool("uncertain-name")
+        task = runner.AssetTask(
+            tool_id=tool_id,
+            canonical_slug="uncertain-name",
+            normalized_domain="uncertain-name.example",
+            official_url="https://uncertain-name.example/",
+            attempts=1,
+            max_attempts=5,
+            generation=1,
+            lease_token="test-lease",
+        )
+        result = runner.AssetFetchResult(
+            final_url=task.official_url,
+            title="Uncertain Name",
+            description="An AI product whose exact brand needs confirmation.",
+            name_source="domain_fallback",
+            name_confidence=45,
+            name_evidence="hostname=uncertain-name.example",
+            name_review_status="needs_review",
+        )
+
+        await runner.D1AssetStore(self.d1).save_tool_localization(task, result)
+        localization = self.connection.execute(
+            "SELECT name, name_confidence, name_review_status FROM tool_localizations WHERE tool_id = ?",
+            [tool_id],
+        ).fetchone()
+        self.assertEqual(localization["name"], "Uncertain Name")
+        self.assertEqual(localization["name_confidence"], 45)
+        self.assertEqual(localization["name_review_status"], "needs_review")
+
+        readiness = await runner.D1EnrichmentStore(self.d1).evaluate_tool(tool_id)
+        self.assertEqual(readiness, "blocked")
+        enrichment = self.task_row("tool_enrichment_states", "tool_id = ?", [tool_id])
+        self.assertIn("name_quality", json.loads(enrichment["blocking_json"]))
 
     async def test_public_slug_data_migration_is_global_collision_safe_and_idempotent(self) -> None:
         existing_runway_id = self.add_tool("runway", status="published")
@@ -685,6 +1625,26 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertEqual(monthly["visits"], 1234)
 
+    async def test_ai_directory_domains_join_the_monthly_traffic_queue(self) -> None:
+        self.connection.execute(
+            """
+            INSERT INTO ai_directory_sites (
+              normalized_domain, canonical_url, submission_url, submission_mode, status
+            )
+            VALUES ('directory.example', 'https://directory.example/', 'https://directory.example/submit', 'free', 'active')
+            """
+        )
+        self.connection.commit()
+        store = runner.D1TaskStore(self.d1)
+
+        self.assertEqual(await store.queue_missing_traffic_tasks(10, "2026-06-01"), 1)
+        row = self.task_row(
+            "traffic_tasks",
+            "normalized_domain = ? AND source = ? AND traffic_month = ?",
+            ["directory.example", runner.TRAFFIC_SOURCE, "2026-06-01"],
+        )
+        self.assertEqual(row["status"], "queued")
+
     async def test_similarweb_keywords_and_raw_payload_are_preserved(self) -> None:
         tool_id = self.add_tool("traffic-keywords", status="published")
         traffic_month = "2026-06-01"
@@ -768,6 +1728,1110 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertEqual(preserved["visits"], 5000)
         self.assertEqual(preserved["keyword_count"], 2)
+
+    async def test_domain_traffic_monthly_dual_writes_and_reconciles_top_countries(self) -> None:
+        domain = "traffic-countries.example"
+        traffic_month = "2026-06-01"
+        await self.d1.upsert_domain_traffic_monthly(
+            domain,
+            [
+                {
+                    "traffic_month": traffic_month,
+                    "visits": 10000,
+                    "top_country_1": "us",
+                    "top_country_1_traffic_share": 0.33335,
+                    "top_country_2": "GB",
+                    "top_country_2_traffic_share": 0.1,
+                }
+            ],
+            captured_at="2026-07-01T00:00:00Z",
+        )
+
+        rows = self.connection.execute(
+            "SELECT country_code, country_position, traffic_share_bps, estimated_visits "
+            "FROM domain_traffic_country_monthly "
+            "WHERE normalized_domain = ? AND traffic_month = ? ORDER BY country_position",
+            [domain, traffic_month],
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in rows],
+            [("US", 1, 3334, 3334), ("GB", 2, 1000, 1000)],
+        )
+
+        await self.d1.upsert_domain_traffic_monthly(
+            domain,
+            [
+                {
+                    "traffic_month": traffic_month,
+                    "visits": 12000,
+                    "top_country_1": "ca",
+                    "top_country_1_traffic_share": 0.25,
+                }
+            ],
+            captured_at="2026-07-02T00:00:00Z",
+        )
+        reconciled = self.connection.execute(
+            "SELECT country_code, country_position, traffic_share_bps, estimated_visits "
+            "FROM domain_traffic_country_monthly "
+            "WHERE normalized_domain = ? AND traffic_month = ?",
+            [domain, traffic_month],
+        ).fetchall()
+        self.assertEqual([tuple(row) for row in reconciled], [("CA", 1, 2500, 3000)])
+
+        await self.d1.upsert_domain_traffic_monthly(
+            domain,
+            [{"traffic_month": traffic_month, "visits": 16000}],
+            captured_at="2026-07-03T00:00:00Z",
+        )
+        refreshed = self.connection.execute(
+            "SELECT country_code, traffic_share_bps, estimated_visits "
+            "FROM domain_traffic_country_monthly "
+            "WHERE normalized_domain = ? AND traffic_month = ?",
+            [domain, traffic_month],
+        ).fetchall()
+        self.assertEqual([tuple(row) for row in refreshed], [("CA", 2500, 4000)])
+
+    async def test_country_dual_write_safely_degrades_only_when_0041_table_is_missing(self) -> None:
+        self.connection.execute("DROP TABLE domain_traffic_country_monthly")
+        self.connection.commit()
+
+        with patch.object(runner, "log_info") as mocked_log:
+            await self.d1.upsert_domain_traffic_monthly(
+                "traffic-pre-migration.example",
+                [
+                    {
+                        "traffic_month": "2026-06-01",
+                        "visits": 777,
+                        "top_country_1": "US",
+                        "top_country_1_traffic_share": 0.5,
+                    }
+                ],
+            )
+
+        monthly = self.connection.execute(
+            "SELECT visits FROM domain_traffic_monthly "
+            "WHERE normalized_domain = ? AND source = ? AND traffic_month = ?",
+            ["traffic-pre-migration.example", runner.TRAFFIC_SOURCE, "2026-06-01"],
+        ).fetchone()
+        self.assertEqual(monthly["visits"], 777)
+        self.assertIs(self.d1._market_country_schema_available, False)
+        mocked_log.assert_called_once()
+        self.assertEqual(
+            mocked_log.call_args.args[0],
+            "d1.domain_traffic_country_monthly.schema_unavailable",
+        )
+
+    async def test_country_dual_write_does_not_hide_other_schema_errors(self) -> None:
+        self.connection.execute("DROP TABLE domain_traffic_country_monthly")
+        self.connection.execute("CREATE TABLE domain_traffic_country_monthly (unexpected TEXT)")
+        self.connection.commit()
+
+        with self.assertRaises(sqlite3.OperationalError):
+            await self.d1.upsert_domain_traffic_monthly(
+                "traffic-bad-schema.example",
+                [
+                    {
+                        "traffic_month": "2026-06-01",
+                        "visits": 900,
+                        "top_country_1": "US",
+                        "top_country_1_traffic_share": 0.5,
+                    }
+                ],
+            )
+
+    async def test_market_foundation_migration_is_schema_only(self) -> None:
+        migration_sql = (
+            MIGRATIONS_DIR / "0041_market_explorer_foundation.sql"
+        ).read_text(encoding="utf-8")
+        executable_sql = "\n".join(
+            line.split("--", 1)[0] for line in migration_sql.splitlines()
+        )
+        statements = [
+            " ".join(statement.split()).upper()
+            for statement in executable_sql.split(";")
+            if statement.strip()
+        ]
+
+        self.assertTrue(statements)
+        self.assertTrue(
+            all(
+                statement == "END"
+                or statement.startswith(
+                    (
+                        "PRAGMA ",
+                        "CREATE TABLE ",
+                        "CREATE INDEX ",
+                        "CREATE UNIQUE INDEX ",
+                        "CREATE TRIGGER ",
+                    )
+                )
+                for statement in statements
+            )
+        )
+        self.assertNotIn("JSON_EACH(", executable_sql.upper())
+        self.assertNotIn("ROW_NUMBER() OVER", executable_sql.upper())
+        self.assertNotIn("INSERT INTO DOMAIN_TRAFFIC_COUNTRY_MONTHLY", executable_sql.upper())
+
+    async def test_traffic_projection_backfill_pages_resumes_and_replays_countries(self) -> None:
+        snapshots = [
+            {
+                "domain": "raw-countries.example",
+                "visits": 1000,
+                "country_1": None,
+                "share_1": None,
+                "country_2": None,
+                "share_2": None,
+                "raw_payload": {
+                    "SiteName": "raw-countries.example",
+                    "SnapshotDate": "2026-06-01",
+                    "EstimatedMonthlyVisits": {"2026-06-01": 1000},
+                    "TopCountryShares": [
+                        {"CountryCode": "US", "Value": 0.6},
+                        {"CountryCode": "GB", "Value": 0.2},
+                    ],
+                },
+            },
+            {
+                "domain": "legacy-columns.example",
+                "visits": 800,
+                "country_1": "CA",
+                "share_1": 0.5,
+                "country_2": "MX",
+                "share_2": 0.125,
+                "raw_payload": {},
+            },
+            {
+                "domain": "resume-countries.example",
+                "visits": 500,
+                "country_1": None,
+                "share_1": None,
+                "country_2": None,
+                "share_2": None,
+                "raw_payload": {
+                    "SiteName": "resume-countries.example",
+                    "SnapshotDate": "2026-06-01",
+                    "EstimatedMonthlyVisits": {"2026-06-01": 500},
+                    "TopCountryShares": [{"CountryCode": "JP", "Value": 0.4}],
+                },
+            },
+        ]
+        snapshot_ids: list[int] = []
+        for index, snapshot in enumerate(snapshots, start=1):
+            cursor = self.connection.execute(
+                """
+                INSERT INTO domain_traffic_snapshots (
+                  normalized_domain, source, website, traffic_month, status, visits,
+                  top_country_1, top_country_1_traffic_share,
+                  top_country_2, top_country_2_traffic_share,
+                  fetched_at, raw_payload
+                )
+                VALUES (?, ?, ?, '2026-06-01', 'done', ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    snapshot["domain"],
+                    runner.TRAFFIC_SOURCE,
+                    snapshot["domain"],
+                    snapshot["visits"],
+                    snapshot["country_1"],
+                    snapshot["share_1"],
+                    snapshot["country_2"],
+                    snapshot["share_2"],
+                    f"2026-07-0{index}T00:00:00Z",
+                    json.dumps(snapshot["raw_payload"]),
+                ],
+            )
+            snapshot_ids.append(int(cursor.lastrowid))
+        self.connection.commit()
+
+        with patch.object(runner, "log_info"):
+            first = await runner.backfill_domain_traffic_monthly_from_d1(
+                self.d1,
+                limit=2,
+                page_size=1,
+                write_batch_size=4,
+            )
+
+        self.assertEqual(first["snapshots_scanned"], 2)
+        self.assertEqual(first["pages_completed"], 2)
+        self.assertEqual(first["last_snapshot_id"], snapshot_ids[1])
+        self.assertEqual(first["monthly_rows_upserted"], 2)
+        self.assertEqual(first["country_rows_upserted"], 4)
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT 1 FROM domain_traffic_monthly WHERE normalized_domain = ?",
+                [snapshots[2]["domain"]],
+            ).fetchone()
+        )
+
+        with patch.object(runner, "log_info"):
+            resumed = await runner.backfill_domain_traffic_monthly_from_d1(
+                self.d1,
+                after_snapshot_id=first["last_snapshot_id"],
+                page_size=1,
+                write_batch_size=4,
+            )
+
+        self.assertEqual(resumed["snapshots_scanned"], 1)
+        self.assertEqual(resumed["pages_completed"], 1)
+        self.assertEqual(resumed["last_snapshot_id"], snapshot_ids[2])
+        country_rows = self.connection.execute(
+            """
+            SELECT normalized_domain, country_code, country_position,
+                   traffic_share_bps, estimated_visits, source_snapshot_id
+            FROM domain_traffic_country_monthly
+            ORDER BY normalized_domain, country_position
+            """
+        ).fetchall()
+        expected_rows = [
+            ("legacy-columns.example", "CA", 1, 5000, 400, snapshot_ids[1]),
+            ("legacy-columns.example", "MX", 2, 1250, 100, snapshot_ids[1]),
+            ("raw-countries.example", "US", 1, 6000, 600, snapshot_ids[0]),
+            ("raw-countries.example", "GB", 2, 2000, 200, snapshot_ids[0]),
+            ("resume-countries.example", "JP", 1, 4000, 200, snapshot_ids[2]),
+        ]
+        self.assertEqual([tuple(row) for row in country_rows], expected_rows)
+        legacy_monthly = self.connection.execute(
+            "SELECT visits FROM domain_traffic_monthly WHERE normalized_domain = ?",
+            [snapshots[1]["domain"]],
+        ).fetchone()
+        self.assertEqual(legacy_monthly["visits"], 800)
+
+        with patch.object(runner, "log_info"):
+            replayed = await runner.backfill_domain_traffic_monthly_from_d1(
+                self.d1,
+                page_size=2,
+                write_batch_size=5,
+            )
+        replayed_country_rows = self.connection.execute(
+            """
+            SELECT normalized_domain, country_code, country_position,
+                   traffic_share_bps, estimated_visits, source_snapshot_id
+            FROM domain_traffic_country_monthly
+            ORDER BY normalized_domain, country_position
+            """
+        ).fetchall()
+        self.assertEqual(replayed["snapshots_scanned"], 3)
+        self.assertEqual([tuple(row) for row in replayed_country_rows], expected_rows)
+
+    async def test_traffic_projection_backfill_never_splits_a_snapshot_atomic_group(self) -> None:
+        snapshot_specs = [
+            (
+                "atomic-first.example",
+                1000,
+                [{"CountryCode": "US", "Value": 0.5}],
+            ),
+            (
+                "atomic-second.example",
+                2000,
+                [
+                    {"CountryCode": "CA", "Value": 0.4},
+                    {"CountryCode": "GB", "Value": 0.2},
+                ],
+            ),
+        ]
+        for index, (domain, visits, countries) in enumerate(snapshot_specs, start=1):
+            self.connection.execute(
+                """
+                INSERT INTO domain_traffic_snapshots (
+                  normalized_domain, source, website, traffic_month, status,
+                  visits, fetched_at, raw_payload
+                )
+                VALUES (?, ?, ?, '2026-06-01', 'done', ?, ?, ?)
+                """,
+                [
+                    domain,
+                    runner.TRAFFIC_SOURCE,
+                    domain,
+                    visits,
+                    f"2026-07-0{index}T00:00:00Z",
+                    json.dumps(
+                        {
+                            "SiteName": domain,
+                            "SnapshotDate": "2026-06-01",
+                            "EstimatedMonthlyVisits": {"2026-06-01": visits},
+                            "TopCountryShares": countries,
+                        }
+                    ),
+                ],
+            )
+        self.connection.execute(
+            """
+            INSERT INTO domain_traffic_country_monthly (
+              normalized_domain, source, traffic_month, country_code,
+              country_position, traffic_share_bps, estimated_visits, captured_at
+            )
+            VALUES (
+              'atomic-second.example', 'similarweb', '2026-06-01',
+              'DE', 1, 9000, 1800, '2026-06-30T00:00:00Z'
+            )
+            """
+        )
+        self.connection.commit()
+
+        class FailingSecondBatchD1(FakeD1):
+            def __init__(self, connection: sqlite3.Connection):
+                super().__init__(connection)
+                self.batches: list[list[tuple[str, list[Any]]]] = []
+
+            async def batch(
+                self,
+                statements: list[tuple[str, list[Any]]],
+            ) -> list[dict[str, Any]]:
+                self.batches.append(list(statements))
+                if len(self.batches) != 2:
+                    return await super().batch(statements)
+
+                failing_statements: list[tuple[str, list[Any]]] = []
+                failure_injected = False
+                for statement in statements:
+                    failing_statements.append(statement)
+                    if (
+                        not failure_injected
+                        and statement[0] == runner.DOMAIN_TRAFFIC_COUNTRY_DELETE_SQL
+                    ):
+                        failing_statements.append(
+                            ("INSERT INTO forced_backfill_failure DEFAULT VALUES", [])
+                        )
+                        failure_injected = True
+                if not failure_injected:
+                    failing_statements.insert(
+                        0,
+                        ("INSERT INTO forced_backfill_failure DEFAULT VALUES", []),
+                    )
+                return await super().batch(failing_statements)
+
+        failing_d1 = FailingSecondBatchD1(self.connection)
+        with self.assertRaisesRegex(sqlite3.OperationalError, "forced_backfill_failure"):
+            await runner.backfill_domain_traffic_monthly_from_d1(
+                failing_d1,
+                page_size=2,
+                write_batch_size=5,
+            )
+
+        self.assertEqual([len(batch) for batch in failing_d1.batches], [3, 4])
+        self.assertEqual(
+            [{params[0] for _, params in batch} for batch in failing_d1.batches],
+            [{"atomic-first.example"}, {"atomic-second.example"}],
+        )
+        self.assertEqual(
+            sum(
+                sql == runner.DOMAIN_TRAFFIC_COUNTRY_DELETE_SQL
+                for sql, _ in failing_d1.batches[1]
+            ),
+            1,
+        )
+        self.assertEqual(
+            sum(
+                sql == runner.DOMAIN_TRAFFIC_COUNTRY_UPSERT_SQL
+                for sql, _ in failing_d1.batches[1]
+            ),
+            2,
+        )
+
+        first_country = self.connection.execute(
+            "SELECT country_code FROM domain_traffic_country_monthly "
+            "WHERE normalized_domain = 'atomic-first.example'"
+        ).fetchone()
+        self.assertEqual(first_country["country_code"], "US")
+        second_countries = self.connection.execute(
+            "SELECT country_code FROM domain_traffic_country_monthly "
+            "WHERE normalized_domain = 'atomic-second.example' ORDER BY country_code"
+        ).fetchall()
+        self.assertEqual([row["country_code"] for row in second_countries], ["DE"])
+        second_monthly = self.connection.execute(
+            "SELECT 1 FROM domain_traffic_monthly "
+            "WHERE normalized_domain = 'atomic-second.example'"
+        ).fetchone()
+        self.assertIsNone(second_monthly)
+
+    async def test_market_snapshot_builder_materializes_metrics_and_never_retires_on_failure(self) -> None:
+        tool_id = self.add_tool("market-snapshot", status="published")
+        duplicate_tool_id = self.add_tool("market-snapshot-duplicate", status="published")
+        self.connection.execute(
+            "UPDATE tools SET verification_status = 'verified', staleness_status = 'fresh' WHERE id = ?",
+            [tool_id],
+        )
+        self.connection.execute(
+            "UPDATE tools SET normalized_domain = 'market-snapshot.example', "
+            "verification_status = 'verified', staleness_status = 'fresh' WHERE id = ?",
+            [duplicate_tool_id],
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO traffic_month_release_checks (
+              source, traffic_month, status, probe_domain, observed_latest_month
+            )
+            VALUES (?, ?, ?, 'probe.example', ?)
+            """,
+            [
+                (runner.TRAFFIC_SOURCE, "2026-05-01", "available", "2026-05-01"),
+                (runner.TRAFFIC_SOURCE, "2026-06-01", "available", "2026-06-01"),
+                (runner.TRAFFIC_SOURCE, "2026-07-01", "unavailable", "2026-06-01"),
+            ],
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO domain_rating_history (
+              normalized_domain, source, observed_date, domain_rating, observed_at
+            )
+            VALUES ('market-snapshot.example', ?, ?, ?, ?)
+            """,
+            [
+                (runner.DOMAIN_STATE_SOURCE, "2026-06-01", 40, "2026-06-01T00:00:00Z"),
+                (runner.DOMAIN_STATE_SOURCE, "2026-06-25", 45, "2026-06-25T00:00:00Z"),
+                (runner.DOMAIN_STATE_SOURCE, "2026-07-01", 46, "2026-07-01T00:00:00Z"),
+            ],
+        )
+        self.connection.commit()
+
+        await self.d1.upsert_domain_traffic_monthly(
+            "market-snapshot.example",
+            [
+                {
+                    "traffic_month": "2026-05-01",
+                    "visits": 1000,
+                    "ai_traffic": {"total_visits": 100},
+                    "gen_ai_traffic_share": 0.1,
+                },
+                {
+                    "traffic_month": "2026-06-01",
+                    "visits": 2000,
+                    "ai_traffic": {"total_visits": 300},
+                    "gen_ai_traffic_share": 0.15,
+                    "search_organic_traffic_share": 0.25,
+                    "search_paid_traffic_share": 0.05,
+                    "top_country_1": "US",
+                    "top_country_1_traffic_share": 0.6,
+                    "top_country_2": "GB",
+                    "top_country_2_traffic_share": 0.2,
+                },
+            ],
+        )
+        # An unavailable month cannot become the default serving input.
+        await self.d1.upsert_domain_traffic_monthly(
+            "market-snapshot.example",
+            [
+                {
+                    "traffic_month": "2026-07-01",
+                    "visits": 2500,
+                    "top_country_1": "US",
+                    "top_country_1_traffic_share": 0.7,
+                }
+            ],
+        )
+
+        preview = await runner.preview_market_snapshot_from_d1(self.d1)
+        self.assertEqual(preview["status"], "dry_run")
+        self.assertEqual(preview["traffic_month"], "2026-06-01")
+        self.assertEqual(preview["baseline_month"], "2026-05-01")
+        self.assertEqual(preview["coverage"]["total_tools"], 1)
+        self.assertEqual(preview["coverage"]["country_tools"], 1)
+        self.assertEqual(
+            self.connection.execute("SELECT count(*) FROM market_snapshot_versions").fetchone()[0],
+            0,
+        )
+
+        result = await runner.build_market_snapshot_from_d1(self.d1, activate=True)
+        self.assertEqual(result["status"], "active")
+        active_snapshot_id = result["snapshot_id"]
+        self.assertEqual(result["coverage"]["total_tools"], 1)
+        self.assertEqual(result["coverage"]["country_tools"], 1)
+        self.assertEqual(result["coverage"]["country_ai_rows"], 2)
+        self.assertEqual(result["coverage"]["country_ai_tools"], 1)
+        coverage_metadata = json.loads(
+            self.connection.execute(
+                "SELECT coverage_json FROM market_snapshot_versions WHERE id = ?",
+                [active_snapshot_id],
+            ).fetchone()["coverage_json"]
+        )
+        self.assertEqual(coverage_metadata["share_unit"], "basis_points")
+        self.assertEqual(coverage_metadata["country_scope"], "provider_top5_observed_only")
+        self.assertEqual(coverage_metadata["country_absence"], "unknown")
+        self.assertEqual(coverage_metadata["country_ai_visits_provenance"], "modeled_not_observed")
+        self.assertEqual(
+            coverage_metadata["country_ai_visits_formula"],
+            "estimated_visits * gen_ai_share_bps / 10000",
+        )
+        self.assertEqual(coverage_metadata["country_ai_visits_scope"], "provider_top5_lower_bound")
+
+        snapshot = self.connection.execute(
+            "SELECT * FROM tool_market_snapshots WHERE snapshot_id = ? AND tool_id = ?",
+            [active_snapshot_id, tool_id],
+        ).fetchone()
+        self.assertIsNotNone(snapshot)
+        self.assertIsNone(
+            self.connection.execute(
+                "SELECT 1 FROM tool_market_snapshots WHERE snapshot_id = ? AND tool_id = ?",
+                [active_snapshot_id, duplicate_tool_id],
+            ).fetchone()
+        )
+        self.assertEqual(snapshot["visits"], 2000)
+        self.assertEqual(snapshot["previous_visits"], 1000)
+        self.assertEqual(snapshot["visits_change"], 1000)
+        self.assertAlmostEqual(snapshot["visits_growth_rate"], 1.0)
+        self.assertEqual(snapshot["search_share_bps"], 3000)
+        self.assertEqual(snapshot["organic_search_share_bps"], 2500)
+        self.assertEqual(snapshot["paid_search_share_bps"], 500)
+        self.assertEqual(snapshot["search_visits"], 600)
+        self.assertEqual(snapshot["paid_search_visits"], 100)
+        self.assertEqual(snapshot["ai_visits"], 300)
+        self.assertEqual(snapshot["previous_ai_visits"], 100)
+        self.assertEqual(snapshot["ai_visits_change"], 200)
+        self.assertAlmostEqual(snapshot["ai_visits_growth_rate"], 2.0)
+        self.assertEqual(snapshot["gen_ai_share_bps"], 1500)
+        self.assertEqual(snapshot["domain_rating"], 46)
+        self.assertEqual(snapshot["previous_domain_rating"], 40)
+        self.assertEqual(snapshot["domain_rating_change"], 6)
+        self.assertAlmostEqual(snapshot["domain_rating_velocity_30d"], 6.0)
+
+        countries = self.connection.execute(
+            "SELECT country_code, traffic_share_bps, estimated_visits, estimated_ai_visits "
+            "FROM tool_country_market_snapshots WHERE snapshot_id = ? ORDER BY country_position",
+            [active_snapshot_id],
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in countries],
+            [("US", 6000, 1200, 180), ("GB", 2000, 400, 60)],
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute(
+                "INSERT INTO tool_market_snapshots (snapshot_id, tool_id, normalized_domain) "
+                "VALUES (?, ?, 'market-snapshot.example')",
+                [active_snapshot_id, duplicate_tool_id],
+            )
+        self.connection.rollback()
+
+        # Explicit builds are allowed for investigation, but a candidate that
+        # regresses a premium metric must not replace the active serving snapshot.
+        with self.assertRaisesRegex(RuntimeError, "failed search_tools absolute coverage gate"):
+            await runner.build_market_snapshot_from_d1(
+                self.d1,
+                "2026-07-01",
+                activate=True,
+            )
+        active = self.connection.execute(
+            "SELECT id FROM market_snapshot_versions WHERE status = 'active'"
+        ).fetchone()
+        self.assertEqual(active["id"], active_snapshot_id)
+        failed_activation_candidate = self.connection.execute(
+            "SELECT id, status FROM market_snapshot_versions WHERE traffic_month = '2026-07-01'"
+        ).fetchone()
+        self.assertEqual(failed_activation_candidate["status"], "candidate")
+        unknown_ai_estimate = self.connection.execute(
+            "SELECT estimated_ai_visits FROM tool_country_market_snapshots "
+            "WHERE snapshot_id = ? LIMIT 1",
+            [failed_activation_candidate["id"]],
+        ).fetchone()
+        self.assertIsNone(unknown_ai_estimate["estimated_ai_visits"])
+
+    async def test_market_facet_rollups_preserve_known_zero_unknown_and_grains(self) -> None:
+        category_id = int(
+            self.connection.execute(
+                "INSERT INTO categories (canonical_slug) VALUES ('market-rollup-category')"
+            ).lastrowid
+        )
+        tool_ids = [
+            self.add_tool(f"market-rollup-{index}", status="published")
+            for index in range(2)
+        ]
+        self.connection.execute(
+            "UPDATE tools SET primary_category_id = ?, verification_status = 'verified', "
+            "staleness_status = 'fresh' WHERE id IN (?, ?)",
+            [category_id, *tool_ids],
+        )
+        eligibility_revision = await runner.ensure_market_catalog_eligibility_revision(self.d1)
+        snapshot_id = int(
+            self.connection.execute(
+                """
+                INSERT INTO market_snapshot_versions (
+                  status, traffic_source, traffic_month, baseline_month,
+                  catalog_eligibility_revision, coverage_json, built_at
+                ) VALUES (
+                  'candidate', ?, '2026-07-01', '2026-06-01', ?, '{}',
+                  '2026-08-01T00:00:00Z'
+                )
+                """,
+                [runner.TRAFFIC_SOURCE, eligibility_revision],
+            ).lastrowid
+        )
+        for index, tool_id in enumerate(tool_ids):
+            domain = f"market-rollup-{index}.example"
+            self.connection.execute(
+                """
+                INSERT INTO tool_market_snapshots (
+                  snapshot_id, tool_id, normalized_domain, primary_category_id, visits
+                ) VALUES (?, ?, ?, ?, 1000)
+                """,
+                [snapshot_id, tool_id, domain, category_id],
+            )
+        country_rows = [
+            (tool_ids[0], "market-rollup-0.example", "US", 1, 0, 0),
+            (tool_ids[1], "market-rollup-1.example", "US", 1, None, None),
+            (tool_ids[0], "market-rollup-0.example", "CA", 2, 0, 0),
+            (tool_ids[1], "market-rollup-1.example", "GB", 2, None, None),
+        ]
+        self.connection.executemany(
+            """
+            INSERT INTO tool_country_market_snapshots (
+              snapshot_id, tool_id, normalized_domain, country_code,
+              country_position, traffic_share_bps, estimated_visits,
+              estimated_ai_visits
+            ) VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            [
+                [snapshot_id, tool_id, domain, country, position, visits, ai_visits]
+                for tool_id, domain, country, position, visits, ai_visits in country_rows
+            ],
+        )
+        self.connection.commit()
+
+        await runner.build_market_snapshot_facet_rollups_from_d1(
+            self.d1,
+            snapshot_id,
+            eligibility_revision,
+            "2026-08-01T00:00:00Z",
+        )
+
+        rows = self.connection.execute(
+            """
+            SELECT primary_category_id, country_code, tool_count,
+                   country_estimated_visits, country_estimated_ai_visits,
+                   country_estimated_visits_unknown_count,
+                   country_estimated_ai_visits_unknown_count
+            FROM market_snapshot_facet_rollups
+            WHERE snapshot_id = ?
+            ORDER BY primary_category_id, country_code
+            """,
+            [snapshot_id],
+        ).fetchall()
+        indexed = {
+            (row["primary_category_id"], row["country_code"]): tuple(row)[2:]
+            for row in rows
+        }
+        self.assertEqual(indexed[(0, "")], (2, None, None, 0, 0))
+        self.assertEqual(indexed[(category_id, "")], (2, None, None, 0, 0))
+        self.assertEqual(indexed[(0, "US")], (2, 0, 0, 1, 1))
+        self.assertEqual(indexed[(category_id, "US")], (2, 0, 0, 1, 1))
+        self.assertEqual(indexed[(0, "CA")], (1, 0, 0, 0, 0))
+        self.assertEqual(indexed[(0, "GB")], (1, None, None, 1, 1))
+        self.assertNotIn((0, "JP"), indexed)
+
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute(
+                """
+                INSERT INTO market_snapshot_facet_rollups (
+                  snapshot_id, country_code, tool_count,
+                  country_estimated_visits_unknown_count,
+                  country_estimated_ai_visits_unknown_count
+                ) VALUES (?, 'JP', 1, 0, 0)
+                """,
+                [snapshot_id],
+            )
+        self.connection.rollback()
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute(
+                """
+                INSERT INTO market_snapshot_facet_rollups (
+                  snapshot_id, country_code, tool_count,
+                  country_estimated_visits, country_estimated_ai_visits
+                ) VALUES (?, 'JP', 1, 10, 11)
+                """,
+                [snapshot_id],
+            )
+        self.connection.rollback()
+
+    async def test_market_entitlement_seed_has_stable_plan_matrix(self) -> None:
+        # The plan skeleton is safe to apply again during local/bootstrap workflows.
+        self.connection.executescript(
+            (MIGRATIONS_DIR / "0042_market_access_entitlements.sql").read_text(encoding="utf-8")
+        )
+        plans = self.connection.execute(
+            "SELECT code FROM access_plans ORDER BY sort_order"
+        ).fetchall()
+        self.assertEqual([row["code"] for row in plans], ["free", "pro", "enterprise"])
+        matrix = self.connection.execute(
+            "SELECT plan_code, feature_key, is_enabled, limit_json "
+            "FROM access_plan_features"
+        ).fetchall()
+        self.assertEqual(len(matrix), 42)
+        indexed = {(row["plan_code"], row["feature_key"]): row for row in matrix}
+        self.assertEqual(indexed[("free", "filter.country")]["is_enabled"], 1)
+        self.assertEqual(indexed[("free", "sort.search_share")]["is_enabled"], 0)
+        self.assertEqual(indexed[("free", "sort.paid_share")]["is_enabled"], 0)
+        self.assertEqual(indexed[("pro", "sort.search_share")]["is_enabled"], 1)
+        self.assertEqual(indexed[("pro", "sort.paid_share")]["is_enabled"], 1)
+        self.assertEqual(indexed[("free", "sort.ai_visits")]["is_enabled"], 0)
+        self.assertEqual(indexed[("pro", "sort.ai_visits")]["is_enabled"], 1)
+        self.assertEqual(indexed[("free", "sort.dr_velocity_30d")]["is_enabled"], 0)
+        self.assertEqual(indexed[("pro", "sort.dr_velocity_30d")]["is_enabled"], 1)
+        self.assertEqual(indexed[("enterprise", "sort.country_ai_estimated_visits")]["is_enabled"], 1)
+        self.assertEqual(indexed[("pro", "sort.country_ai_estimated_visits")]["is_enabled"], 1)
+        self.assertEqual(indexed[("free", "sort.country_ai_estimated_visits")]["is_enabled"], 0)
+
+    async def test_existing_market_candidate_can_be_activated_without_rebuilding(self) -> None:
+        tool_id = self.add_tool("activate-existing-market", status="published")
+        self.connection.execute(
+            "UPDATE tools SET verification_status = 'verified', staleness_status = 'fresh' WHERE id = ?",
+            [tool_id],
+        )
+        version_ids: list[int] = []
+        for status, traffic_month in (("active", "2026-06-01"), ("candidate", "2026-07-01")):
+            cursor = self.connection.execute(
+                """
+                INSERT INTO market_snapshot_versions (
+                  status, traffic_source, traffic_month, baseline_month,
+                  coverage_json, built_at, activated_at
+                )
+                VALUES (?, ?, ?, '2026-05-01', '{}', '2026-08-01T00:00:00Z', ?)
+                """,
+                [
+                    status,
+                    runner.TRAFFIC_SOURCE,
+                    traffic_month,
+                    "2026-08-01T00:00:00Z" if status == "active" else None,
+                ],
+            )
+            version_ids.append(int(cursor.lastrowid))
+
+        for snapshot_id in version_ids:
+            self.connection.execute(
+                """
+                INSERT INTO tool_market_snapshots (
+                  snapshot_id, tool_id, normalized_domain, visits,
+                  search_share_bps, paid_search_share_bps,
+                  ai_visits, gen_ai_share_bps, domain_rating,
+                  domain_rating_change, domain_rating_velocity_30d
+                )
+                VALUES (
+                  ?, ?, 'activate-existing-market.example', 1000, 4000, 1000,
+                  100, 1000, 70, 2, 2
+                )
+                """,
+                [snapshot_id, tool_id],
+            )
+            self.connection.execute(
+                """
+                INSERT INTO tool_country_market_snapshots (
+                  snapshot_id, tool_id, normalized_domain, country_code,
+                  country_position, traffic_share_bps, estimated_visits,
+                  estimated_ai_visits
+                )
+                VALUES (
+                  ?, ?, 'activate-existing-market.example', 'US', 1, 5000, 500, 50
+                )
+                """,
+                [snapshot_id, tool_id],
+            )
+        self.connection.commit()
+        eligibility_revision = await runner.ensure_market_catalog_eligibility_revision(self.d1)
+        for snapshot_id in version_ids:
+            await runner.build_market_snapshot_facet_rollups_from_d1(
+                self.d1,
+                snapshot_id,
+                eligibility_revision,
+                "2026-08-01T00:00:00Z",
+            )
+
+        activation = await runner.activate_market_snapshot_from_d1(
+            self.d1,
+            version_ids[1],
+        )
+
+        self.assertEqual(activation["snapshot_id"], version_ids[1])
+        self.assertEqual(activation["previous_snapshot_id"], version_ids[0])
+        statuses = self.connection.execute(
+            "SELECT id, status FROM market_snapshot_versions ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [(row["id"], row["status"]) for row in statuses],
+            [(version_ids[0], "retired"), (version_ids[1], "active")],
+        )
+        revision_before = self.connection.execute(
+            "SELECT revision FROM market_catalog_eligibility_revision WHERE id = 1"
+        ).fetchone()["revision"]
+        self.add_tool("not-in-active-market-snapshot", status="published")
+        revision_after_insert = self.connection.execute(
+            "SELECT revision FROM market_catalog_eligibility_revision WHERE id = 1"
+        ).fetchone()["revision"]
+        self.assertEqual(revision_after_insert, revision_before)
+
+        candidate_id = int(
+            self.connection.execute(
+                """
+                INSERT INTO market_snapshot_versions (
+                  status, traffic_source, traffic_month, baseline_month,
+                  catalog_eligibility_revision, coverage_json, built_at
+                ) VALUES (
+                  'candidate', ?, '2026-08-01', '2026-07-01', ?, '{}',
+                  '2026-08-02T00:00:00Z'
+                )
+                """,
+                [runner.TRAFFIC_SOURCE, revision_before],
+            ).lastrowid
+        )
+        self.connection.execute(
+            """
+            INSERT INTO tool_market_snapshots (
+              snapshot_id, tool_id, normalized_domain, visits,
+              search_share_bps, paid_search_share_bps,
+              ai_visits, gen_ai_share_bps, domain_rating,
+              domain_rating_change, domain_rating_velocity_30d
+            ) VALUES (
+              ?, ?, 'activate-existing-market.example', 1000, 4000, 1000,
+              100, 1000, 70, 2, 2
+            )
+            """,
+            [candidate_id, tool_id],
+        )
+        self.connection.execute(
+            """
+            INSERT INTO tool_country_market_snapshots (
+              snapshot_id, tool_id, normalized_domain, country_code,
+              country_position, traffic_share_bps, estimated_visits,
+              estimated_ai_visits
+            ) VALUES (
+              ?, ?, 'activate-existing-market.example', 'US', 1, 5000, 500, 50
+            )
+            """,
+            [candidate_id, tool_id],
+        )
+        self.connection.commit()
+        await runner.build_market_snapshot_facet_rollups_from_d1(
+            self.d1,
+            candidate_id,
+            revision_before,
+            "2026-08-02T00:00:00Z",
+        )
+
+        self.connection.execute(
+            "UPDATE tools SET status = 'archived' WHERE id = ?",
+            [tool_id],
+        )
+        self.connection.commit()
+        revision_after_active_change = self.connection.execute(
+            "SELECT revision FROM market_catalog_eligibility_revision WHERE id = 1"
+        ).fetchone()["revision"]
+        self.assertEqual(revision_after_active_change, revision_before + 1)
+        with self.assertRaisesRegex(
+            RuntimeError,
+            "current_catalog_eligibility_revision=.*expected=",
+        ):
+            await runner.activate_market_snapshot_from_d1(self.d1, candidate_id)
+        statuses_after_rejected_activation = self.connection.execute(
+            "SELECT id, status FROM market_snapshot_versions WHERE id IN (?, ?) ORDER BY id",
+            [version_ids[1], candidate_id],
+        ).fetchall()
+        self.assertEqual(
+            [(row["id"], row["status"]) for row in statuses_after_rejected_activation],
+            [(version_ids[1], "active"), (candidate_id, "candidate")],
+        )
+
+    async def test_market_candidate_without_dr_coverage_cannot_activate(self) -> None:
+        tool_id = self.add_tool("market-candidate-without-dr", status="published")
+        self.connection.execute(
+            "UPDATE tools SET verification_status = 'verified', staleness_status = 'fresh' WHERE id = ?",
+            [tool_id],
+        )
+        cursor = self.connection.execute(
+            """
+            INSERT INTO market_snapshot_versions (
+              status, traffic_source, traffic_month, baseline_month,
+              coverage_json, built_at
+            )
+            VALUES (
+              'candidate', ?, '2026-07-01', '2026-06-01', '{}',
+              '2026-08-01T00:00:00Z'
+            )
+            """,
+            [runner.TRAFFIC_SOURCE],
+        )
+        snapshot_id = int(cursor.lastrowid)
+        self.connection.execute(
+            """
+            INSERT INTO tool_market_snapshots (
+              snapshot_id, tool_id, normalized_domain, visits,
+              search_share_bps, paid_search_share_bps,
+              ai_visits, gen_ai_share_bps
+            )
+            VALUES (
+              ?, ?, 'market-candidate-without-dr.example', 1000,
+              4000, 1000, 100, 1000
+            )
+            """,
+            [snapshot_id, tool_id],
+        )
+        self.connection.execute(
+            """
+            INSERT INTO tool_country_market_snapshots (
+              snapshot_id, tool_id, normalized_domain, country_code,
+              country_position, traffic_share_bps, estimated_visits,
+              estimated_ai_visits
+            )
+            VALUES (
+              ?, ?, 'market-candidate-without-dr.example', 'US', 1,
+              5000, 500, 50
+            )
+            """,
+            [snapshot_id, tool_id],
+        )
+        self.connection.commit()
+        eligibility_revision = await runner.ensure_market_catalog_eligibility_revision(self.d1)
+        await runner.build_market_snapshot_facet_rollups_from_d1(
+            self.d1,
+            snapshot_id,
+            eligibility_revision,
+            "2026-08-01T00:00:00Z",
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "dr_tools absolute coverage gate"):
+            await runner.activate_market_snapshot_from_d1(self.d1, snapshot_id)
+
+        status = self.connection.execute(
+            "SELECT status FROM market_snapshot_versions WHERE id = ?",
+            [snapshot_id],
+        ).fetchone()["status"]
+        self.assertEqual(status, "candidate")
+
+    async def test_market_candidate_cannot_regress_relative_dr_coverage(self) -> None:
+        tool_ids = [
+            self.add_tool(f"market-relative-dr-{index:02d}", status="published")
+            for index in range(20)
+        ]
+        self.connection.execute(
+            "UPDATE tools SET verification_status = 'verified', staleness_status = 'fresh' "
+            f"WHERE id IN ({','.join('?' for _ in tool_ids)})",
+            tool_ids,
+        )
+        version_ids: list[int] = []
+        for status, traffic_month in (("active", "2026-06-01"), ("candidate", "2026-07-01")):
+            cursor = self.connection.execute(
+                """
+                INSERT INTO market_snapshot_versions (
+                  status, traffic_source, traffic_month, baseline_month,
+                  coverage_json, built_at, activated_at
+                )
+                VALUES (?, ?, ?, '2026-05-01', '{}', '2026-08-01T00:00:00Z', ?)
+                """,
+                [
+                    status,
+                    runner.TRAFFIC_SOURCE,
+                    traffic_month,
+                    "2026-08-01T00:00:00Z" if status == "active" else None,
+                ],
+            )
+            version_ids.append(int(cursor.lastrowid))
+
+        for snapshot_index, snapshot_id in enumerate(version_ids):
+            for tool_index, tool_id in enumerate(tool_ids):
+                has_dr = snapshot_index == 0 or tool_index < 18
+                domain = f"market-relative-dr-{tool_index:02d}.example"
+                self.connection.execute(
+                    """
+                    INSERT INTO tool_market_snapshots (
+                      snapshot_id, tool_id, normalized_domain, visits,
+                      search_share_bps, paid_search_share_bps,
+                      ai_visits, gen_ai_share_bps, domain_rating,
+                      domain_rating_change, domain_rating_velocity_30d
+                    )
+                    VALUES (?, ?, ?, 1000, 4000, 1000, 100, 1000, ?, ?, ?)
+                    """,
+                    [
+                        snapshot_id,
+                        tool_id,
+                        domain,
+                        70 if has_dr else None,
+                        2 if has_dr else None,
+                        2 if has_dr else None,
+                    ],
+                )
+                self.connection.execute(
+                    """
+                    INSERT INTO tool_country_market_snapshots (
+                      snapshot_id, tool_id, normalized_domain, country_code,
+                      country_position, traffic_share_bps, estimated_visits,
+                      estimated_ai_visits
+                    )
+                    VALUES (?, ?, ?, 'US', 1, 5000, 500, 50)
+                    """,
+                    [snapshot_id, tool_id, domain],
+                )
+        self.connection.commit()
+        eligibility_revision = await runner.ensure_market_catalog_eligibility_revision(self.d1)
+        for snapshot_id in version_ids:
+            await runner.build_market_snapshot_facet_rollups_from_d1(
+                self.d1,
+                snapshot_id,
+                eligibility_revision,
+                "2026-08-01T00:00:00Z",
+            )
+
+        with self.assertRaisesRegex(RuntimeError, "failed dr_tools coverage gate"):
+            await runner.activate_market_snapshot_from_d1(self.d1, version_ids[1])
+
+        statuses = self.connection.execute(
+            "SELECT id, status FROM market_snapshot_versions ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [(row["id"], row["status"]) for row in statuses],
+            [(version_ids[0], "active"), (version_ids[1], "candidate")],
+        )
+
+    async def test_activate_market_snapshot_id_cli_is_a_separate_mode(self) -> None:
+        with patch.object(
+            runner.sys,
+            "argv",
+            ["runner.py", "--activate-market-snapshot-id", "42"],
+        ):
+            args = runner.parse_args()
+        self.assertEqual(args.activate_market_snapshot_id, 42)
+        self.assertFalse(args.build_market_snapshot)
+
+        with patch.object(
+            runner.sys,
+            "argv",
+            [
+                "runner.py",
+                "--build-market-snapshot",
+                "--activate-market-snapshot-id",
+                "42",
+            ],
+        ):
+            with self.assertRaises(SystemExit):
+                runner.parse_args()
+
+        help_output = io.StringIO()
+        with (
+            patch.object(runner.sys, "argv", ["runner.py", "--help"]),
+            redirect_stdout(help_output),
+            self.assertRaises(SystemExit) as help_exit,
+        ):
+            runner.parse_args()
+        self.assertEqual(help_exit.exception.code, 0)
+        self.assertIn(
+            "WRITE: apply coverage gates, then atomically activate",
+            help_output.getvalue(),
+        )
+
+    async def test_activate_market_snapshot_id_cli_does_not_require_brightdata(self) -> None:
+        config = type("ActivationConfig", (), {"poll_interval_seconds": 60})()
+        with (
+            patch.object(
+                runner.sys,
+                "argv",
+                ["runner.py", "--activate-market-snapshot-id", "42"],
+            ),
+            patch.object(runner, "load_config", return_value=config) as load_config,
+            patch.object(
+                runner,
+                "activate_market_snapshot",
+                new=AsyncMock(return_value={"snapshot_id": 42}),
+            ) as activate_snapshot,
+            patch.object(runner, "log_info"),
+        ):
+            await asyncio.to_thread(runner.main)
+
+        load_config.assert_called_once_with(require_brightdata=False)
+        activate_snapshot.assert_awaited_once_with(config, 42)
 
     async def test_done_traffic_task_without_materialization_starts_new_generation(self) -> None:
         self.add_tool("traffic-missing-materialization", status="published")
@@ -1012,6 +3076,7 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 status="done",
                 domain_rating=42.0,
                 domain_created_at="2020-01-02T00:00:00Z",
+                rdap_status="done",
             ),
         )
         row = self.task_row(
@@ -1021,10 +3086,14 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assert_completed_lease(row, "done")
         state = self.connection.execute(
-            "SELECT domain_rating FROM domain_states WHERE normalized_domain = ? AND source = ?",
+            "SELECT domain_rating, domain_created_at, rdap_status, rdap_checked_at "
+            "FROM domain_states WHERE normalized_domain = ? AND source = ?",
             [task.normalized_domain, runner.DOMAIN_STATE_SOURCE],
         ).fetchone()
         self.assertEqual(state["domain_rating"], 42.0)
+        self.assertEqual(state["domain_created_at"], "2020-01-02T00:00:00Z")
+        self.assertEqual(state["rdap_status"], "done")
+        self.assertTrue(state["rdap_checked_at"])
         history = self.connection.execute(
             "SELECT domain_rating, observed_date FROM domain_rating_history "
             "WHERE normalized_domain = ? AND source = ?",
@@ -1033,6 +3102,131 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(history), 1)
         self.assertEqual(history[0]["domain_rating"], 42.0)
         self.assertEqual(len(history[0]["observed_date"]), 10)
+
+    async def test_completed_rdap_is_not_queued_again_with_monthly_dr(self) -> None:
+        self.add_tool("domain-rdap-once")
+        store = runner.D1DomainStateStore(self.d1)
+        self.assertEqual(await store.queue_due_tasks(10, 30), 1)
+        first_task = (await store.claim_due_tasks(10, "domain-worker"))[0]
+        self.assertTrue(first_task.fetch_domain_rating)
+        self.assertTrue(first_task.fetch_rdap)
+        await store.complete_task(
+            first_task,
+            runner.DomainStateResult(
+                status="done",
+                domain_rating=42.0,
+                domain_created_at="2020-01-02T00:00:00Z",
+                rdap_status="done",
+            ),
+        )
+
+        self.assertEqual(await store.queue_due_tasks(10, 30), 0)
+        self.connection.execute(
+            "UPDATE domain_states SET last_crawled_at = '2020-01-01T00:00:00Z' "
+            "WHERE normalized_domain = ? AND source = ?",
+            [first_task.normalized_domain, runner.DOMAIN_STATE_SOURCE],
+        )
+        self.connection.commit()
+
+        self.assertEqual(await store.queue_due_tasks(10, 30), 1)
+        monthly_task = (await store.claim_due_tasks(10, "domain-worker"))[0]
+        self.assertTrue(monthly_task.fetch_domain_rating)
+        self.assertFalse(monthly_task.fetch_rdap)
+
+    async def test_failed_rdap_is_marked_once_and_not_requeued(self) -> None:
+        self.add_tool("domain-rdap-failed")
+        store = runner.D1DomainStateStore(self.d1)
+        self.assertEqual(await store.queue_due_tasks(10, 30), 1)
+        task = (await store.claim_due_tasks(10, "domain-worker"))[0]
+        await store.complete_task(
+            task,
+            runner.DomainStateResult(
+                status="done",
+                domain_rating=21.0,
+                domain_created_at=None,
+                rdap_status="failed",
+                rdap_error="rdap_timeout",
+            ),
+        )
+
+        state = self.connection.execute(
+            "SELECT rdap_status, rdap_checked_at, rdap_last_error FROM domain_states "
+            "WHERE normalized_domain = ? AND source = ?",
+            [task.normalized_domain, runner.DOMAIN_STATE_SOURCE],
+        ).fetchone()
+        self.assertEqual(state["rdap_status"], "failed")
+        self.assertTrue(state["rdap_checked_at"])
+        self.assertEqual(state["rdap_last_error"], "rdap_timeout")
+        self.assertEqual(await store.queue_due_tasks(10, 30), 0)
+
+    async def test_pending_rdap_can_run_without_refreshing_fresh_dr(self) -> None:
+        self.add_tool("domain-rdap-only")
+        self.connection.execute(
+            """
+            INSERT INTO domain_states (
+              normalized_domain, source, domain_rating, last_crawled_at
+            ) VALUES (?, ?, 64, '2099-01-01T00:00:00Z')
+            """,
+            ["domain-rdap-only.example", runner.DOMAIN_STATE_SOURCE],
+        )
+        self.connection.commit()
+        store = runner.D1DomainStateStore(self.d1)
+
+        self.assertEqual(await store.queue_due_tasks(10, 30), 1)
+        task = (await store.claim_due_tasks(10, "domain-worker"))[0]
+        self.assertFalse(task.fetch_domain_rating)
+        self.assertTrue(task.fetch_rdap)
+        await store.complete_task(
+            task,
+            runner.DomainStateResult(
+                status="done",
+                domain_rating=None,
+                domain_created_at=None,
+                rdap_status="no_data",
+                rdap_error="created_at_not_found",
+            ),
+        )
+
+        state = self.connection.execute(
+            "SELECT domain_rating, last_crawled_at, rdap_status FROM domain_states "
+            "WHERE normalized_domain = ? AND source = ?",
+            [task.normalized_domain, runner.DOMAIN_STATE_SOURCE],
+        ).fetchone()
+        self.assertEqual(state["domain_rating"], 64)
+        self.assertEqual(state["last_crawled_at"], "2099-01-01T00:00:00Z")
+        self.assertEqual(state["rdap_status"], "no_data")
+        self.assertEqual(await store.queue_due_tasks(10, 30), 0)
+
+    async def test_failed_dr_persists_rdap_and_disables_it_for_task_retry(self) -> None:
+        self.add_tool("domain-dr-retry")
+        store = runner.D1DomainStateStore(self.d1)
+        self.assertEqual(await store.queue_due_tasks(10, 30), 1)
+        task = (await store.claim_due_tasks(10, "domain-worker"))[0]
+        await store.complete_task(
+            task,
+            runner.DomainStateResult(
+                status="failed",
+                domain_rating=None,
+                domain_created_at="2020-01-02T00:00:00Z",
+                error="ahrefs_down",
+                rdap_status="done",
+            ),
+        )
+
+        state = self.connection.execute(
+            "SELECT domain_created_at, rdap_status FROM domain_states "
+            "WHERE normalized_domain = ? AND source = ?",
+            [task.normalized_domain, runner.DOMAIN_STATE_SOURCE],
+        ).fetchone()
+        retry = self.task_row(
+            "domain_state_tasks",
+            "normalized_domain = ? AND source = ?",
+            [task.normalized_domain, runner.DOMAIN_STATE_SOURCE],
+        )
+        self.assertEqual(state["domain_created_at"], "2020-01-02T00:00:00Z")
+        self.assertEqual(state["rdap_status"], "done")
+        self.assertEqual(retry["status"], "failed")
+        self.assertEqual(retry["fetch_rdap"], 0)
 
     async def test_similarweb_three_month_windows_accumulate_long_term_history(self) -> None:
         tool_id = self.add_tool("traffic-history", status="published")
@@ -1104,6 +3298,131 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             [task.pricing_source_id],
         ).fetchone()
         self.assertTrue(source["last_success_at"])
+
+    async def test_pricing_claims_shadow_deduplicates_artifacts_and_continues_claims(self) -> None:
+        tool_id = self.add_tool("pricing-claims-shadow")
+        store = runner.D1PricingStore(self.d1)
+        source_url = "https://pricing-claims-shadow.example/pricing"
+        await store.insert_pricing_source(tool_id, source_url, "manual", 100)
+        self.assertEqual(await store.queue_due_tasks(10), 1)
+        task = (await store.claim_due_tasks(10, lease_owner="claims-shadow-worker"))[0]
+        html_body = """
+        <html><body><section id="pricing" aria-label="Pricing plans">
+          <h1>Pricing plans</h1><article><h2>Pro</h2><p>$29 per month</p></article>
+        </section></body></html>
+        """
+        result = runner.PricingFetchResult(
+            url=source_url,
+            final_url=source_url,
+            status=200,
+            content_type="text/html",
+            html=html_body,
+        )
+        bundle = runner.build_pricing_snapshot_bundle(html_body)
+
+        class StubUploader:
+            def __init__(self) -> None:
+                self.keys: list[str] = []
+
+            async def put_object(self, key: str, body: bytes, content_type: str) -> None:
+                self.keys.append(key)
+
+        uploader = StubUploader()
+        first_plan = await store.prepare_pricing_claims_shadow(task, bundle, uploader)
+        self.assertTrue(first_plan.region_changed)
+        self.assertEqual(len(uploader.keys), 4)
+        first_snapshot_id = await store.insert_snapshot(task, result, bundle)
+        first_counts = await store.insert_pricing_claims_shadow(
+            task, first_snapshot_id, bundle, first_plan
+        )
+        self.assertEqual(first_counts["claims_inserted"], 4)
+        self.assertEqual(first_counts["claims_continued"], 0)
+
+        second_plan = await store.prepare_pricing_claims_shadow(task, bundle, uploader)
+        self.assertFalse(second_plan.region_changed)
+        self.assertFalse(second_plan.run_extraction)
+        self.assertEqual(len(uploader.keys), 4)
+        second_snapshot_id = await store.insert_snapshot(task, result, bundle)
+        second_counts = await store.insert_pricing_claims_shadow(
+            task, second_snapshot_id, bundle, second_plan
+        )
+        self.assertEqual(second_counts["claims_inserted"], 0)
+        self.assertEqual(second_counts["claims_continued"], 4)
+
+        snapshot = self.connection.execute(
+            "SELECT html_object_key, text_object_key, dom_map_object_key, pricing_region_hash "
+            "FROM pricing_snapshots WHERE id = ?",
+            [second_snapshot_id],
+        ).fetchone()
+        self.assertTrue(snapshot["html_object_key"].startswith("pricing/artifacts/html/"))
+        self.assertTrue(snapshot["text_object_key"].startswith("pricing/artifacts/text/"))
+        self.assertTrue(snapshot["dom_map_object_key"].startswith("pricing/artifacts/dom_map/"))
+        self.assertEqual(snapshot["pricing_region_hash"], bundle.region.region_hash)
+        active_claims = self.connection.execute(
+            "SELECT claim_type, first_seen_snapshot_id, last_seen_snapshot_id, consecutive_seen_count, "
+            "normalization_status, validation_status, decision_status, normalized_value_json, "
+            "normalization_errors_json, normalizer_version, validator_version "
+            "FROM pricing_claims WHERE lifecycle_status = 'active' ORDER BY claim_type"
+        ).fetchall()
+        self.assertEqual(len(active_claims), 4)
+        self.assertTrue(all(row["first_seen_snapshot_id"] == first_snapshot_id for row in active_claims))
+        self.assertTrue(all(row["last_seen_snapshot_id"] == second_snapshot_id for row in active_claims))
+        self.assertTrue(all(row["consecutive_seen_count"] == 2 for row in active_claims))
+        by_type = {row["claim_type"]: row for row in active_claims}
+        self.assertEqual(by_type["has_paid_pricing"]["normalization_status"], "not_applicable")
+        self.assertEqual(by_type["has_paid_pricing"]["validation_status"], "entailed")
+        self.assertEqual(by_type["has_paid_pricing"]["decision_status"], "auto_verified")
+        self.assertEqual(by_type["starting_paid_price"]["normalization_status"], "failed")
+        self.assertEqual(by_type["starting_paid_price"]["validation_status"], "entailed")
+        self.assertEqual(by_type["starting_paid_price"]["decision_status"], "unresolved")
+        self.assertEqual(by_type["starting_paid_price"]["normalized_value_json"], '{"amount":"29"}')
+        self.assertEqual(
+            by_type["starting_paid_price"]["normalization_errors_json"],
+            '["ambiguous_currency_symbol"]',
+        )
+        self.assertTrue(all(row["normalizer_version"] == "pricing-normalizer-v1" for row in active_claims))
+        self.assertTrue(all(row["validator_version"] == "pricing-validator-v1" for row in active_claims))
+        evidence_count = self.connection.execute(
+            "SELECT count(*) AS total FROM pricing_claim_evidence"
+        ).fetchone()["total"]
+        self.assertEqual(evidence_count, 8)
+        second_retention = self.connection.execute(
+            "SELECT DISTINCT retention_class FROM pricing_snapshot_artifacts WHERE snapshot_id = ?",
+            [second_snapshot_id],
+        ).fetchall()
+        self.assertEqual([row["retention_class"] for row in second_retention], ["diagnostic"])
+
+        changed_html = html_body.replace("$29", "$39")
+        changed_result = runner.PricingFetchResult(
+            url=source_url,
+            final_url=source_url,
+            status=200,
+            content_type="text/html",
+            html=changed_html,
+        )
+        changed_bundle = runner.build_pricing_snapshot_bundle(changed_html)
+        changed_plan = await store.prepare_pricing_claims_shadow(task, changed_bundle, uploader)
+        self.assertTrue(changed_plan.region_changed)
+        changed_snapshot_id = await store.insert_snapshot(task, changed_result, changed_bundle)
+        changed_counts = await store.insert_pricing_claims_shadow(
+            task, changed_snapshot_id, changed_bundle, changed_plan
+        )
+        self.assertEqual(changed_counts["claims_inserted"], 1)
+        self.assertEqual(changed_counts["claims_continued"], 3)
+        self.assertEqual(changed_counts["claims_superseded"], 1)
+        price_claims = self.connection.execute(
+            "SELECT lifecycle_status, raw_value_json FROM pricing_claims "
+            "WHERE claim_type = 'starting_paid_price' ORDER BY id"
+        ).fetchall()
+        self.assertEqual(
+            [row["lifecycle_status"] for row in price_claims],
+            ["superseded", "active"],
+        )
+        self.assertIn('"amount_raw":"39"', price_claims[-1]["raw_value_json"])
+        change_events = self.connection.execute(
+            "SELECT event_type FROM pricing_claim_events ORDER BY id"
+        ).fetchall()
+        self.assertEqual([row["event_type"] for row in change_events], ["change_detected"])
 
     async def test_missing_pricing_source_discovery_builds_unleased_probe_task(self) -> None:
         tool_id = self.add_tool("pricing-source-discovery", status="published")

@@ -9,5 +9,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY runner.py .
+COPY taxonomy_shadow.py .
+COPY pricing ./pricing
 
 CMD ["python", "runner.py", "--all", "--loop", "--interval-seconds", "300"]

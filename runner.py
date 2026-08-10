@@ -24,6 +24,12 @@ from urllib.parse import quote, urljoin, urlsplit
 import httpx
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from dotenv import load_dotenv
+from pricing.bundle import PricingSnapshotBundle, build_pricing_snapshot_bundle
+from pricing.claim_states import ClaimState, assert_claim_invariants
+from pricing.feature_flags import assert_safe_pricing_claim_flags
+from pricing.normalize import normalize_raw_claim
+from pricing.snapshot import SnapshotCapturePlan, plan_snapshot_capture
+from pricing.validate import validate_raw_claim
 
 try:
     from fake_useragent import UserAgent
@@ -44,7 +50,19 @@ TRAFFIC_METRICS_SCHEMA_VERSION = 2
 ASSET_SOURCE = "site_scraper"
 ASSET_DB_STORAGE_BUCKET = "sitesimgs"
 DEFAULT_R2_BUCKET = "sitesimgs"
-ASSET_REQUIREMENT_ORDER = ("screenshot", "favicon", "description", "key_features", "category")
+ASSET_REQUIREMENT_ORDER = ("content_safety", "screenshot", "favicon", "description", "key_features", "category")
+AUTO_APPROVE_TOOL_NAME_CONFIDENCE = 85
+REVIEW_TOOL_NAME_CONFIDENCE = 60
+# Stop automatic attempts at this threshold and route the tool to manual review.
+CATEGORY_CLASSIFICATION_MAX_ATTEMPTS = 3
+CATEGORY_CLASSIFICATION_PROMPT_VERSION = "hierarchical-v2-2026-08-05"
+# Marker stored in classification raw JSON so published backfill is resumable.
+PUBLISHED_CATEGORY_BACKFILL_VERSION = "published-legacy-v1"
+# Primary model via Browser Rendering custom_ai (AI Gateway provider form).
+DEFAULT_CATEGORY_CLASSIFICATION_MODEL = "deepseek/deepseek-v4-flash"
+DEFAULT_CATEGORY_CLASSIFICATION_FALLBACK_MODEL = (
+    "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+)
 D1_API_BASE = "https://api.cloudflare.com/client/v4"
 DOMAIN_STATE_SOURCE = "ahrefs"
 AHREFS_DOMAIN_RATING_URL = "https://api.ahrefs.com/v3/public/domain-rating-free"
@@ -53,7 +71,7 @@ RDAP_USER_AGENT = "traffic-runner-domain-whois/0.1"
 PRICING_EXTRACTOR_VERSION = "python-rule-pricing-v1"
 OPENAI_PRICING_EXTRACTOR_VERSION = "openai-structured-pricing-v1"
 OPENAI_API_BASE = "https://api.openai.com/v1"
-DEFAULT_OPENAI_PRICING_MODEL = "gpt-5.4-mini"
+DEFAULT_OPENAI_PRICING_MODEL = "gpt-5.6-luna"
 DEFAULT_OPENAI_PRICING_FALLBACK_MODEL = ""
 OPENAI_PRICING_MIN_CONFIDENCE = 60
 DEFAULT_OPENAI_PRICING_TEXT_CHARS = 24000
@@ -208,6 +226,14 @@ class Config:
     domain_state_max_age_days: int
     pricing_limit: int
     pricing_timeout_seconds: int
+    taxonomy_auto_enabled: bool
+    taxonomy_limit: int
+    taxonomy_interval_seconds: int
+    taxonomy_concurrency: int
+    taxonomy_auto_accept_confidence: float
+    taxonomy_provider_backoff_seconds: int
+    pricing_claims_shadow: bool
+    pricing_claims_publish: bool
     openai_api_key: str
     openai_pricing_model: str
     openai_pricing_fallback_model: str
@@ -216,6 +242,10 @@ class Config:
     browser_rendering_api_token: str
     browser_rendering_enabled: bool
     browser_rendering_timeout_seconds: int
+    category_classification_api_token: str
+    category_classification_deepseek_api_key: str
+    category_classification_model: str
+    category_classification_fallback_model: str
     r2_access_key_id: str
     r2_secret_access_key: str
     r2_bucket: str
@@ -253,6 +283,8 @@ class DomainStateTask:
     max_attempts: int
     generation: int
     lease_token: str
+    fetch_domain_rating: bool
+    fetch_rdap: bool
 
 
 @dataclass(frozen=True)
@@ -313,6 +345,8 @@ class DomainStateResult:
     domain_rating: float | None
     domain_created_at: str | None
     error: str | None = None
+    rdap_status: str | None = None
+    rdap_error: str | None = None
 
 
 @dataclass(frozen=True)
@@ -321,19 +355,94 @@ class AssetFetchResult:
     screenshot: bytes = b""
     html: str = ""
     title: str = ""
+    page_title: str = ""
     description: str = ""
     favicon_href: str = ""
     category_l1: str = ""
     category_l2: str = ""
+    category_raw_output: str = ""
     key_features: list[dict[str, str]] | None = None
+    name_source: str = "internal"
+    name_confidence: int = 100
+    name_evidence: str = ""
+    name_review_status: str = "auto_approved"
+    page_state: str = "valid_product_page"
+    page_state_reason: str = ""
+    content_safety_status: str = "unknown"
+    content_safety_score: int = 0
+    content_safety_confidence: int = 0
+    content_safety_reason: str = ""
+    content_safety_evidence: list[str] | None = None
+    content_safety_source: str = ""
     metadata_error: str = ""
     metadata_retryable: bool = True
+
+
+@dataclass(frozen=True)
+class CategoryCatalogEntry:
+    slug: str
+    parent_slug: str = ""
+    definition: str = ""
+    includes: str = ""
+    excludes: str = ""
+    examples: str = ""
+
+
+@dataclass(frozen=True)
+class PageQualityAssessment:
+    state: str
+    reason: str
+    evidence: str = ""
+
+    @property
+    def is_valid(self) -> bool:
+        return self.state == "valid_product_page"
+
+
+@dataclass(frozen=True)
+class ToolNameResolution:
+    product_name: str
+    page_title: str
+    source: str
+    confidence: int
+    evidence: str
+    review_status: str
+
+
+@dataclass(frozen=True)
+class ContentSafetyAssessment:
+    status: str
+    risk_score: int
+    confidence: int
+    reason: str
+    evidence: list[str]
+    source: str
 
 
 class AssetPipelineError(RuntimeError):
     def __init__(self, message: str, *, retryable: bool = True):
         super().__init__(message)
         self.retryable = retryable
+
+
+class PageQualityError(AssetPipelineError):
+    def __init__(self, assessment: PageQualityAssessment, *, retry_after_hours: int):
+        super().__init__(
+            f"page_invalid:{assessment.state}:{assessment.reason}:{assessment.evidence}"[:900],
+            retryable=assessment.state in {"anti_bot", "access_denied", "captcha", "empty_page", "error_page"},
+        )
+        self.assessment = assessment
+        self.retry_after_hours = retry_after_hours
+
+
+class ContentSafetyError(AssetPipelineError):
+    def __init__(self, assessment: ContentSafetyAssessment):
+        super().__init__(
+            f"content_safety_blocked:{assessment.status}:{assessment.reason}:"
+            f"{','.join(assessment.evidence[:8])}"[:900],
+            retryable=False,
+        )
+        self.assessment = assessment
 
 
 @dataclass(frozen=True)
@@ -370,6 +479,16 @@ def read_bool_env(name: str, fallback: bool) -> bool:
     if value is None or value.strip() == "":
         return fallback
     return value.strip().lower() not in {"0", "false", "no", "off"}
+
+
+def read_float_env(name: str, fallback: float) -> float:
+    value = os.getenv(name)
+    if not value:
+        return fallback
+    try:
+        return float(value)
+    except ValueError:
+        return fallback
 
 
 def log_info(message: str, **fields: Any) -> None:
@@ -437,9 +556,26 @@ def load_config(require_brightdata: bool = True) -> Config:
         traffic_release_queue_limit=max(1, read_int_env("TRAFFIC_RELEASE_QUEUE_LIMIT", 5000)),
         asset_limit=read_int_env("RUNNER_ASSET_LIMIT", 5),
         domain_state_limit=read_int_env("RUNNER_DOMAIN_STATE_LIMIT", 50),
-        domain_state_max_age_days=read_int_env("RUNNER_DOMAIN_STATE_MAX_AGE_DAYS", 15),
+        domain_state_max_age_days=read_int_env("RUNNER_DOMAIN_STATE_MAX_AGE_DAYS", 30),
         pricing_limit=read_int_env("RUNNER_PRICING_LIMIT", 20),
         pricing_timeout_seconds=read_int_env("RUNNER_PRICING_TIMEOUT_SECONDS", 20),
+        taxonomy_auto_enabled=read_bool_env("TAXONOMY_AUTO_ENABLED", True),
+        taxonomy_limit=max(1, read_int_env("RUNNER_TAXONOMY_LIMIT", 10)),
+        taxonomy_interval_seconds=max(
+            300, read_int_env("RUNNER_TAXONOMY_INTERVAL_SECONDS", 900)
+        ),
+        taxonomy_concurrency=min(
+            8, max(1, read_int_env("RUNNER_TAXONOMY_CONCURRENCY", 2))
+        ),
+        taxonomy_auto_accept_confidence=min(
+            1.0,
+            max(0.35, read_float_env("TAXONOMY_AUTO_ACCEPT_CONFIDENCE", 0.5)),
+        ),
+        taxonomy_provider_backoff_seconds=max(
+            900, read_int_env("RUNNER_TAXONOMY_PROVIDER_BACKOFF_SECONDS", 21600)
+        ),
+        pricing_claims_shadow=read_bool_env("PRICING_CLAIMS_SHADOW", False),
+        pricing_claims_publish=read_bool_env("PRICING_CLAIMS_PUBLISH", False),
         openai_api_key=os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API", ""),
         openai_pricing_model=os.getenv("OPENAI_PRICING_MODEL", DEFAULT_OPENAI_PRICING_MODEL),
         openai_pricing_fallback_model=os.getenv("OPENAI_PRICING_FALLBACK_MODEL", DEFAULT_OPENAI_PRICING_FALLBACK_MODEL),
@@ -448,6 +584,28 @@ def load_config(require_brightdata: bool = True) -> Config:
         browser_rendering_api_token=os.getenv("CLOUDFLARE_BROWSER_RENDERING_API_TOKEN") or os.environ["CLOUDFLARE_API_TOKEN"],
         browser_rendering_enabled=read_bool_env("CLOUDFLARE_BROWSER_RENDERING_ENABLED", False),
         browser_rendering_timeout_seconds=read_int_env("CLOUDFLARE_BROWSER_RENDERING_TIMEOUT_SECONDS", 45),
+        category_classification_api_token=(
+            os.getenv("CLOUDFLARE_WORKERS_AI_API_TOKEN")
+            or os.getenv("CLOUDFLARE_BROWSER_RENDERING_API_TOKEN")
+            or os.environ["CLOUDFLARE_API_TOKEN"]
+        ),
+        category_classification_deepseek_api_key=(
+            os.getenv("DEEPSEEK_API_KEY")
+            or os.getenv("CATEGORY_CLASSIFICATION_DEEPSEEK_API_KEY")
+            or ""
+        ).strip(),
+        category_classification_model=normalize_category_model_id(
+            os.getenv(
+                "CATEGORY_CLASSIFICATION_MODEL",
+                DEFAULT_CATEGORY_CLASSIFICATION_MODEL,
+            )
+        ),
+        category_classification_fallback_model=normalize_category_model_id(
+            os.getenv(
+                "CATEGORY_CLASSIFICATION_FALLBACK_MODEL",
+                DEFAULT_CATEGORY_CLASSIFICATION_FALLBACK_MODEL,
+            )
+        ),
         r2_access_key_id=os.getenv("CLOUDFLARE_R2_ACCESS_KEY_ID", ""),
         r2_secret_access_key=os.getenv("CLOUDFLARE_R2_SECRET_ACCESS_KEY", ""),
         r2_bucket=os.getenv("CLOUDFLARE_R2_BUCKET", DEFAULT_R2_BUCKET),
@@ -767,9 +925,355 @@ def clean_asset_text(value: Any, limit: int) -> str:
     return html.unescape(text)[:limit]
 
 
+def normalize_category_model_id(value: Any) -> str:
+    """Normalize category model ids for Browser Rendering custom_ai.
+
+    Accepts short DeepSeek names (``deepseek-v4-flash``) and expands them to the
+    provider form required by Cloudflare custom_ai (``deepseek/deepseek-v4-flash``).
+    """
+    model = str(value or "").strip()
+    if not model:
+        return ""
+    if model.startswith(("workers-ai/", "deepseek/", "openai/", "anthropic/", "google-ai-studio/", "groq/")):
+        return model
+    if model.startswith("deepseek-") or model in {"deepseek-v4-flash", "deepseek-v4-pro"}:
+        return f"deepseek/{model}"
+    return model
+
+
+def category_model_auth_token(model: str, config_or_client: Any) -> str:
+    """Pick the provider credential for a category custom_ai model entry."""
+    model_id = normalize_category_model_id(model)
+    if model_id.startswith("deepseek/"):
+        deepseek_key = getattr(config_or_client, "category_deepseek_api_key", None)
+        if deepseek_key is None:
+            deepseek_key = getattr(config_or_client, "category_classification_deepseek_api_key", "")
+        return str(deepseek_key or "").strip()
+    token = getattr(config_or_client, "category_api_token", None)
+    if token is None:
+        token = getattr(config_or_client, "category_classification_api_token", "")
+    return str(token or "").strip()
+
+
+def build_browser_response_format(
+    json_schema: dict[str, Any],
+    *,
+    model: str | None = None,
+    stage: str = "extraction",
+) -> dict[str, Any]:
+    """Build provider-compatible response_format for Browser Rendering /json.
+
+    DeepSeek's API documents ``json_object`` only. Forwarding OpenAI-style
+    ``json_schema`` without a nested ``schema`` field fails with:
+    ``response_format: missing field schema``.
+    Workers AI / default Browser Run accept a json_schema envelope with
+    ``name`` + ``schema``.
+    """
+    model_id = normalize_category_model_id(model or "")
+    if model_id.startswith("deepseek/"):
+        return {"type": "json_object"}
+
+    schema_name = re.sub(r"[^a-z0-9_]+", "_", (stage or "extraction").lower()).strip("_")[:64] or "extraction"
+    # If caller already passed an OpenAI envelope, keep it.
+    if isinstance(json_schema, dict) and isinstance(json_schema.get("schema"), dict) and "name" in json_schema:
+        return {"type": "json_schema", "json_schema": json_schema}
+
+    return {
+        "type": "json_schema",
+        "json_schema": {
+            "name": schema_name,
+            "strict": True,
+            "schema": json_schema,
+        },
+    }
+
+
+def augment_prompt_for_response_format(
+    prompt: str,
+    json_schema: dict[str, Any],
+    response_format: dict[str, Any],
+) -> str:
+    """When using json_object mode, pin the expected keys into the prompt."""
+    if response_format.get("type") != "json_object":
+        return prompt
+    schema = json_schema
+    if isinstance(json_schema.get("schema"), dict):
+        schema = json_schema["schema"]
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict) or not properties:
+        return (
+            f"{prompt}\n\nReturn one JSON object only. Do not wrap it in markdown."
+        )
+    required = schema.get("required") if isinstance(schema, dict) else None
+    keys = list(properties.keys())
+    required_keys = [str(item) for item in required] if isinstance(required, list) else keys
+    return (
+        f"{prompt}\n\n"
+        "Return one JSON object only (no markdown fences). "
+        f"Required keys: {', '.join(required_keys)}. "
+        f"Allowed keys: {', '.join(keys)}. "
+        "Use empty strings when a value is unknown."
+    )
+
+
 def clean_category_slug(value: Any) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
     return slug if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,119}", slug) and slug != "uncategorized" else ""
+
+
+def normalize_category_catalog(
+    category_options: list[str] | list[CategoryCatalogEntry],
+) -> list[CategoryCatalogEntry]:
+    entries: list[CategoryCatalogEntry] = []
+    for item in category_options:
+        if isinstance(item, CategoryCatalogEntry):
+            if item.slug:
+                entries.append(item)
+            continue
+        slug = clean_category_slug(item)
+        if slug:
+            entries.append(CategoryCatalogEntry(slug=slug))
+    return entries
+
+
+def render_category_catalog(entries: list[CategoryCatalogEntry]) -> str:
+    lines: list[str] = []
+    for entry in entries:
+        bits = [entry.slug]
+        if entry.parent_slug:
+            bits.append(f"parent={entry.parent_slug}")
+        if entry.definition:
+            bits.append(f"def={entry.definition}")
+        if entry.includes:
+            bits.append(f"includes={entry.includes}")
+        if entry.excludes:
+            bits.append(f"excludes={entry.excludes}")
+        if entry.examples:
+            bits.append(f"examples={entry.examples}")
+        lines.append(" | ".join(bits))
+    return "\n".join(lines)
+
+
+def category_catalog_version(entries: list[CategoryCatalogEntry]) -> str:
+    payload = [
+        {
+            "slug": entry.slug,
+            "parent_slug": entry.parent_slug,
+            "definition": entry.definition,
+            "includes": entry.includes,
+            "excludes": entry.excludes,
+            "examples": entry.examples,
+        }
+        for entry in entries
+    ]
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
+
+
+def build_category_classification_prompt(entries: list[CategoryCatalogEntry]) -> str:
+    """Build the legacy flat prompt used when hierarchy metadata is unavailable."""
+    if not entries:
+        return (
+            "Choose the best category slugs for this AI product. No active categories are configured. "
+            "Return empty strings for category_l1 and category_l2."
+        )
+
+    return (
+        "Choose the best category slugs for this AI product from the catalog below. "
+        "Category values must be exact slugs from the catalog. "
+        "Use category_l1 for the broad parent/top-level category and category_l2 for the most specific child. "
+        "When a definition or excludes note is present, treat it as binding boundary guidance. "
+        "Return empty strings when unsure — do not invent slugs.\n\n"
+        f"Catalog:\n{render_category_catalog(entries[:180])}"
+    )
+
+
+def build_category_l1_prompt(entries: list[CategoryCatalogEntry]) -> str:
+    return (
+        "Classify the AI product into exactly one primary top-level category from the catalog below. "
+        "Choose by the product's main user outcome, not incidental features, integrations, or marketing wording. "
+        "Definitions and excludes are binding. "
+        "If the page is a product homepage with any usable product description, tagline, or feature list, "
+        "you MUST pick the single best-matching category_l1 slug — do not return empty just because evidence is partial. "
+        "Return an empty category_l1 only when the page is blank, blocked, or clearly not a product site. "
+        "Use an exact slug and never invent a category.\n\n"
+        f"Top-level catalog:\n{render_category_catalog(entries)}"
+    )
+
+
+def build_category_l2_prompt(
+    parent: CategoryCatalogEntry,
+    children: list[CategoryCatalogEntry],
+) -> str:
+    return (
+        f"The AI product has already been assigned to top-level category '{parent.slug}'. "
+        "Choose the single most specific child category below that best matches its main user outcome. "
+        "Definitions and excludes are binding. Return an empty category_l2 when none is sufficiently supported. "
+        "Use an exact slug and never choose a category outside this parent.\n\n"
+        f"Parent:\n{render_category_catalog([parent])}\n\n"
+        f"Child catalog:\n{render_category_catalog(children)}"
+    )
+
+
+def annotate_published_category_backfill_raw(raw_output: str, result: AssetFetchResult) -> str:
+    """Attach resumable backfill markers to the model raw payload."""
+    payload: dict[str, Any]
+    try:
+        parsed = json.loads(raw_output) if raw_output else {}
+        payload = parsed if isinstance(parsed, dict) else {"raw": parsed}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        payload = {"raw": raw_output}
+    payload["backfill"] = PUBLISHED_CATEGORY_BACKFILL_VERSION
+    payload["prompt_version"] = str(
+        payload.get("prompt_version") or CATEGORY_CLASSIFICATION_PROMPT_VERSION
+    )
+    payload["accepted_l1"] = result.category_l1
+    payload["accepted_l2"] = result.category_l2
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def published_category_backfill_success(result: AssetFetchResult) -> bool:
+    """Return True when a reclassification result is safe to apply to a published tool.
+
+    L1 is required. An unmatched L2 (invented / out-of-parent slug) is rejected so the
+    live catalog is never partially rewritten. Empty L2 is allowed (parent-only).
+    """
+    if not result.category_l1:
+        return False
+    error = (result.metadata_error or "").strip()
+    if error.startswith("category_l2_unmatched"):
+        return False
+    return True
+
+
+def raw_has_published_category_backfill(raw_output: Any) -> bool:
+    text = str(raw_output or "")
+    if not text:
+        return False
+    if f'"backfill":"{PUBLISHED_CATEGORY_BACKFILL_VERSION}"' in text:
+        return True
+    if f'"backfill": "{PUBLISHED_CATEGORY_BACKFILL_VERSION}"' in text:
+        return True
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return isinstance(parsed, dict) and parsed.get("backfill") == PUBLISHED_CATEGORY_BACKFILL_VERSION
+
+
+def extract_json_object_from_text(text: str) -> dict[str, Any]:
+    """Best-effort extraction of a schema JSON object from free-form model text."""
+    cleaned = (text or "").strip()
+    if not cleaned:
+        return {}
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except (TypeError, ValueError, json.JSONDecodeError):
+        pass
+
+    # Prefer the last compact object that mentions a category field.
+    candidates = re.findall(r"\{[^{}]*\"category_l[12]\"[^{}]*\}", cleaned)
+    for candidate in reversed(candidates):
+        try:
+            parsed = json.loads(candidate)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(parsed, dict):
+            return parsed
+
+    # gpt-oss sometimes concludes in prose: category_l1 = "coding-development"
+    match = re.search(
+        r"category_l1\s*[:=]\s*[\"']([a-z0-9][a-z0-9-]{0,119})[\"']",
+        cleaned,
+        flags=re.IGNORECASE,
+    )
+    if match:
+        result = {"category_l1": match.group(1).lower()}
+        match_l2 = re.search(
+            r"category_l2\s*[:=]\s*[\"']([a-z0-9][a-z0-9-]{0,119})[\"']",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        if match_l2:
+            result["category_l2"] = match_l2.group(1).lower()
+        return result
+    return {}
+
+
+def normalize_structured_json_payload(payload: Any) -> dict[str, Any]:
+    """Normalize Browser Run /json payloads across default and custom AI models.
+
+    Cloudflare's default /json path usually returns a flat object matching the
+    requested schema. Workers AI custom models (especially gpt-oss) often wrap the
+    same object inside OpenAI-style ``choices[0].message.content`` as a JSON string,
+    or leave content null while the decision appears only in reasoning text.
+    """
+    if isinstance(payload, str):
+        return extract_json_object_from_text(payload)
+
+    if not isinstance(payload, dict):
+        return {}
+
+    # Already looks like a schema object (category/core/features).
+    schema_keys = {
+        "category_l1",
+        "category_l2",
+        "title",
+        "product_name",
+        "page_title",
+        "name_confidence",
+        "name_source",
+        "name_evidence",
+        "content_safety_label",
+        "content_safety_confidence",
+        "content_safety_evidence",
+        "description",
+        "favicon_href",
+        "key_features",
+    }
+    if schema_keys.intersection(payload.keys()):
+        return payload
+
+    choices = payload.get("choices")
+    if isinstance(choices, list) and choices:
+        first = choices[0] if isinstance(choices[0], dict) else {}
+        message = first.get("message") if isinstance(first, dict) else None
+        if isinstance(message, dict):
+            for key in ("content", "reasoning", "reasoning_content"):
+                normalized = normalize_structured_json_payload(message.get(key))
+                if normalized and schema_keys.intersection(normalized.keys()):
+                    return normalized
+        normalized = normalize_structured_json_payload(first)
+        if normalized and schema_keys.intersection(normalized.keys()):
+            return normalized
+
+    # Message-shaped object returned without a choices wrapper.
+    if any(key in payload for key in ("content", "reasoning", "reasoning_content")):
+        for key in ("content", "reasoning", "reasoning_content"):
+            normalized = normalize_structured_json_payload(payload.get(key))
+            if normalized and schema_keys.intersection(normalized.keys()):
+                return normalized
+
+    for key in ("result", "json", "output", "data", "response", "message"):
+        if key not in payload:
+            continue
+        nested = payload.get(key)
+        if nested is payload:
+            continue
+        normalized = normalize_structured_json_payload(nested)
+        if normalized and (
+            schema_keys.intersection(normalized.keys()) or normalized is not nested
+        ):
+            # Avoid returning the same empty-ish wrapper repeatedly.
+            if schema_keys.intersection(normalized.keys()) or any(
+                value not in (None, "", [], {}) for value in normalized.values()
+            ):
+                if schema_keys.intersection(normalized.keys()):
+                    return normalized
+
+    return payload
 
 
 def clean_public_slug(value: Any) -> str:
@@ -828,6 +1332,391 @@ def read_html_meta(html_body: str, names: set[str]) -> str:
         if key in names and content:
             return clean_asset_text(content, 500)
     return ""
+
+
+_CHALLENGE_TITLE_RE = re.compile(
+    r"^(?:just\s+(?:a\s+moment|wait)|checking\s+your\s+browser|"
+    r"verify\s+(?:you\s+are\s+human|your\s+identity)|attention\s+required|security\s+check)\b",
+    re.I,
+)
+_ACCESS_DENIED_TITLE_RE = re.compile(
+    r"^(?:access\s+denied|forbidden|unauthorized|request\s+(?:was\s+)?blocked|error\s*403)\b",
+    re.I,
+)
+_ERROR_TITLE_RE = re.compile(
+    r"^(?:404|not\s+found|page\s+not\s+found|500|internal\s+server\s+error|service\s+unavailable)\b",
+    re.I,
+)
+_GENERIC_PAGE_NAME_RE = re.compile(r"^(?:home|homepage|welcome|index|default\s+page)$", re.I)
+_MARKETING_PAGE_NAME_RE = re.compile(r"^(?:best|free|online|official)\b", re.I)
+_TITLE_SEPARATOR_RE = re.compile(r"\s+(?:\||[–—·])\s+|\s+-\s+|:\s+")
+
+
+def page_visible_text(html_body: str, limit: int = 12000) -> str:
+    text = re.sub(r"<script\b[\s\S]*?</script>", " ", html_body or "", flags=re.I)
+    text = re.sub(r"<style\b[\s\S]*?</style>", " ", text, flags=re.I)
+    text = re.sub(r"<[^>]+>", " ", text)
+    return clean_asset_text(text, limit)
+
+
+def classify_page_state(
+    html_body: str,
+    *,
+    page_title: str = "",
+    http_status: int | None = None,
+) -> PageQualityAssessment:
+    """Classify the captured target page before any enrichment is persisted.
+
+    Browser Rendering can return HTTP 200 while the rendered target is a WAF or
+    anti-bot challenge. Content signatures therefore take precedence over the
+    outer API status.
+    """
+    title = clean_asset_text(page_title or read_html_title(html_body), 200)
+    raw_lower = (html_body or "").lower()
+    visible = page_visible_text(html_body)
+    visible_lower = visible.lower()
+
+    if http_status in {401, 403}:
+        return PageQualityAssessment("access_denied", f"http_{http_status}", title)
+    if http_status == 429:
+        return PageQualityAssessment("anti_bot", "http_429", title)
+    if http_status is not None and http_status >= 500 and not html_body.strip():
+        return PageQualityAssessment("error_page", f"http_{http_status}", title)
+
+    if _ACCESS_DENIED_TITLE_RE.search(title):
+        return PageQualityAssessment("access_denied", "access_denied_title", title)
+    if _CHALLENGE_TITLE_RE.search(title):
+        return PageQualityAssessment("anti_bot", "challenge_title", title)
+    if _ERROR_TITLE_RE.search(title):
+        return PageQualityAssessment("error_page", "error_title", title)
+
+    challenge_signatures = (
+        "cf_chl_opt",
+        "cf-chl-",
+        "/cdn-cgi/challenge-platform",
+        "datadome-captcha",
+        "_incapsula_resource",
+        "imperva captcha",
+        "akamai bot manager",
+    )
+    signature = next((item for item in challenge_signatures if item in raw_lower), "")
+    if signature:
+        return PageQualityAssessment("anti_bot", "challenge_html_signature", signature)
+
+    access_phrases = (
+        "you don't have permission to access",
+        "you do not have permission to access",
+        "the request was blocked",
+        "request has been blocked",
+        "access to this page has been denied",
+    )
+    phrase = next((item for item in access_phrases if item in visible_lower), "")
+    if phrase:
+        return PageQualityAssessment("access_denied", "access_denied_body", phrase)
+
+    human_check_phrases = (
+        "checking your browser before accessing",
+        "verify you are human",
+        "verifying you are human",
+        "complete the security check",
+        "enable javascript and cookies to continue",
+    )
+    phrase = next((item for item in human_check_phrases if item in visible_lower), "")
+    if phrase:
+        return PageQualityAssessment("captcha", "human_verification_body", phrase)
+
+    if len(visible) < 20:
+        return PageQualityAssessment("empty_page", "insufficient_visible_content", visible[:120])
+    return PageQualityAssessment("valid_product_page", "usable_html", title)
+
+
+def invalid_tool_name_reason(value: Any) -> str:
+    name = clean_asset_text(value, 160)
+    if not name:
+        return "empty_name"
+    if _CHALLENGE_TITLE_RE.search(name):
+        return "anti_bot_name"
+    if _ACCESS_DENIED_TITLE_RE.search(name):
+        return "access_denied_name"
+    if _ERROR_TITLE_RE.search(name):
+        return "error_page_name"
+    if _GENERIC_PAGE_NAME_RE.fullmatch(name):
+        return "generic_page_name"
+    if len(name) > 80:
+        return "name_too_long"
+    if "|" in name or re.search(r"\s[–—]\s", name):
+        return "unsplit_page_title"
+    if _MARKETING_PAGE_NAME_RE.search(name) and len(name.split()) >= 4:
+        return "marketing_page_title"
+    return ""
+
+
+def _json_ld_product_names(html_body: str) -> list[str]:
+    names: list[str] = []
+    accepted_types = {
+        "product",
+        "softwareapplication",
+        "webapplication",
+        "mobileapplication",
+        "webapp",
+    }
+
+    def visit(value: Any) -> None:
+        if isinstance(value, list):
+            for item in value:
+                visit(item)
+            return
+        if not isinstance(value, dict):
+            return
+        raw_type = value.get("@type")
+        types = raw_type if isinstance(raw_type, list) else [raw_type]
+        normalized_types = {str(item or "").replace(" ", "").lower() for item in types}
+        if normalized_types & accepted_types:
+            name = clean_asset_text(value.get("name"), 120)
+            if name:
+                names.append(name)
+        for key in ("@graph", "mainEntity", "itemListElement"):
+            if key in value:
+                visit(value[key])
+
+    for match in re.finditer(
+        r"<script\b[^>]*type\s*=\s*['\"]application/ld\+json['\"][^>]*>([\s\S]*?)</script>",
+        html_body or "",
+        re.I,
+    ):
+        try:
+            visit(json.loads(html.unescape(match.group(1)).strip()))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+    return list(dict.fromkeys(names))
+
+
+def _domain_brand_label(hostname: str) -> str:
+    registrable = get_registrable_domain(hostname)
+    return (registrable.split(".", 1)[0] or hostname.split(".", 1)[0]).strip().lower()
+
+
+def _compact_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", value.lower())
+
+
+def _matches_domain_brand(name: str, hostname: str) -> bool:
+    name_key = _compact_name(name)
+    domain_key = _compact_name(_domain_brand_label(hostname))
+    return bool(name_key and domain_key and (domain_key in name_key or name_key in domain_key))
+
+
+def domain_fallback_tool_name(hostname: str) -> str:
+    label = _domain_brand_label(hostname)
+    parts = [part for part in re.split(r"[-_]+", label) if part]
+    return " ".join(part[:1].upper() + part[1:] for part in parts)[:120] or "Tool"
+
+
+def resolve_tool_name(
+    html_body: str,
+    hostname: str,
+    *,
+    model_product_name: Any = "",
+    model_page_title: Any = "",
+    model_confidence: Any = 0,
+    model_source: Any = "",
+    model_evidence: Any = "",
+) -> ToolNameResolution:
+    page_title = clean_asset_text(model_page_title or read_html_title(html_body), 200)
+    candidates: list[tuple[str, str, int, str]] = []
+
+    for value in _json_ld_product_names(html_body):
+        candidates.append((value, "json_ld_product", 95, "Product/SoftwareApplication.name"))
+
+    application_name = read_html_meta(html_body, {"application-name", "apple-mobile-web-app-title"})
+    if application_name:
+        candidates.append((application_name, "application_name", 90, "application-name meta"))
+
+    site_name = read_html_meta(html_body, {"og:site_name"})
+    if site_name:
+        candidates.append((site_name, "open_graph_site_name", 82, "og:site_name"))
+
+    product_name = clean_asset_text(model_product_name, 120)
+    if product_name:
+        try:
+            stated_confidence = max(0, min(100, int(float(model_confidence or 0))))
+        except (TypeError, ValueError):
+            stated_confidence = 0
+        model_score = max(70, min(90, stated_confidence or 78))
+        candidates.append((
+            product_name,
+            clean_asset_text(model_source, 60) or "model_product_name",
+            model_score,
+            clean_asset_text(model_evidence, 240) or "model extraction",
+        ))
+
+    for part in _TITLE_SEPARATOR_RE.split(page_title):
+        candidate = clean_asset_text(part, 120).strip(" -|–—:·")
+        if candidate:
+            candidates.append((candidate, "page_title_segment", 72, f"page title: {page_title[:160]}"))
+
+    scored: list[tuple[int, str, str, str]] = []
+    for value, source, base_score, evidence in candidates:
+        reason = invalid_tool_name_reason(value)
+        if reason:
+            continue
+        score = base_score
+        if _matches_domain_brand(value, hostname):
+            score += 15
+        if len(value) > 50:
+            score -= 15
+        if len(value.split()) > 8:
+            score -= 10
+        scored.append((max(0, min(100, score)), value, source, evidence))
+
+    if scored:
+        confidence, name, source, evidence = max(scored, key=lambda item: item[0])
+    else:
+        confidence = 45
+        name = domain_fallback_tool_name(hostname)
+        source = "domain_fallback"
+        evidence = f"hostname={hostname}"
+
+    if confidence >= AUTO_APPROVE_TOOL_NAME_CONFIDENCE:
+        review_status = "auto_approved"
+    elif confidence >= REVIEW_TOOL_NAME_CONFIDENCE:
+        review_status = "needs_review"
+    else:
+        review_status = "needs_review"
+
+    return ToolNameResolution(name, page_title, source, confidence, evidence, review_status)
+
+
+_CONTENT_SAFETY_STRONG_DOMAIN_RE = re.compile(
+    r"porn|porno|pornify|pornjoy|pornwork|hentai|nsfw|deepnude|nudify|undress|clothoff|rule34|sexchat|aiporn",
+    re.I,
+)
+_CONTENT_SAFETY_STRONG_SIGNALS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("porn", re.compile(r"\b(?:ai\s*)?porn(?:ographic)?\b", re.I)),
+    ("nsfw", re.compile(r"\bnsfw\b", re.I)),
+    ("hentai", re.compile(r"\bhentai\b", re.I)),
+    ("deepnude", re.compile(r"\bdeep\s*nude\b|\bdeepnude\b", re.I)),
+    ("nudify", re.compile(r"\bnudif(?:y|ies|ied)\b", re.I)),
+    ("undress-ai", re.compile(r"\b(?:ai\s*)?undress(?:\s+(?:app|ai|photo|image|generator))?\b", re.I)),
+    ("remove-clothes", re.compile(r"\bremove\s+(?:her\s+|their\s+)?clothes\b", re.I)),
+    ("erotic-content", re.compile(r"\berotic(?:a|\s+(?:story|chat|content|image|roleplay))?\b", re.I)),
+    ("sexting", re.compile(r"\bsexting\b", re.I)),
+    ("adult-generator", re.compile(r"\badult\s+(?:content|image|video)\s+generator\b", re.I)),
+    ("explicit-sexual", re.compile(r"\b(?:nude|naked)\b.{0,50}\b(?:sex|sexual|generator|image|video)\b", re.I)),
+    ("xxx", re.compile(r"\bxxx\b", re.I)),
+    ("chinese-porn", re.compile(r"色情|成人视频|黄片|裸照|脱衣|成人图片")),
+)
+_CONTENT_SAFETY_WEAK_SIGNALS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("uncensored", re.compile(r"\buncensored\b", re.I)),
+    ("unrestricted", re.compile(r"\bunrestricted\b", re.I)),
+    ("spicy", re.compile(r"\bspicy\b", re.I)),
+    ("adult", re.compile(r"\badult\b", re.I)),
+    ("ai-girlfriend", re.compile(r"\bai\s+girlfriend\b", re.I)),
+    ("ai-boyfriend", re.compile(r"\bai\s+boyfriend\b", re.I)),
+    ("fantasy-companion", re.compile(r"\b(?:fantasy|intimate)\s+(?:ai\s+)?(?:companion|chat)\b", re.I)),
+    ("no-filter-roleplay", re.compile(r"\b(?:no\s+filter|unfiltered)\b.{0,50}\b(?:roleplay|chat|image|video)\b", re.I)),
+)
+_CONTENT_SAFETY_SAFE_CONTEXT_RE = re.compile(
+    r"\b(?:llm\s+safety|red\s+team|adversarial\s+attack|business\s+(?:domain\s+)?model|data\s+model|code\s+generation|application\s+model)\b",
+    re.I,
+)
+
+
+def assess_content_safety(
+    html_body: str,
+    hostname: str,
+    *,
+    product_name: Any = "",
+    description: Any = "",
+    model_label: Any = "",
+    model_confidence: Any = 0,
+    model_evidence: Any = "",
+) -> ContentSafetyAssessment:
+    visible = page_visible_text(html_body)[:20000]
+    text = " ".join(
+        value for value in (
+            clean_asset_text(product_name, 200),
+            clean_asset_text(description, 1000),
+            visible,
+        ) if value
+    )
+    evidence: list[str] = []
+    normalized_domain = str(hostname or "").lower().removeprefix("www.")
+    if normalized_domain and _CONTENT_SAFETY_STRONG_DOMAIN_RE.search(normalized_domain):
+        evidence.append(f"domain:{normalized_domain}")
+    for label, pattern in _CONTENT_SAFETY_STRONG_SIGNALS:
+        if pattern.search(text):
+            evidence.append(f"strong:{label}")
+    if evidence:
+        return ContentSafetyAssessment(
+            "nsfw",
+            min(100, 95 + min(len(evidence) - 1, 5)),
+            98,
+            "explicit_adult_product_signal",
+            evidence[:12],
+            "deterministic_rules",
+        )
+
+    weak = [f"weak:{label}" for label, pattern in _CONTENT_SAFETY_WEAK_SIGNALS if pattern.search(text)]
+    safe_context = bool(_CONTENT_SAFETY_SAFE_CONTEXT_RE.search(text))
+    label = clean_asset_text(model_label, 30).lower().replace("-", "_")
+    try:
+        stated_confidence = max(0, min(100, int(float(model_confidence or 0))))
+    except (TypeError, ValueError):
+        stated_confidence = 0
+    model_note = clean_asset_text(model_evidence, 240)
+
+    # A model-only NSFW decision is deliberately routed to a human; only high-precision
+    # deterministic evidence may automatically reject a listing.
+    if label in {"nsfw", "adult", "explicit"}:
+        model_signal = f"model:nsfw:{model_note}" if model_note else "model:nsfw"
+        return ContentSafetyAssessment(
+            "needs_review",
+            max(75, stated_confidence),
+            max(70, stated_confidence),
+            "model_detected_adult_context",
+            (weak + [model_signal])[:12],
+            "model_and_rules",
+        )
+    if label in {"uncertain", "needs_review", "unknown"}:
+        return ContentSafetyAssessment(
+            "needs_review",
+            max(45, 40 + len(weak) * 12),
+            max(60, stated_confidence),
+            "content_safety_uncertain",
+            (weak + ([f"model:uncertain:{model_note}"] if model_note else []))[:12],
+            "model_and_rules",
+        )
+    if weak and not safe_context:
+        return ContentSafetyAssessment(
+            "needs_review",
+            min(85, 40 + len(weak) * 12),
+            72,
+            "ambiguous_adult_context",
+            weak[:12],
+            "deterministic_rules",
+        )
+    if label == "safe" and stated_confidence >= 70:
+        return ContentSafetyAssessment(
+            "safe",
+            15 if weak else 5,
+            stated_confidence,
+            "safe_context_disambiguated" if weak else "model_confirmed_safe",
+            weak[:12],
+            "model_and_rules",
+        )
+    if weak and safe_context:
+        return ContentSafetyAssessment(
+            "safe", 15, 82, "safe_context_disambiguated", weak[:12], "deterministic_rules"
+        )
+    return ContentSafetyAssessment(
+        "needs_review",
+        25,
+        max(50, stated_confidence),
+        "insufficient_content_safety_evidence",
+        [],
+        "deterministic_rules",
+    )
 
 
 def extract_favicon_href(html_body: str, page_url: str) -> str | None:
@@ -1774,6 +2663,13 @@ class CloudflareBrowserRunAssetClient:
             "Content-Type": "application/json",
         }
         self.timeout_seconds = config.browser_rendering_timeout_seconds
+        self.category_api_token = config.category_classification_api_token
+        self.category_deepseek_api_key = config.category_classification_deepseek_api_key
+        self.category_model = normalize_category_model_id(config.category_classification_model)
+        self.category_fallback_model = normalize_category_model_id(
+            config.category_classification_fallback_model
+        )
+        self._validated_pages: dict[int, tuple[str, str, PageQualityAssessment]] = {}
 
     async def call_quick_action(self, endpoint: str, body: dict[str, Any]) -> Any:
         async with httpx.AsyncClient(timeout=float(self.timeout_seconds)) as client:
@@ -1840,6 +2736,90 @@ class CloudflareBrowserRunAssetClient:
             payload["rejectResourceTypes"] = ["image", "media", "font"]
         return payload
 
+    def category_custom_ai(self) -> list[dict[str, Any]]:
+        models = list(
+            dict.fromkeys(
+                filter(
+                    None,
+                    [
+                        normalize_category_model_id(
+                            getattr(self, "category_model", DEFAULT_CATEGORY_CLASSIFICATION_MODEL)
+                        ),
+                        normalize_category_model_id(
+                            getattr(
+                                self,
+                                "category_fallback_model",
+                                DEFAULT_CATEGORY_CLASSIFICATION_FALLBACK_MODEL,
+                            )
+                        ),
+                    ],
+                )
+            )
+        )
+        configs: list[dict[str, Any]] = []
+        for model in models:
+            token = category_model_auth_token(model, self)
+            if not token:
+                log_info(
+                    "assets.category_custom_ai.skip_missing_token",
+                    model=model,
+                    provider="deepseek" if model.startswith("deepseek/") else "workers-ai",
+                )
+                continue
+            item: dict[str, Any] = {
+                "model": model,
+                "authorization": f"Bearer {token}",
+            }
+            # Some providers (gpt-oss, deepseek) spend tokens on reasoning; request a
+            # higher completion budget where Browser Run honors it.
+            if "gpt-oss" in model or model.startswith("deepseek/"):
+                item["max_tokens"] = 1024
+                item["max_completion_tokens"] = 1024
+            configs.append(item)
+        return configs
+
+    @staticmethod
+    def structured_payload_has_required_fields(
+        metadata: dict[str, Any],
+        json_schema: dict[str, Any],
+        *,
+        allow_empty_required_arrays: bool = False,
+        empty_object_means_empty_required_arrays: bool = False,
+    ) -> bool:
+        required = json_schema.get("required")
+        if not isinstance(required, list) or not required:
+            return bool(metadata)
+        if allow_empty_required_arrays:
+            properties = json_schema.get("properties")
+            properties = properties if isinstance(properties, dict) else {}
+            if empty_object_means_empty_required_arrays and not metadata:
+                return all(
+                    isinstance(properties.get(key), dict)
+                    and properties[key].get("type") == "array"
+                    for key in required
+                )
+            for key in required:
+                if key not in metadata:
+                    return False
+                value = metadata.get(key)
+                property_schema = properties.get(key)
+                property_schema = property_schema if isinstance(property_schema, dict) else {}
+                if property_schema.get("type") == "array" and isinstance(value, list):
+                    continue
+                if isinstance(value, str) and value.strip():
+                    continue
+                if value not in (None, "", [], {}):
+                    continue
+                return False
+            return True
+        for key in required:
+            value = metadata.get(key)
+            if isinstance(value, str) and value.strip():
+                return True
+            if value not in (None, "", [], {}):
+                return True
+        return False
+
     async def fetch_structured_asset_data(
         self,
         task: AssetTask,
@@ -1847,26 +2827,126 @@ class CloudflareBrowserRunAssetClient:
         prompt: str,
         json_schema: dict[str, Any],
         stage: str,
+        custom_ai: list[dict[str, Any]] | None = None,
+        allow_empty_required_arrays: bool = False,
+        empty_object_means_empty_required_arrays: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         errors: list[str] = []
         retryable_errors: list[bool] = []
+        # Browser Run only falls through custom_ai entries on hard API errors.
+        # Empty / truncated model answers (e.g. gpt-oss finish_reason=length) still
+        # count as HTTP success, so we walk models ourselves.
+        model_attempts: list[list[dict[str, Any]] | None]
+        if custom_ai:
+            model_attempts = [[item] for item in custom_ai if item]
+        else:
+            model_attempts = [None]
+
         for target_url in self.asset_candidate_urls(task):
-            try:
-                extracted = await self.call_quick_action(
-                    "json",
-                    {
-                        **self.browser_payload(target_url),
-                        "prompt": prompt,
-                        "response_format": {
-                            "type": "json_schema",
-                            "json_schema": json_schema,
-                        },
-                    },
+            for ai_config in model_attempts:
+                model_name = ""
+                if ai_config and isinstance(ai_config[0], dict):
+                    model_name = str(ai_config[0].get("model") or "")
+                response_format = build_browser_response_format(
+                    json_schema,
+                    model=model_name or None,
+                    stage=stage,
                 )
-                return target_url, extracted if isinstance(extracted, dict) else {}
-            except Exception as error:
-                errors.append(f"{target_url}: {str(error)[:220]}")
-                retryable_errors.append(bool(getattr(error, "retryable", True)))
+                request_prompt = augment_prompt_for_response_format(prompt, json_schema, response_format)
+                try:
+                    body = {
+                        **self.browser_payload(target_url),
+                        "prompt": request_prompt,
+                        "response_format": response_format,
+                    }
+                    if ai_config:
+                        body["custom_ai"] = ai_config
+                    extracted = await self.call_quick_action("json", body)
+                    metadata = normalize_structured_json_payload(extracted)
+                    if custom_ai and not self.structured_payload_has_required_fields(
+                        metadata,
+                        json_schema,
+                        allow_empty_required_arrays=allow_empty_required_arrays,
+                        empty_object_means_empty_required_arrays=empty_object_means_empty_required_arrays,
+                    ):
+                        # DeepSeek often returns {"category_l1":""} when uncertain. One force-pick retry.
+                        if model_name.startswith("deepseek/") and response_format.get("type") == "json_object":
+                            force_prompt = (
+                                f"{request_prompt}\n\n"
+                                "IMPORTANT: Do not return empty strings. Choose the single best-matching slug "
+                                "from the catalog for this product homepage."
+                            )
+                            try:
+                                force_body = {
+                                    **self.browser_payload(target_url),
+                                    "prompt": force_prompt,
+                                    "response_format": response_format,
+                                    "custom_ai": ai_config,
+                                }
+                                forced = await self.call_quick_action("json", force_body)
+                                forced_meta = normalize_structured_json_payload(forced)
+                                if self.structured_payload_has_required_fields(
+                                    forced_meta,
+                                    json_schema,
+                                    allow_empty_required_arrays=allow_empty_required_arrays,
+                                    empty_object_means_empty_required_arrays=empty_object_means_empty_required_arrays,
+                                ):
+                                    return target_url, forced_meta
+                            except Exception:
+                                pass
+                        log_info(
+                            "assets.browser_json.empty_schema_result",
+                            stage=stage,
+                            url=target_url,
+                            model=model_name,
+                            response_format_type=response_format.get("type"),
+                            raw_preview=json.dumps(extracted, ensure_ascii=False)[:200]
+                            if not isinstance(extracted, (bytes, bytearray))
+                            else "",
+                        )
+                        errors.append(f"{target_url}/{model_name or 'default'}: empty_schema_result")
+                        retryable_errors.append(True)
+                        continue
+                    return target_url, metadata
+                except Exception as error:
+                    message = str(error)[:220]
+                    # If a provider rejects our schema envelope, retry once with json_object.
+                    if (
+                        model_name.startswith("deepseek/")
+                        and "missing field" in message.lower()
+                        and "schema" in message.lower()
+                        and response_format.get("type") != "json_object"
+                    ):
+                        try:
+                            fallback_format = {"type": "json_object"}
+                            fallback_prompt = augment_prompt_for_response_format(
+                                prompt,
+                                json_schema,
+                                fallback_format,
+                            )
+                            body = {
+                                **self.browser_payload(target_url),
+                                "prompt": fallback_prompt,
+                                "response_format": fallback_format,
+                            }
+                            if ai_config:
+                                body["custom_ai"] = ai_config
+                            extracted = await self.call_quick_action("json", body)
+                            metadata = normalize_structured_json_payload(extracted)
+                            if self.structured_payload_has_required_fields(
+                                metadata,
+                                json_schema,
+                                allow_empty_required_arrays=allow_empty_required_arrays,
+                                empty_object_means_empty_required_arrays=empty_object_means_empty_required_arrays,
+                            ):
+                                return target_url, metadata
+                            errors.append(f"{target_url}/{model_name}: empty_schema_result_after_json_object")
+                            retryable_errors.append(True)
+                            continue
+                        except Exception as fallback_error:
+                            message = str(fallback_error)[:220]
+                    errors.append(f"{target_url}: {message}")
+                    retryable_errors.append(bool(getattr(error, "retryable", True)))
 
         raise AssetPipelineError(
             f"Browser Run {stage} extraction failed. " + " | ".join(errors),
@@ -1898,29 +2978,69 @@ class CloudflareBrowserRunAssetClient:
             retryable=any(retryable_errors),
         )
 
+    async def preflight_homepage(self, task: AssetTask) -> PageQualityAssessment:
+        cached = getattr(self, "_validated_pages", {}).get(task.tool_id)
+        if cached:
+            return cached[2]
+        final_url, html_body = await self.fetch_homepage_content(task)
+        assessment = classify_page_state(html_body)
+        if not hasattr(self, "_validated_pages"):
+            self._validated_pages = {}
+        self._validated_pages[task.tool_id] = (final_url, html_body, assessment)
+        return assessment
+
     async def fetch_homepage_core_metadata(self, task: AssetTask) -> AssetFetchResult:
         metadata: dict[str, Any] = {}
         final_url = asset_page_url(task)
         html_body = ""
+        page_assessment = PageQualityAssessment("valid_product_page", "not_preflighted")
         metadata_error = ""
         metadata_retryable = True
+        cached = getattr(self, "_validated_pages", {}).get(task.tool_id)
+        if cached:
+            final_url, html_body, page_assessment = cached
         try:
             final_url, metadata = await self.fetch_structured_asset_data(
                 task,
                 stage="core metadata",
                 prompt=(
-                    "Extract the product title, a concise factual product description, and the favicon href "
-                    "from this product homepage. Return empty strings only when the value is unavailable."
+                    "Extract only the product or brand proper name, the full browser page title, a concise factual "
+                    "product description, and the favicon href from this product homepage. product_name must never "
+                    "contain a tagline, marketing claim, feature description, page label such as Home, or anti-bot "
+                    "text such as Just a moment or Access Denied. If the proper name is uncertain, return an empty "
+                    "product_name. Return a 0-100 name_confidence and concise source/evidence."
+                    " Also classify whether the product intentionally provides pornography, explicit sexual or nude "
+                    "content, sexual chat/sexting, erotic roleplay, or AI undressing. Return content_safety_label as "
+                    "safe, nsfw, or uncertain. Do not classify a product as NSFW merely because it says uncensored, "
+                    "explicit data model, red team, or adult professionals; use the product's actual purpose."
                 ),
                 json_schema={
                     "type": "object",
                     "additionalProperties": False,
                     "properties": {
-                        "title": {"type": "string"},
+                        "product_name": {"type": "string"},
+                        "page_title": {"type": "string"},
                         "description": {"type": "string"},
                         "favicon_href": {"type": "string"},
+                        "name_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+                        "name_source": {"type": "string"},
+                        "name_evidence": {"type": "string"},
+                        "content_safety_label": {"type": "string", "enum": ["safe", "nsfw", "uncertain"]},
+                        "content_safety_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
+                        "content_safety_evidence": {"type": "string"},
                     },
-                    "required": ["title", "description", "favicon_href"],
+                    "required": [
+                        "product_name",
+                        "page_title",
+                        "description",
+                        "favicon_href",
+                        "name_confidence",
+                        "name_source",
+                        "name_evidence",
+                        "content_safety_label",
+                        "content_safety_confidence",
+                        "content_safety_evidence",
+                    ],
                 },
             )
         except Exception as error:
@@ -1928,13 +3048,12 @@ class CloudflareBrowserRunAssetClient:
             metadata_retryable = bool(getattr(error, "retryable", True))
             log_info("assets.browser_core_metadata.failed", url=final_url, error=metadata_error[:300])
 
-        title = clean_asset_text(metadata.get("title"), 120)
         description = clean_asset_text(metadata.get("description"), 500)
-        if not title or not description:
+        if not html_body and (not metadata.get("product_name") or not description):
             try:
                 content_url, html_body = await self.fetch_homepage_content(task)
                 final_url = content_url
-                title = title or read_html_title(html_body)
+                page_assessment = classify_page_state(html_body)
                 description = description or read_html_meta(
                     html_body,
                     {"description", "og:description", "twitter:description"},
@@ -1947,6 +3066,25 @@ class CloudflareBrowserRunAssetClient:
                 metadata_retryable = metadata_retryable or bool(getattr(content_error, "retryable", True))
                 log_info("assets.browser_content.failed", url=final_url, error=content_message[:300])
 
+        resolution = resolve_tool_name(
+            html_body,
+            task.normalized_domain,
+            model_product_name=metadata.get("product_name"),
+            model_page_title=metadata.get("page_title"),
+            model_confidence=metadata.get("name_confidence"),
+            model_source=metadata.get("name_source"),
+            model_evidence=metadata.get("name_evidence"),
+        )
+        content_safety = assess_content_safety(
+            html_body,
+            task.normalized_domain,
+            product_name=resolution.product_name,
+            description=description,
+            model_label=metadata.get("content_safety_label"),
+            model_confidence=metadata.get("content_safety_confidence"),
+            model_evidence=metadata.get("content_safety_evidence"),
+        )
+
         validation_errors = []
         if not description:
             validation_errors.append("description_empty")
@@ -1957,9 +3095,22 @@ class CloudflareBrowserRunAssetClient:
         return AssetFetchResult(
             final_url=final_url,
             html=html_body,
-            title=title,
+            title=resolution.product_name,
+            page_title=resolution.page_title,
             description=description,
             favicon_href=clean_asset_text(metadata.get("favicon_href"), 1000),
+            name_source=resolution.source,
+            name_confidence=resolution.confidence,
+            name_evidence=resolution.evidence,
+            name_review_status=resolution.review_status,
+            page_state=page_assessment.state,
+            page_state_reason=page_assessment.reason,
+            content_safety_status=content_safety.status,
+            content_safety_score=content_safety.risk_score,
+            content_safety_confidence=content_safety.confidence,
+            content_safety_reason=content_safety.reason,
+            content_safety_evidence=content_safety.evidence,
+            content_safety_source=content_safety.source,
             metadata_error=metadata_error,
             metadata_retryable=metadata_retryable,
         )
@@ -2005,50 +3156,189 @@ class CloudflareBrowserRunAssetClient:
     async def fetch_homepage_categories(
         self,
         task: AssetTask,
-        category_options: list[str],
+        category_options: list[str] | list[CategoryCatalogEntry],
     ) -> AssetFetchResult:
-        category_hint = ", ".join(category_options[:180])
-        final_url, metadata = await self.fetch_structured_asset_data(
+        entries = normalize_category_catalog(category_options)
+        model_chain = [item["model"] for item in self.category_custom_ai()]
+        custom_ai = self.category_custom_ai()
+        taxonomy_version = category_catalog_version(entries)
+        parents = [entry for entry in entries if not entry.parent_slug]
+        parent_by_slug = {entry.slug: entry for entry in parents}
+        children_by_parent: dict[str, list[CategoryCatalogEntry]] = {}
+        for entry in entries:
+            if entry.parent_slug in parent_by_slug:
+                children_by_parent.setdefault(entry.parent_slug, []).append(entry)
+
+        if not entries:
+            raw_output = json.dumps(
+                {
+                    "prompt_version": CATEGORY_CLASSIFICATION_PROMPT_VERSION,
+                    "taxonomy_version": taxonomy_version,
+                    "model_chain": model_chain,
+                    "error": "category_catalog_empty",
+                },
+                separators=(",", ":"),
+            )
+            return AssetFetchResult(
+                final_url=asset_page_url(task),
+                category_raw_output=raw_output,
+                metadata_error="category_catalog_empty",
+                metadata_retryable=False,
+            )
+
+        if not children_by_parent:
+            valid_categories = {entry.slug for entry in entries}
+            final_url, metadata = await self.fetch_structured_asset_data(
+                task,
+                stage="category",
+                prompt=build_category_classification_prompt(entries),
+                json_schema={
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "category_l1": {"type": "string"},
+                        "category_l2": {"type": "string"},
+                    },
+                    "required": ["category_l1", "category_l2"],
+                },
+                custom_ai=custom_ai,
+            )
+            extracted_category_l1 = clean_category_slug(metadata.get("category_l1"))
+            extracted_category_l2 = clean_category_slug(metadata.get("category_l2"))
+            category_l1 = extracted_category_l1 if extracted_category_l1 in valid_categories else ""
+            category_l2 = extracted_category_l2 if extracted_category_l2 in valid_categories else ""
+            rejected = [
+                slug
+                for slug in (extracted_category_l1, extracted_category_l2)
+                if slug and slug not in valid_categories
+            ]
+            metadata_error = ""
+            if not category_l1 and not category_l2:
+                metadata_error = (
+                    "category_unmatched=" + ",".join(rejected)
+                    if rejected
+                    else "category_empty"
+                )
+            raw_output = json.dumps(
+                {
+                    "prompt_version": CATEGORY_CLASSIFICATION_PROMPT_VERSION,
+                    "taxonomy_version": taxonomy_version,
+                    "model_chain": model_chain,
+                    "mode": "flat_fallback",
+                    "category_l1": extracted_category_l1 or str(metadata.get("category_l1") or ""),
+                    "category_l2": extracted_category_l2 or str(metadata.get("category_l2") or ""),
+                    "accepted_l1": category_l1,
+                    "accepted_l2": category_l2,
+                    "error": metadata_error,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            return AssetFetchResult(
+                final_url=final_url,
+                category_l1=category_l1,
+                category_l2=category_l2,
+                category_raw_output=raw_output,
+                metadata_error=metadata_error,
+                metadata_retryable=True,
+            )
+
+        final_url, l1_metadata = await self.fetch_structured_asset_data(
             task,
-            stage="category",
-            prompt=(
-                "Choose the best category slugs for this AI product. Category values must be exact slugs "
-                f"from this list: {category_hint}. Use category_l1 for the broad category and category_l2 "
-                "for the most specific category. Return empty strings when unsure."
-            ),
+            stage="category_l1",
+            prompt=build_category_l1_prompt(parents),
             json_schema={
                 "type": "object",
                 "additionalProperties": False,
-                "properties": {
-                    "category_l1": {"type": "string"},
-                    "category_l2": {"type": "string"},
-                },
-                "required": ["category_l1", "category_l2"],
+                "properties": {"category_l1": {"type": "string"}},
+                "required": ["category_l1"],
             },
+            custom_ai=custom_ai,
         )
-        valid_categories = set(category_options)
-        extracted_category_l1 = clean_category_slug(metadata.get("category_l1"))
-        extracted_category_l2 = clean_category_slug(metadata.get("category_l2"))
-        category_l1 = extracted_category_l1 if extracted_category_l1 in valid_categories else ""
-        category_l2 = extracted_category_l2 if extracted_category_l2 in valid_categories else ""
-        rejected_categories = [
-            slug
-            for slug in (extracted_category_l1, extracted_category_l2)
-            if slug and slug not in valid_categories
-        ]
-        metadata_error = ""
-        if not category_l1 and not category_l2:
+        extracted_category_l1 = clean_category_slug(l1_metadata.get("category_l1"))
+        category_l1 = extracted_category_l1 if extracted_category_l1 in parent_by_slug else ""
+        if not category_l1:
             metadata_error = (
-                "category_unmatched=" + ",".join(rejected_categories)
-                if rejected_categories
-                else "category_empty"
+                f"category_l1_unmatched={extracted_category_l1}"
+                if extracted_category_l1
+                else "category_l1_empty"
             )
+            raw_output = json.dumps(
+                {
+                    "prompt_version": CATEGORY_CLASSIFICATION_PROMPT_VERSION,
+                    "taxonomy_version": taxonomy_version,
+                    "model_chain": model_chain,
+                    "mode": "hierarchical",
+                    "l1": l1_metadata,
+                    "accepted_l1": "",
+                    "accepted_l2": "",
+                    "error": metadata_error,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            return AssetFetchResult(
+                final_url=final_url,
+                category_raw_output=raw_output,
+                metadata_error=metadata_error,
+                metadata_retryable=True,
+            )
+
+        parent = parent_by_slug[category_l1]
+        children = children_by_parent.get(category_l1, [])
+        l2_metadata: dict[str, Any] = {}
+        category_l2 = ""
+        l2_error = ""
+        l2_retryable = True
+        if children:
+            try:
+                final_url, l2_metadata = await self.fetch_structured_asset_data(
+                    task,
+                    stage="category_l2",
+                    prompt=build_category_l2_prompt(parent, children),
+                    json_schema={
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {"category_l2": {"type": "string"}},
+                        "required": ["category_l2"],
+                    },
+                    custom_ai=custom_ai,
+                )
+                extracted_category_l2 = clean_category_slug(l2_metadata.get("category_l2"))
+                valid_children = {entry.slug for entry in children}
+                category_l2 = extracted_category_l2 if extracted_category_l2 in valid_children else ""
+                if extracted_category_l2 and not category_l2:
+                    l2_error = f"category_l2_unmatched={extracted_category_l2}"
+                elif not extracted_category_l2:
+                    l2_error = "category_l2_empty"
+            except Exception as error:
+                l2_error = str(error)[:500] or type(error).__name__
+                l2_retryable = bool(getattr(error, "retryable", True))
+                l2_metadata = {"error": l2_error}
+
+        raw_output = json.dumps(
+            {
+                "prompt_version": CATEGORY_CLASSIFICATION_PROMPT_VERSION,
+                "taxonomy_version": taxonomy_version,
+                "model_chain": model_chain,
+                "mode": "hierarchical",
+                "l1": l1_metadata,
+                "l2": l2_metadata,
+                "accepted_l1": category_l1,
+                "accepted_l2": category_l2,
+                "l2_error": l2_error,
+                "error": l2_error,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         return AssetFetchResult(
             final_url=final_url,
             category_l1=category_l1,
             category_l2=category_l2,
-            metadata_error=metadata_error,
-            metadata_retryable=True,
+            category_raw_output=raw_output,
+            metadata_error=l2_error,
+            metadata_retryable=l2_retryable,
         )
 
     async def capture_homepage_screenshot(self, task: AssetTask) -> AssetFetchResult:
@@ -2463,6 +3753,26 @@ def build_traffic_metrics(row: dict[str, Any]) -> dict[str, Any]:
     return metrics
 
 
+def normalize_country_code(value: Any) -> str | None:
+    country_code = str(value or "").strip().upper()
+    return country_code if re.fullmatch(r"[A-Z]{2}", country_code) else None
+
+
+def traffic_share_to_bps(value: Any) -> int | None:
+    share = to_number(value)
+    if share is None or share < 0 or share > 1.000001:
+        return None
+    share = min(share, 1.0)
+    return min(10000, max(0, int(share * 10000 + 0.5)))
+
+
+def estimate_visits_from_bps(visits: Any, traffic_share_bps: int) -> int | None:
+    normalized_visits = to_integer(visits)
+    if normalized_visits is None:
+        return None
+    return (normalized_visits * traffic_share_bps + 5000) // 10000
+
+
 def parse_monthly_rows(payload: dict[str, Any], domain: str, requested_month: str) -> list[dict[str, Any]]:
     engagements = payload.get("Engagments") or {}
     estimated_visits = payload.get("EstimatedMonthlyVisits") or {}
@@ -2815,26 +4125,47 @@ class DomainStateClient:
     def __init__(self, ahref_api_key: str) -> None:
         self.ahref_api_key = ahref_api_key.strip()
 
-    async def fetch(self, domain: str) -> DomainStateResult:
-        ahrefs_result, whois_result = await asyncio.gather(
-            self.fetch_ahrefs_domain_rating(domain),
-            self.fetch_domain_created_at(domain),
-        )
-        domain_created_at = ahrefs_result.domain_created_at or whois_result.domain_created_at
-        if ahrefs_result.status == "done" or domain_created_at:
-            status = "done"
-            error = None
-        elif ahrefs_result.status == "no_data" or whois_result.status == "no_data":
-            status = "no_data"
-            error = ahrefs_result.error or whois_result.error
-        else:
-            status = "failed"
-            error = ahrefs_result.error or whois_result.error
+    async def fetch(
+        self,
+        domain: str,
+        *,
+        fetch_domain_rating: bool = True,
+        fetch_rdap: bool = True,
+    ) -> DomainStateResult:
+        async def safely(operation: Any) -> DomainStateResult:
+            try:
+                return await operation
+            except Exception as error:
+                return DomainStateResult(
+                    status="failed",
+                    domain_rating=None,
+                    domain_created_at=None,
+                    error=str(error)[:300],
+                )
+
+        ahrefs_result: DomainStateResult | None = None
+        rdap_result: DomainStateResult | None = None
+        if fetch_domain_rating and fetch_rdap:
+            ahrefs_result, rdap_result = await asyncio.gather(
+                safely(self.fetch_ahrefs_domain_rating(domain)),
+                safely(self.fetch_domain_created_at(domain)),
+            )
+        elif fetch_domain_rating:
+            ahrefs_result = await safely(self.fetch_ahrefs_domain_rating(domain))
+        elif fetch_rdap:
+            rdap_result = await safely(self.fetch_domain_created_at(domain))
+
+        # DR owns the recurring task outcome and retry policy. RDAP is a one-time
+        # observation: even a failed/no-data response is persisted and not retried.
+        status = ahrefs_result.status if ahrefs_result is not None else "done"
+        error = ahrefs_result.error if ahrefs_result is not None else None
         return DomainStateResult(
             status=status,
-            domain_rating=ahrefs_result.domain_rating,
-            domain_created_at=domain_created_at,
+            domain_rating=ahrefs_result.domain_rating if ahrefs_result is not None else None,
+            domain_created_at=rdap_result.domain_created_at if rdap_result is not None else None,
             error=error,
+            rdap_status=rdap_result.status if rdap_result is not None else None,
+            rdap_error=rdap_result.error if rdap_result is not None else None,
         )
 
     async def fetch_ahrefs_domain_rating(self, domain: str) -> DomainStateResult:
@@ -3103,6 +4434,7 @@ class D1Client:
             "Content-Type": "application/json",
         }
         self.client = httpx.AsyncClient(timeout=30.0)
+        self._market_country_schema_available: bool | None = None
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -3294,11 +4626,12 @@ class D1Client:
         *,
         captured_at: str | None = None,
     ) -> None:
+        projection_captured_at = captured_at or utc_now_iso()
         statements = [
             build_domain_traffic_monthly_upsert(
                 domain,
                 row,
-                captured_at=captured_at,
+                captured_at=projection_captured_at,
                 source_snapshot_id=to_integer(row.get("_source_snapshot_id")),
             )
             for row in rows
@@ -3306,6 +4639,46 @@ class D1Client:
         ]
         if statements:
             await self.batch(statements)
+            await self.upsert_domain_traffic_country_monthly(
+                domain,
+                rows,
+                captured_at=projection_captured_at,
+            )
+
+    async def upsert_domain_traffic_country_monthly(
+        self,
+        domain: str,
+        rows: list[dict[str, Any]],
+        *,
+        captured_at: str,
+    ) -> None:
+        if getattr(self, "_market_country_schema_available", None) is False:
+            return
+        statements = build_domain_traffic_country_upsert_statements(
+            domain,
+            rows,
+            captured_at=captured_at,
+        )
+        if not statements:
+            return
+
+        try:
+            await self.batch(statements)
+        except Exception as error:
+            if not is_missing_market_country_schema_error(error):
+                raise
+            # 0041 can be deployed after this runner version. Keep the canonical
+            # monthly write and the legacy compatibility write healthy, then
+            # probe again when the process restarts after the migration rollout.
+            setattr(self, "_market_country_schema_available", False)
+            log_info(
+                "d1.domain_traffic_country_monthly.schema_unavailable",
+                domain=domain,
+                error=str(error)[:300],
+            )
+            return
+
+        setattr(self, "_market_country_schema_available", True)
 
     async def upsert_tool_traffic_monthly(self, domain: str, rows: list[dict[str, Any]]) -> None:
         tools = await self.query(
@@ -3371,10 +4744,57 @@ class D1Client:
                 )
 
 
-async def backfill_domain_traffic_monthly(
-    config: Config,
+def add_legacy_snapshot_countries(
+    rows: list[dict[str, Any]],
+    snapshot: dict[str, Any],
+    requested_month: str,
+) -> list[dict[str, Any]]:
+    legacy_country_fields: dict[str, Any] = {}
+    for country_position in range(1, 6):
+        country_code = normalize_country_code(snapshot.get(f"top_country_{country_position}"))
+        country_share = to_number(snapshot.get(f"top_country_{country_position}_traffic_share"))
+        if country_code is None or country_share is None or not 0 <= country_share <= 1:
+            continue
+        legacy_country_fields[f"top_country_{country_position}"] = country_code
+        legacy_country_fields[f"top_country_{country_position}_traffic_share"] = country_share
+    if not legacy_country_fields:
+        return rows
+
+    if not rows:
+        return [
+            {
+                "traffic_month": requested_month,
+                "visits": to_integer(snapshot.get("visits")),
+                **legacy_country_fields,
+            }
+        ]
+
+    target_row = next(
+        (row for row in rows if row.get("traffic_month") == requested_month),
+        rows[-1],
+    )
+    if target_row.get("visits") is None:
+        target_row["visits"] = to_integer(snapshot.get("visits"))
+    has_parsed_countries = any(
+        normalize_country_code(target_row.get(f"top_country_{country_position}")) is not None
+        and traffic_share_to_bps(
+            target_row.get(f"top_country_{country_position}_traffic_share")
+        ) is not None
+        for country_position in range(1, 6)
+    )
+    if not has_parsed_countries:
+        target_row.update(legacy_country_fields)
+    return rows
+
+
+TRAFFIC_BACKFILL_MAX_SNAPSHOT_STATEMENTS = 32
+
+
+async def backfill_domain_traffic_monthly_from_d1(
+    d1: D1Client,
     limit: int | None = None,
     *,
+    after_snapshot_id: int = 0,
     page_size: int = 100,
     write_batch_size: int = 40,
 ) -> dict[str, int]:
@@ -3384,100 +4804,1238 @@ async def backfill_domain_traffic_monthly(
     idempotent, so this command is safe to resume or run again after a parser
     change.
     """
-    counts = {
+    if after_snapshot_id < 0:
+        raise ValueError("after_snapshot_id must be non-negative")
+    if page_size <= 0 or write_batch_size <= 0:
+        raise ValueError("page_size and write_batch_size must be positive")
+
+    counts: dict[str, int] = {
         "snapshots_scanned": 0,
         "snapshots_projected": 0,
         "snapshots_invalid": 0,
         "monthly_rows_upserted": 0,
+        "snapshots_with_country": 0,
+        "country_rows_upserted": 0,
+        "country_months_reconciled": 0,
+        "country_estimates_refreshed": 0,
+        "country_statements_applied": 0,
+        "pages_completed": 0,
+        "last_snapshot_id": after_snapshot_id,
     }
-    last_snapshot_id = 0
+    last_snapshot_id = after_snapshot_id
 
-    async with D1Client(config) as d1:
-        while limit is None or counts["snapshots_scanned"] < limit:
-            remaining = page_size if limit is None else min(page_size, limit - counts["snapshots_scanned"])
-            if remaining <= 0:
-                break
-            snapshots = await d1.query(
-                """
-                SELECT id, normalized_domain, traffic_month, fetched_at, raw_payload
-                FROM domain_traffic_snapshots
-                WHERE source = ?
-                  AND status = 'done'
-                  AND id > ?
-                  AND json_valid(raw_payload)
-                  AND raw_payload <> '{}'
-                ORDER BY id ASC
-                LIMIT ?
-                """,
-                [TRAFFIC_SOURCE, last_snapshot_id, remaining],
-            )
-            if not snapshots:
-                break
+    while limit is None or counts["snapshots_scanned"] < limit:
+        remaining = (
+            page_size
+            if limit is None
+            else min(page_size, limit - counts["snapshots_scanned"])
+        )
+        if remaining <= 0:
+            break
+        snapshots = await d1.query(
+            """
+            SELECT
+              id, normalized_domain, traffic_month, fetched_at, visits, raw_payload,
+              top_country_1, top_country_1_traffic_share,
+              top_country_2, top_country_2_traffic_share,
+              top_country_3, top_country_3_traffic_share,
+              top_country_4, top_country_4_traffic_share,
+              top_country_5, top_country_5_traffic_share
+            FROM domain_traffic_snapshots
+            WHERE source = ?
+              AND status = 'done'
+              AND id > ?
+              AND (
+                (json_valid(raw_payload) AND raw_payload <> '{}')
+                OR top_country_1 IS NOT NULL
+                OR top_country_2 IS NOT NULL
+                OR top_country_3 IS NOT NULL
+                OR top_country_4 IS NOT NULL
+                OR top_country_5 IS NOT NULL
+              )
+            ORDER BY id ASC
+            LIMIT ?
+            """,
+            [TRAFFIC_SOURCE, last_snapshot_id, remaining],
+        )
+        if not snapshots:
+            break
 
-            statements: list[tuple[str, list[Any]]] = []
-            for snapshot in snapshots:
-                snapshot_id = to_integer(snapshot.get("id")) or 0
-                last_snapshot_id = max(last_snapshot_id, snapshot_id)
-                counts["snapshots_scanned"] += 1
-                raw_payload = snapshot.get("raw_payload")
-                try:
-                    payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
-                except (TypeError, json.JSONDecodeError):
-                    payload = None
-                if not isinstance(payload, dict):
-                    counts["snapshots_invalid"] += 1
-                    continue
+        snapshot_statement_groups: list[list[tuple[str, str, list[Any]]]] = []
+        page_last_snapshot_id = last_snapshot_id
+        for snapshot in snapshots:
+            snapshot_id = to_integer(snapshot.get("id")) or 0
+            page_last_snapshot_id = max(page_last_snapshot_id, snapshot_id)
+            counts["snapshots_scanned"] += 1
+            raw_payload = snapshot.get("raw_payload")
+            try:
+                payload = json.loads(raw_payload) if isinstance(raw_payload, str) else raw_payload
+            except (TypeError, json.JSONDecodeError):
+                payload = None
 
-                domain = normalize_domain(str(snapshot.get("normalized_domain") or ""))
-                requested_month = to_month_start(snapshot.get("traffic_month"))
-                if not domain or not requested_month:
-                    counts["snapshots_invalid"] += 1
-                    continue
-                try:
-                    rows = parse_monthly_rows(payload, domain, requested_month)
-                except Exception as error:
-                    counts["snapshots_invalid"] += 1
-                    log_error(
-                        "traffic_projection_backfill.parse_failed",
-                        snapshot_id=snapshot_id,
-                        domain=domain,
-                        error=str(error)[:300],
-                    )
-                    continue
+            domain = normalize_domain(str(snapshot.get("normalized_domain") or ""))
+            requested_month = to_month_start(snapshot.get("traffic_month"))
+            if not domain or not requested_month:
+                counts["snapshots_invalid"] += 1
+                continue
+            try:
+                rows = parse_monthly_rows(payload, domain, requested_month) if isinstance(payload, dict) else []
+                rows = add_legacy_snapshot_countries(rows, snapshot, requested_month)
+            except Exception as error:
+                counts["snapshots_invalid"] += 1
+                log_error(
+                    "traffic_projection_backfill.parse_failed",
+                    snapshot_id=snapshot_id,
+                    domain=domain,
+                    error=str(error)[:300],
+                )
+                continue
 
-                captured_at = str(snapshot.get("fetched_at") or "").strip() or utc_now_iso()
-                row_statements = [
-                    build_domain_traffic_monthly_upsert(
+            captured_at = str(snapshot.get("fetched_at") or "").strip() or utc_now_iso()
+            projection_rows = [
+                {**row, "_source_snapshot_id": snapshot_id}
+                for row in rows
+                if row.get("traffic_month")
+            ]
+            if not projection_rows:
+                counts["snapshots_invalid"] += 1
+                continue
+
+            snapshot_statements: list[tuple[str, str, list[Any]]] = []
+            snapshot_statements.extend(
+                (
+                    "monthly",
+                    *build_domain_traffic_monthly_upsert(
                         domain,
                         row,
                         captured_at=captured_at,
                         source_snapshot_id=snapshot_id,
-                    )
-                    for row in rows
-                    if row.get("traffic_month")
-                ]
-                if not row_statements:
-                    counts["snapshots_invalid"] += 1
-                    continue
-                statements.extend(row_statements)
-                counts["snapshots_projected"] += 1
-
-            for offset in range(0, len(statements), write_batch_size):
-                batch = statements[offset : offset + write_batch_size]
-                await d1.batch(batch)
-                counts["monthly_rows_upserted"] += len(batch)
-
-            log_info(
-                "traffic_projection_backfill.page",
-                last_snapshot_id=last_snapshot_id,
-                **counts,
+                    ),
+                )
+                for row in projection_rows
             )
+            country_statements = build_domain_traffic_country_upsert_statements(
+                domain,
+                projection_rows,
+                captured_at=captured_at,
+            )
+            country_row_count = sum(
+                1 for sql, _ in country_statements if sql == DOMAIN_TRAFFIC_COUNTRY_UPSERT_SQL
+            )
+            if country_row_count > 0:
+                counts["snapshots_with_country"] += 1
+            for sql, params in country_statements:
+                if sql == DOMAIN_TRAFFIC_COUNTRY_UPSERT_SQL:
+                    tag = "country_upsert"
+                elif sql == DOMAIN_TRAFFIC_COUNTRY_DELETE_SQL:
+                    tag = "country_reconcile"
+                else:
+                    tag = "country_refresh"
+                snapshot_statements.append((tag, sql, params))
+            if len(snapshot_statements) > TRAFFIC_BACKFILL_MAX_SNAPSHOT_STATEMENTS:
+                raise RuntimeError(
+                    "traffic snapshot "
+                    f"{snapshot_id} generated {len(snapshot_statements)} statements; "
+                    "refusing to split its atomic projection group above "
+                    f"{TRAFFIC_BACKFILL_MAX_SNAPSHOT_STATEMENTS}"
+                )
+            if len(snapshot_statements) > write_batch_size:
+                raise ValueError(
+                    f"write_batch_size={write_batch_size} is smaller than the "
+                    f"{len(snapshot_statements)}-statement atomic projection group "
+                    f"for traffic snapshot {snapshot_id}"
+                )
+            snapshot_statement_groups.append(snapshot_statements)
+            counts["snapshots_projected"] += 1
+
+        tagged_batches: list[list[tuple[str, str, list[Any]]]] = []
+        tagged_batch: list[tuple[str, str, list[Any]]] = []
+        for snapshot_statements in snapshot_statement_groups:
+            # D1 batch() is the transaction boundary. Flush only between
+            # snapshots so monthly + country reconciliation commits together.
+            if (
+                tagged_batch
+                and len(tagged_batch) + len(snapshot_statements) > write_batch_size
+            ):
+                tagged_batches.append(tagged_batch)
+                tagged_batch = []
+            tagged_batch.extend(snapshot_statements)
+        if tagged_batch:
+            tagged_batches.append(tagged_batch)
+
+        for tagged_batch in tagged_batches:
+            await d1.batch([(sql, params) for _, sql, params in tagged_batch])
+            for tag, _, _ in tagged_batch:
+                if tag == "monthly":
+                    counts["monthly_rows_upserted"] += 1
+                    continue
+                counts["country_statements_applied"] += 1
+                if tag == "country_upsert":
+                    counts["country_rows_upserted"] += 1
+                elif tag == "country_reconcile":
+                    counts["country_months_reconciled"] += 1
+                else:
+                    counts["country_estimates_refreshed"] += 1
+
+        last_snapshot_id = page_last_snapshot_id
+        counts["last_snapshot_id"] = last_snapshot_id
+        counts["pages_completed"] += 1
+        log_info(
+            "traffic_projection_backfill.page",
+            **counts,
+        )
 
     return counts
 
 
+async def backfill_domain_traffic_monthly(
+    config: Config,
+    limit: int | None = None,
+    *,
+    after_snapshot_id: int = 0,
+    page_size: int = 100,
+    write_batch_size: int = 40,
+) -> dict[str, int]:
+    async with D1Client(config) as d1:
+        return await backfill_domain_traffic_monthly_from_d1(
+            d1,
+            limit,
+            after_snapshot_id=after_snapshot_id,
+            page_size=page_size,
+            write_batch_size=write_batch_size,
+        )
+
+
+MARKET_DR_MIN_BASELINE_DAYS = 20
+MARKET_DR_MAX_BASELINE_DAYS = 45
+MARKET_DR_TARGET_BASELINE_DAYS = 30
+MARKET_MIN_ABSOLUTE_COVERAGE_BPS = {
+    "search_tools": 2500,
+    "paid_tools": 2500,
+    "ai_tools": 100,
+    "dr_tools": 2500,
+    "dr_comparable_tools": 100,
+    "country_tools": 2500,
+    "country_ai_tools": 100,
+}
+MARKET_SNAPSHOT_PUBLIC_TOOL_PREDICATE = """
+  t.status = 'published'
+  AND t.content_safety_status = 'safe'
+  AND t.duplicate_of_tool_id IS NULL
+  AND t.verification_status IN ('verified', 'pending')
+  AND t.staleness_status IN ('fresh', 'aging')
+"""
+MARKET_VISIBLE_TOOLS_CTES = """
+visible_tools_ranked AS (
+  SELECT
+    id,
+    lower(trim(normalized_domain)) AS normalized_domain,
+    primary_category_id,
+    row_number() OVER (
+      PARTITION BY lower(trim(normalized_domain))
+      ORDER BY coalesce(first_published_at, listed_at) ASC, id ASC
+    ) AS domain_row
+  FROM tools
+  WHERE status = 'published'
+    AND content_safety_status = 'safe'
+    AND duplicate_of_tool_id IS NULL
+    AND verification_status IN ('verified', 'pending')
+    AND staleness_status IN ('fresh', 'aging')
+), visible_tools AS (
+  SELECT id, normalized_domain, primary_category_id
+  FROM visible_tools_ranked
+  WHERE domain_row = 1
+)
+"""
+
+
+async def resolve_market_snapshot_months(
+    d1: D1Client,
+    traffic_month: str | None = None,
+) -> tuple[str, str | None]:
+    selected_month = to_month_start(traffic_month) if traffic_month else None
+    if traffic_month and selected_month is None:
+        raise ValueError(f"Invalid market traffic month: {traffic_month}")
+    if selected_month is None:
+        latest_month_rows = await d1.query(
+            """
+            SELECT max(traffic.traffic_month) AS traffic_month
+            FROM domain_traffic_monthly traffic
+            JOIN traffic_month_release_checks release
+              ON release.source = traffic.source
+             AND release.traffic_month = traffic.traffic_month
+             AND release.status = 'available'
+            WHERE traffic.source = ? AND traffic.visits IS NOT NULL
+            """,
+            [TRAFFIC_SOURCE],
+        )
+        selected_month = (
+            to_month_start(latest_month_rows[0].get("traffic_month"))
+            if latest_month_rows
+            else None
+        )
+    if selected_month is None:
+        raise RuntimeError("No release-gated Similarweb traffic month is available for a market snapshot")
+
+    baseline_rows = await d1.query(
+        """
+        SELECT max(traffic.traffic_month) AS traffic_month
+        FROM domain_traffic_monthly traffic
+        JOIN traffic_month_release_checks release
+          ON release.source = traffic.source
+         AND release.traffic_month = traffic.traffic_month
+         AND release.status = 'available'
+        WHERE traffic.source = ?
+          AND traffic.traffic_month < ?
+          AND traffic.visits IS NOT NULL
+        """,
+        [TRAFFIC_SOURCE, selected_month],
+    )
+    baseline_month = (
+        to_month_start(baseline_rows[0].get("traffic_month"))
+        if baseline_rows
+        else None
+    )
+    return selected_month, baseline_month
+
+
+async def preview_market_snapshot_from_d1(
+    d1: D1Client,
+    traffic_month: str | None = None,
+) -> dict[str, Any]:
+    selected_month, baseline_month = await resolve_market_snapshot_months(d1, traffic_month)
+    rows = await d1.query(
+        f"""
+        WITH {MARKET_VISIBLE_TOOLS_CTES}
+        SELECT
+          count(*) AS total_tools,
+          coalesce(sum(CASE WHEN traffic.visits IS NOT NULL THEN 1 ELSE 0 END), 0) AS traffic_tools,
+          (
+            SELECT count(*)
+            FROM domain_traffic_country_monthly country
+            JOIN visible_tools country_tool
+              ON country_tool.normalized_domain = country.normalized_domain
+            WHERE country.source = ? AND country.traffic_month = ?
+          ) AS country_rows,
+          (
+            SELECT count(DISTINCT country_tool.id)
+            FROM domain_traffic_country_monthly country
+            JOIN visible_tools country_tool
+              ON country_tool.normalized_domain = country.normalized_domain
+            WHERE country.source = ? AND country.traffic_month = ?
+          ) AS country_tools
+        FROM visible_tools tool
+        LEFT JOIN domain_traffic_monthly traffic
+          ON traffic.normalized_domain = tool.normalized_domain
+         AND traffic.source = ?
+         AND traffic.traffic_month = ?
+        """,
+        [
+            TRAFFIC_SOURCE,
+            selected_month,
+            TRAFFIC_SOURCE,
+            selected_month,
+            TRAFFIC_SOURCE,
+            selected_month,
+        ],
+    )
+    row = rows[0] if rows else {}
+    return {
+        "status": "dry_run",
+        "traffic_month": selected_month,
+        "baseline_month": baseline_month,
+        "coverage": {
+            key: to_integer(row.get(key)) or 0
+            for key in ("total_tools", "traffic_tools", "country_rows", "country_tools")
+        },
+    }
+
+
+async def ensure_market_catalog_eligibility_revision(d1: D1Client) -> int:
+    await d1.run(
+        """
+        INSERT OR IGNORE INTO market_catalog_eligibility_revision (id, revision)
+        VALUES (1, 0)
+        """
+    )
+    rows = await d1.query(
+        "SELECT revision FROM market_catalog_eligibility_revision WHERE id = 1"
+    )
+    revision = to_integer(rows[0].get("revision")) if rows else None
+    if revision is None or revision < 0:
+        raise RuntimeError("Market catalog eligibility revision is unavailable")
+    return revision
+
+
+async def build_market_snapshot_facet_rollups_from_d1(
+    d1: D1Client,
+    snapshot_id: int,
+    catalog_eligibility_revision: int,
+    built_at: str,
+) -> None:
+    await d1.batch(
+        [
+            (
+                "DELETE FROM market_snapshot_facet_rollups WHERE snapshot_id = ?",
+                [snapshot_id],
+            ),
+            (
+                f"""
+                INSERT INTO market_snapshot_facet_rollups (
+                  snapshot_id, primary_category_id, primary_category_value,
+                  country_code, tool_count, built_at
+                )
+                SELECT ?, 0, '', '', count(*), ?
+                FROM tool_market_snapshots snapshot
+                JOIN tools t ON t.id = snapshot.tool_id
+                JOIN market_catalog_eligibility_revision revision
+                  ON revision.id = 1 AND revision.revision = ?
+                WHERE snapshot.snapshot_id = ?
+                  AND {MARKET_SNAPSHOT_PUBLIC_TOOL_PREDICATE}
+                HAVING count(*) > 0
+                """,
+                [snapshot_id, built_at, catalog_eligibility_revision, snapshot_id],
+            ),
+            (
+                f"""
+                INSERT INTO market_snapshot_facet_rollups (
+                  snapshot_id, primary_category_id, primary_category_value,
+                  country_code, tool_count, built_at
+                )
+                SELECT
+                  snapshot.snapshot_id,
+                  snapshot.primary_category_id,
+                  category.canonical_slug,
+                  '',
+                  count(*),
+                  ?
+                FROM tool_market_snapshots snapshot
+                JOIN tools t ON t.id = snapshot.tool_id
+                JOIN categories category ON category.id = snapshot.primary_category_id
+                JOIN market_catalog_eligibility_revision revision
+                  ON revision.id = 1 AND revision.revision = ?
+                WHERE snapshot.snapshot_id = ?
+                  AND {MARKET_SNAPSHOT_PUBLIC_TOOL_PREDICATE}
+                GROUP BY
+                  snapshot.snapshot_id,
+                  snapshot.primary_category_id,
+                  category.canonical_slug
+                """,
+                [built_at, catalog_eligibility_revision, snapshot_id],
+            ),
+            (
+                f"""
+                WITH country_domains AS (
+                  SELECT
+                    country.snapshot_id,
+                    snapshot.primary_category_id,
+                    category.canonical_slug AS primary_category_value,
+                    country.country_code,
+                    country.normalized_domain,
+                    max(country.estimated_visits) AS estimated_visits,
+                    max(country.estimated_ai_visits) AS estimated_ai_visits
+                  FROM tool_country_market_snapshots country
+                  JOIN tool_market_snapshots snapshot
+                    ON snapshot.snapshot_id = country.snapshot_id
+                   AND snapshot.tool_id = country.tool_id
+                  JOIN tools t ON t.id = snapshot.tool_id
+                  LEFT JOIN categories category ON category.id = snapshot.primary_category_id
+                  JOIN market_catalog_eligibility_revision revision
+                    ON revision.id = 1 AND revision.revision = ?
+                  WHERE country.snapshot_id = ?
+                    AND {MARKET_SNAPSHOT_PUBLIC_TOOL_PREDICATE}
+                  GROUP BY
+                    country.snapshot_id,
+                    snapshot.primary_category_id,
+                    category.canonical_slug,
+                    country.country_code,
+                    country.normalized_domain
+                )
+                INSERT INTO market_snapshot_facet_rollups (
+                  snapshot_id, primary_category_id, primary_category_value,
+                  country_code, tool_count,
+                  country_estimated_visits, country_estimated_ai_visits,
+                  country_estimated_visits_unknown_count,
+                  country_estimated_ai_visits_unknown_count,
+                  built_at
+                )
+                SELECT
+                  snapshot_id,
+                  0,
+                  '',
+                  country_code,
+                  count(*),
+                  sum(estimated_visits),
+                  sum(estimated_ai_visits),
+                  sum(CASE WHEN estimated_visits IS NULL THEN 1 ELSE 0 END),
+                  sum(CASE WHEN estimated_ai_visits IS NULL THEN 1 ELSE 0 END),
+                  ?
+                FROM country_domains
+                GROUP BY snapshot_id, country_code
+                UNION ALL
+                SELECT
+                  snapshot_id,
+                  primary_category_id,
+                  primary_category_value,
+                  country_code,
+                  count(*),
+                  sum(estimated_visits),
+                  sum(estimated_ai_visits),
+                  sum(CASE WHEN estimated_visits IS NULL THEN 1 ELSE 0 END),
+                  sum(CASE WHEN estimated_ai_visits IS NULL THEN 1 ELSE 0 END),
+                  ?
+                FROM country_domains
+                WHERE primary_category_id IS NOT NULL
+                  AND primary_category_value IS NOT NULL
+                GROUP BY
+                  snapshot_id,
+                  primary_category_id,
+                  primary_category_value,
+                  country_code
+                """,
+                [
+                    catalog_eligibility_revision,
+                    snapshot_id,
+                    built_at,
+                    built_at,
+                ],
+            ),
+        ]
+    )
+
+
+async def get_market_snapshot_coverage(d1: D1Client, snapshot_id: int) -> dict[str, int]:
+    rows = await d1.query(
+        """
+        WITH target AS (SELECT ? AS snapshot_id)
+        SELECT
+          count(snapshot.tool_id) AS total_tools,
+          coalesce(sum(CASE WHEN visits IS NOT NULL THEN 1 ELSE 0 END), 0) AS traffic_tools,
+          coalesce(sum(CASE WHEN search_share_bps IS NOT NULL THEN 1 ELSE 0 END), 0) AS search_tools,
+          coalesce(sum(CASE WHEN paid_search_share_bps IS NOT NULL THEN 1 ELSE 0 END), 0) AS paid_tools,
+          coalesce(sum(CASE WHEN ai_visits IS NOT NULL THEN 1 ELSE 0 END), 0) AS ai_tools,
+          coalesce(sum(CASE WHEN domain_rating IS NOT NULL THEN 1 ELSE 0 END), 0) AS dr_tools,
+          coalesce(sum(CASE WHEN domain_rating_change IS NOT NULL THEN 1 ELSE 0 END), 0) AS dr_comparable_tools,
+          coalesce(sum(CASE WHEN primary_category_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS category_tools,
+          (
+            SELECT count(*)
+            FROM tool_country_market_snapshots country
+            WHERE country.snapshot_id = target.snapshot_id
+          ) AS country_rows,
+          (
+            SELECT count(DISTINCT country.tool_id)
+            FROM tool_country_market_snapshots country
+            WHERE country.snapshot_id = target.snapshot_id
+          ) AS country_tools,
+          (
+            SELECT count(DISTINCT country.country_code)
+            FROM tool_country_market_snapshots country
+            WHERE country.snapshot_id = target.snapshot_id
+          ) AS countries,
+          (
+            SELECT count(*)
+            FROM tool_country_market_snapshots country
+            WHERE country.snapshot_id = target.snapshot_id
+              AND country.estimated_visits IS NULL
+          ) AS country_estimated_unknown_rows,
+          (
+            SELECT count(*)
+            FROM tool_country_market_snapshots country
+            WHERE country.snapshot_id = target.snapshot_id
+              AND country.estimated_ai_visits IS NOT NULL
+          ) AS country_ai_rows,
+          (
+            SELECT count(DISTINCT country.tool_id)
+            FROM tool_country_market_snapshots country
+            WHERE country.snapshot_id = target.snapshot_id
+              AND country.estimated_ai_visits IS NOT NULL
+          ) AS country_ai_tools,
+          (
+            SELECT count(*)
+            FROM tool_country_market_snapshots country
+            JOIN tool_market_snapshots country_snapshot
+              ON country_snapshot.snapshot_id = country.snapshot_id
+             AND country_snapshot.tool_id = country.tool_id
+            WHERE country.snapshot_id = target.snapshot_id
+              AND country_snapshot.primary_category_id IS NOT NULL
+          ) AS country_category_rows,
+          coalesce((
+            SELECT version.catalog_eligibility_revision
+            FROM market_snapshot_versions version
+            WHERE version.id = target.snapshot_id
+          ), -1) AS snapshot_catalog_eligibility_revision,
+          coalesce((
+            SELECT revision.revision
+            FROM market_catalog_eligibility_revision revision
+            WHERE revision.id = 1
+          ), -1) AS current_catalog_eligibility_revision,
+          (
+            SELECT count(*)
+            FROM market_snapshot_facet_rollups rollup
+            WHERE rollup.snapshot_id = target.snapshot_id
+          ) AS facet_rollup_rows,
+          (
+            SELECT count(*)
+            FROM market_snapshot_facet_rollups rollup
+            WHERE rollup.snapshot_id = target.snapshot_id
+              AND rollup.primary_category_id = 0
+              AND rollup.country_code = ''
+          ) AS facet_rollup_global_rows,
+          coalesce((
+            SELECT rollup.tool_count
+            FROM market_snapshot_facet_rollups rollup
+            WHERE rollup.snapshot_id = target.snapshot_id
+              AND rollup.primary_category_id = 0
+              AND rollup.country_code = ''
+          ), 0) AS facet_rollup_global_tools,
+          (
+            SELECT count(*)
+            FROM market_snapshot_facet_rollups rollup
+            WHERE rollup.snapshot_id = target.snapshot_id
+              AND rollup.primary_category_id > 0
+              AND rollup.country_code = ''
+          ) AS facet_rollup_category_rows,
+          coalesce((
+            SELECT sum(rollup.tool_count)
+            FROM market_snapshot_facet_rollups rollup
+            WHERE rollup.snapshot_id = target.snapshot_id
+              AND rollup.primary_category_id > 0
+              AND rollup.country_code = ''
+          ), 0) AS facet_rollup_category_tools,
+          (
+            SELECT count(*)
+            FROM market_snapshot_facet_rollups rollup
+            WHERE rollup.snapshot_id = target.snapshot_id
+              AND rollup.primary_category_id = 0
+              AND rollup.country_code <> ''
+          ) AS facet_rollup_country_rows,
+          coalesce((
+            SELECT sum(rollup.tool_count)
+            FROM market_snapshot_facet_rollups rollup
+            WHERE rollup.snapshot_id = target.snapshot_id
+              AND rollup.primary_category_id = 0
+              AND rollup.country_code <> ''
+          ), 0) AS facet_rollup_country_tools,
+          coalesce((
+            SELECT sum(rollup.country_estimated_visits_unknown_count)
+            FROM market_snapshot_facet_rollups rollup
+            WHERE rollup.snapshot_id = target.snapshot_id
+              AND rollup.primary_category_id = 0
+              AND rollup.country_code <> ''
+          ), 0) AS facet_rollup_country_estimated_unknown_rows,
+          coalesce((
+            SELECT sum(rollup.country_estimated_ai_visits_unknown_count)
+            FROM market_snapshot_facet_rollups rollup
+            WHERE rollup.snapshot_id = target.snapshot_id
+              AND rollup.primary_category_id = 0
+              AND rollup.country_code <> ''
+          ), 0) AS facet_rollup_country_ai_unknown_rows,
+          (
+            SELECT count(*)
+            FROM market_snapshot_facet_rollups rollup
+            WHERE rollup.snapshot_id = target.snapshot_id
+              AND rollup.primary_category_id > 0
+              AND rollup.country_code <> ''
+          ) AS facet_rollup_category_country_rows,
+          coalesce((
+            SELECT sum(rollup.tool_count)
+            FROM market_snapshot_facet_rollups rollup
+            WHERE rollup.snapshot_id = target.snapshot_id
+              AND rollup.primary_category_id > 0
+              AND rollup.country_code <> ''
+          ), 0) AS facet_rollup_category_country_tools
+        FROM target
+        LEFT JOIN tool_market_snapshots snapshot
+          ON snapshot.snapshot_id = target.snapshot_id
+        """,
+        [snapshot_id],
+    )
+    row = rows[0] if rows else {}
+    return {
+        key: to_integer(row.get(key)) or 0
+        for key in (
+            "total_tools",
+            "traffic_tools",
+            "search_tools",
+            "paid_tools",
+            "ai_tools",
+            "dr_tools",
+            "dr_comparable_tools",
+            "category_tools",
+            "country_rows",
+            "country_tools",
+            "countries",
+            "country_estimated_unknown_rows",
+            "country_ai_rows",
+            "country_ai_tools",
+            "country_category_rows",
+            "snapshot_catalog_eligibility_revision",
+            "current_catalog_eligibility_revision",
+            "facet_rollup_rows",
+            "facet_rollup_global_rows",
+            "facet_rollup_global_tools",
+            "facet_rollup_category_rows",
+            "facet_rollup_category_tools",
+            "facet_rollup_country_rows",
+            "facet_rollup_country_tools",
+            "facet_rollup_country_estimated_unknown_rows",
+            "facet_rollup_country_ai_unknown_rows",
+            "facet_rollup_category_country_rows",
+            "facet_rollup_category_country_tools",
+        )
+    }
+
+
+def market_snapshot_coverage_payload(coverage: dict[str, int]) -> dict[str, Any]:
+    return {
+        **coverage,
+        "share_unit": "basis_points",
+        "country_scope": "provider_top5_observed_only",
+        "country_absence": "unknown",
+        "country_estimate_method": "tool_visits_times_country_share",
+        "country_estimated_visits_scope": "provider_top5_lower_bound",
+        "country_ai_visits_provenance": "modeled_not_observed",
+        "country_ai_visits_formula": "estimated_visits * gen_ai_share_bps / 10000",
+        "country_ai_visits_scope": "provider_top5_lower_bound",
+        "facet_rollup_version": "v1",
+        "facet_rollup_grains": ["global", "category", "country", "category_country"],
+        "facet_rollup_threshold_policy": "real_time",
+        "facet_rollup_country_provenance": "provider_top5_modeled_lower_bound",
+        "dr_baseline_target_days": MARKET_DR_TARGET_BASELINE_DAYS,
+        "dr_baseline_window_days": [
+            MARKET_DR_MIN_BASELINE_DAYS,
+            MARKET_DR_MAX_BASELINE_DAYS,
+        ],
+    }
+
+
+def validate_market_snapshot_facet_rollups(
+    snapshot_id: int,
+    coverage: dict[str, int],
+) -> None:
+    mismatches: list[str] = []
+    expected = {
+        "current_catalog_eligibility_revision": coverage[
+            "snapshot_catalog_eligibility_revision"
+        ],
+        "facet_rollup_global_rows": 1,
+        "facet_rollup_global_tools": coverage["total_tools"],
+        "facet_rollup_category_tools": coverage["category_tools"],
+        "facet_rollup_country_rows": coverage["countries"],
+        "facet_rollup_country_tools": coverage["country_rows"],
+        "facet_rollup_country_estimated_unknown_rows": coverage[
+            "country_estimated_unknown_rows"
+        ],
+        "facet_rollup_country_ai_unknown_rows": (
+            coverage["country_rows"] - coverage["country_ai_rows"]
+        ),
+        "facet_rollup_category_country_tools": coverage["country_category_rows"],
+        "facet_rollup_rows": (
+            1
+            + coverage["facet_rollup_category_rows"]
+            + coverage["facet_rollup_country_rows"]
+            + coverage["facet_rollup_category_country_rows"]
+        ),
+    }
+    for key, expected_value in expected.items():
+        current_value = coverage[key]
+        if current_value != expected_value:
+            mismatches.append(f"{key}={current_value} expected={expected_value}")
+    if mismatches:
+        raise RuntimeError(
+            f"Market snapshot {snapshot_id} has incomplete facet rollup read model: "
+            + ", ".join(mismatches)
+        )
+
+
+async def activate_market_snapshot_from_d1(
+    d1: D1Client,
+    snapshot_id: int,
+    *,
+    minimum_coverage_ratio: float = 0.95,
+) -> dict[str, Any]:
+    versions = await d1.query(
+        """
+        SELECT id, status, traffic_source, traffic_month
+        FROM market_snapshot_versions
+        WHERE id = ?
+        LIMIT 1
+        """,
+        [snapshot_id],
+    )
+    if not versions:
+        raise RuntimeError(f"Market snapshot {snapshot_id} does not exist")
+    version = versions[0]
+    if version.get("status") == "active":
+        return {
+            "snapshot_id": snapshot_id,
+            "status": "active",
+            "previous_snapshot_id": None,
+            "coverage": await get_market_snapshot_coverage(d1, snapshot_id),
+        }
+    if version.get("status") != "candidate":
+        raise RuntimeError(
+            f"Market snapshot {snapshot_id} must be candidate before activation; "
+            f"status={version.get('status')}"
+        )
+
+    active_versions = await d1.query(
+        """
+        SELECT id
+        FROM market_snapshot_versions
+        WHERE traffic_source = ? AND status = 'active'
+        ORDER BY id DESC
+        LIMIT 1
+        """,
+        [version.get("traffic_source") or TRAFFIC_SOURCE],
+    )
+    previous_snapshot_id = to_integer(active_versions[0].get("id")) if active_versions else None
+    coverage = await get_market_snapshot_coverage(d1, snapshot_id)
+    if (
+        coverage["total_tools"] <= 0
+        or coverage["traffic_tools"] <= 0
+        or coverage["country_tools"] <= 0
+    ):
+        raise RuntimeError(
+            f"Market snapshot {snapshot_id} has incomplete required coverage: {coverage}"
+        )
+    validate_market_snapshot_facet_rollups(snapshot_id, coverage)
+
+    for coverage_key, minimum_ratio_bps in MARKET_MIN_ABSOLUTE_COVERAGE_BPS.items():
+        minimum_count = max(
+            1,
+            (coverage["traffic_tools"] * minimum_ratio_bps + 9999) // 10000,
+        )
+        if coverage[coverage_key] < minimum_count:
+            raise RuntimeError(
+                f"Market snapshot {snapshot_id} failed {coverage_key} absolute coverage gate: "
+                f"current={coverage[coverage_key]}, required={minimum_count}, "
+                f"traffic_tools={coverage['traffic_tools']}"
+            )
+
+    if previous_snapshot_id is not None and previous_snapshot_id != snapshot_id:
+        previous_coverage = await get_market_snapshot_coverage(d1, previous_snapshot_id)
+        for coverage_key in (
+            "total_tools",
+            "traffic_tools",
+            "search_tools",
+            "paid_tools",
+            "ai_tools",
+            "dr_tools",
+            "dr_comparable_tools",
+            "country_rows",
+            "country_tools",
+            "country_ai_rows",
+            "country_ai_tools",
+        ):
+            previous_value = previous_coverage[coverage_key]
+            current_value = coverage[coverage_key]
+            if previous_value > 0 and current_value < previous_value * minimum_coverage_ratio:
+                raise RuntimeError(
+                    f"Market snapshot {snapshot_id} failed {coverage_key} coverage gate: "
+                    f"current={current_value}, previous={previous_value}, "
+                    f"minimum_ratio={minimum_coverage_ratio}"
+                )
+
+    now = utc_now_iso()
+    await d1.batch(
+        [
+            (
+                """
+                UPDATE market_snapshot_versions
+                SET status = 'retired', retired_at = ?, updated_at = ?
+                WHERE traffic_source = ? AND status = 'active' AND id <> ?
+                  AND EXISTS (
+                    SELECT 1
+                    FROM market_snapshot_versions candidate
+                    JOIN market_catalog_eligibility_revision revision ON revision.id = 1
+                    WHERE candidate.id = ?
+                      AND candidate.status = 'candidate'
+                      AND candidate.catalog_eligibility_revision = revision.revision
+                  )
+                """,
+                [
+                    now,
+                    now,
+                    version.get("traffic_source") or TRAFFIC_SOURCE,
+                    snapshot_id,
+                    snapshot_id,
+                ],
+            ),
+            (
+                """
+                UPDATE market_snapshot_versions
+                SET status = 'active', activated_at = ?, retired_at = NULL, updated_at = ?
+                WHERE id = ? AND status = 'candidate'
+                  AND catalog_eligibility_revision = (
+                    SELECT revision
+                    FROM market_catalog_eligibility_revision
+                    WHERE id = 1
+                  )
+                """,
+                [now, now, snapshot_id],
+            ),
+        ]
+    )
+    activated = await d1.query(
+        "SELECT status FROM market_snapshot_versions WHERE id = ?",
+        [snapshot_id],
+    )
+    if not activated or activated[0].get("status") != "active":
+        raise RuntimeError(f"Market snapshot {snapshot_id} activation did not commit")
+    return {
+        "snapshot_id": snapshot_id,
+        "status": "active",
+        "previous_snapshot_id": previous_snapshot_id,
+        "coverage": coverage,
+    }
+
+
+async def build_market_snapshot_from_d1(
+    d1: D1Client,
+    traffic_month: str | None = None,
+    *,
+    activate: bool = False,
+) -> dict[str, Any]:
+    selected_month, baseline_month = await resolve_market_snapshot_months(d1, traffic_month)
+    catalog_eligibility_revision = await ensure_market_catalog_eligibility_revision(d1)
+    now = utc_now_iso()
+    inserted_versions = await d1.query(
+        """
+        INSERT INTO market_snapshot_versions (
+          status, traffic_source, traffic_month, baseline_month, dr_source,
+          dr_baseline_days, catalog_eligibility_revision, coverage_json,
+          build_started_at, updated_at
+        )
+        VALUES ('building', ?, ?, ?, ?, ?, ?, '{}', ?, ?)
+        RETURNING id
+        """,
+        [
+            TRAFFIC_SOURCE,
+            selected_month,
+            baseline_month,
+            DOMAIN_STATE_SOURCE,
+            MARKET_DR_TARGET_BASELINE_DAYS,
+            catalog_eligibility_revision,
+            now,
+            now,
+        ],
+    )
+    snapshot_id = to_integer(inserted_versions[0].get("id")) if inserted_versions else None
+    if snapshot_id is None:
+        raise RuntimeError("Market snapshot builder did not return a snapshot id")
+
+    try:
+        await d1.run(
+            f"""
+            WITH {MARKET_VISIBLE_TOOLS_CTES}, current_raw AS (
+              SELECT
+                traffic.normalized_domain,
+                traffic.visits,
+                traffic.ai_visits,
+                traffic.gen_ai_traffic_share,
+                traffic.captured_at,
+                coalesce(
+                  cast(json_extract(traffic.metrics_json, '$.traffic_sources.search') AS REAL),
+                  cast(json_extract(traffic.metrics_json, '$.search_traffic_share') AS REAL)
+                ) AS explicit_search_share,
+                coalesce(
+                  cast(json_extract(traffic.metrics_json, '$.traffic_sources.search_organic') AS REAL),
+                  cast(json_extract(traffic.metrics_json, '$.search_organic_traffic_share') AS REAL)
+                ) AS organic_search_share,
+                coalesce(
+                  cast(json_extract(traffic.metrics_json, '$.traffic_sources.search_paid') AS REAL),
+                  cast(json_extract(traffic.metrics_json, '$.search_paid_traffic_share') AS REAL)
+                ) AS paid_search_share
+              FROM domain_traffic_monthly traffic
+              WHERE traffic.source = ? AND traffic.traffic_month = ?
+            ), current_computed AS (
+              SELECT
+                current_raw.*,
+                CASE
+                  WHEN explicit_search_share IS NOT NULL THEN explicit_search_share
+                  WHEN organic_search_share IS NOT NULL OR paid_search_share IS NOT NULL
+                    THEN coalesce(organic_search_share, 0) + coalesce(paid_search_share, 0)
+                END AS search_share
+              FROM current_raw
+            ), current_traffic AS (
+              SELECT
+                current_computed.*,
+                CASE WHEN search_share BETWEEN 0 AND 1
+                  THEN cast(round(search_share * 10000.0) AS INTEGER) END AS search_share_bps,
+                CASE WHEN organic_search_share BETWEEN 0 AND 1
+                  THEN cast(round(organic_search_share * 10000.0) AS INTEGER) END AS organic_search_share_bps,
+                CASE WHEN paid_search_share BETWEEN 0 AND 1
+                  THEN cast(round(paid_search_share * 10000.0) AS INTEGER) END AS paid_search_share_bps,
+                CASE WHEN gen_ai_traffic_share BETWEEN 0 AND 1
+                  THEN cast(round(gen_ai_traffic_share * 10000.0) AS INTEGER) END AS gen_ai_share_bps
+              FROM current_computed
+            ), baseline_traffic AS (
+              SELECT normalized_domain, visits, ai_visits
+              FROM domain_traffic_monthly
+              WHERE source = ? AND traffic_month = ?
+            ), rating_latest_ranked AS (
+              SELECT
+                normalized_domain,
+                source,
+                observed_date,
+                domain_rating,
+                row_number() OVER (
+                  PARTITION BY normalized_domain
+                  ORDER BY observed_date DESC
+                ) AS latest_row
+              FROM domain_rating_history
+              WHERE source = ?
+            ), rating_latest AS (
+              SELECT
+                normalized_domain,
+                source,
+                observed_date AS latest_date,
+                domain_rating AS latest_rating
+              FROM rating_latest_ranked
+              WHERE latest_row = 1
+            ), rating_baseline_ranked AS (
+              SELECT
+                latest.normalized_domain,
+                baseline.observed_date AS previous_date,
+                baseline.domain_rating AS previous_rating,
+                row_number() OVER (
+                  PARTITION BY latest.normalized_domain
+                  ORDER BY
+                    abs(
+                      julianday(latest.latest_date)
+                      - julianday(baseline.observed_date)
+                      - {MARKET_DR_TARGET_BASELINE_DAYS}
+                    ),
+                    baseline.observed_date DESC
+                ) AS baseline_row
+              FROM rating_latest latest
+              JOIN domain_rating_history baseline
+                ON baseline.normalized_domain = latest.normalized_domain
+               AND baseline.source = latest.source
+               AND baseline.observed_date < latest.latest_date
+              WHERE julianday(latest.latest_date) - julianday(baseline.observed_date)
+                BETWEEN {MARKET_DR_MIN_BASELINE_DAYS} AND {MARKET_DR_MAX_BASELINE_DAYS}
+            ), rating_pairs AS (
+              SELECT
+                latest.normalized_domain,
+                latest.latest_date,
+                baseline.previous_date,
+                latest.latest_rating,
+                baseline.previous_rating
+              FROM rating_latest latest
+              LEFT JOIN rating_baseline_ranked baseline
+                ON baseline.normalized_domain = latest.normalized_domain
+               AND baseline.baseline_row = 1
+            )
+            INSERT INTO tool_market_snapshots (
+              snapshot_id, tool_id, normalized_domain, primary_category_id,
+              visits, previous_visits, visits_change, visits_growth_rate,
+              search_share_bps, organic_search_share_bps, paid_search_share_bps,
+              search_visits, paid_search_visits,
+              ai_visits, previous_ai_visits, ai_visits_change, ai_visits_growth_rate,
+              gen_ai_share_bps,
+              domain_rating, previous_domain_rating, domain_rating_change,
+              domain_rating_velocity_30d, domain_rating_observed_date,
+              previous_domain_rating_observed_date, captured_at, updated_at
+            )
+            SELECT
+              ?,
+              tool.id,
+              tool.normalized_domain,
+              tool.primary_category_id,
+              current.visits,
+              baseline.visits,
+              CASE WHEN current.visits IS NOT NULL AND baseline.visits IS NOT NULL
+                THEN current.visits - baseline.visits END,
+              CASE WHEN current.visits IS NOT NULL AND baseline.visits > 0
+                THEN cast(current.visits - baseline.visits AS REAL) / baseline.visits END,
+              current.search_share_bps,
+              current.organic_search_share_bps,
+              current.paid_search_share_bps,
+              CASE WHEN current.visits IS NOT NULL AND current.search_share_bps IS NOT NULL
+                THEN cast(round(current.visits * current.search_share_bps / 10000.0) AS INTEGER) END,
+              CASE WHEN current.visits IS NOT NULL AND current.paid_search_share_bps IS NOT NULL
+                THEN cast(round(current.visits * current.paid_search_share_bps / 10000.0) AS INTEGER) END,
+              current.ai_visits,
+              baseline.ai_visits,
+              CASE WHEN current.ai_visits IS NOT NULL AND baseline.ai_visits IS NOT NULL
+                THEN current.ai_visits - baseline.ai_visits END,
+              CASE WHEN current.ai_visits IS NOT NULL AND baseline.ai_visits > 0
+                THEN cast(current.ai_visits - baseline.ai_visits AS REAL) / baseline.ai_visits END,
+              current.gen_ai_share_bps,
+              rating.latest_rating,
+              rating.previous_rating,
+              CASE WHEN rating.previous_rating IS NOT NULL
+                    AND julianday(rating.latest_date) - julianday(rating.previous_date)
+                      BETWEEN {MARKET_DR_MIN_BASELINE_DAYS} AND {MARKET_DR_MAX_BASELINE_DAYS}
+                THEN rating.latest_rating - rating.previous_rating END,
+              CASE WHEN rating.previous_rating IS NOT NULL
+                    AND julianday(rating.latest_date) - julianday(rating.previous_date)
+                      BETWEEN {MARKET_DR_MIN_BASELINE_DAYS} AND {MARKET_DR_MAX_BASELINE_DAYS}
+                THEN (rating.latest_rating - rating.previous_rating) * {MARKET_DR_TARGET_BASELINE_DAYS}.0
+                  / nullif(julianday(rating.latest_date) - julianday(rating.previous_date), 0) END,
+              rating.latest_date,
+              rating.previous_date,
+              current.captured_at,
+              ?
+            FROM visible_tools tool
+            LEFT JOIN current_traffic current
+              ON current.normalized_domain = tool.normalized_domain
+            LEFT JOIN baseline_traffic baseline
+              ON baseline.normalized_domain = tool.normalized_domain
+            LEFT JOIN rating_pairs rating
+              ON rating.normalized_domain = tool.normalized_domain
+            """,
+            [
+                TRAFFIC_SOURCE,
+                selected_month,
+                TRAFFIC_SOURCE,
+                baseline_month,
+                DOMAIN_STATE_SOURCE,
+                snapshot_id,
+                now,
+            ],
+        )
+        await d1.run(
+            """
+            WITH country_estimates AS (
+              SELECT
+                snapshot.snapshot_id,
+                snapshot.tool_id,
+                snapshot.normalized_domain,
+                country.country_code,
+                country.country_position,
+                country.traffic_share_bps,
+                CASE
+                  WHEN snapshot.visits IS NOT NULL
+                    THEN cast(round(snapshot.visits * country.traffic_share_bps / 10000.0) AS INTEGER)
+                  ELSE country.estimated_visits
+                END AS estimated_visits,
+                snapshot.gen_ai_share_bps,
+                country.captured_at
+              FROM tool_market_snapshots snapshot
+              JOIN domain_traffic_country_monthly country
+                ON country.normalized_domain = snapshot.normalized_domain
+               AND country.source = ?
+               AND country.traffic_month = ?
+              WHERE snapshot.snapshot_id = ?
+            )
+            INSERT INTO tool_country_market_snapshots (
+              snapshot_id, tool_id, normalized_domain, country_code,
+              country_position, traffic_share_bps, estimated_visits, estimated_ai_visits,
+              captured_at, updated_at
+            )
+            SELECT
+              estimate.snapshot_id,
+              estimate.tool_id,
+              estimate.normalized_domain,
+              estimate.country_code,
+              estimate.country_position,
+              estimate.traffic_share_bps,
+              estimate.estimated_visits,
+              CASE
+                WHEN estimate.estimated_visits IS NOT NULL
+                     AND estimate.gen_ai_share_bps IS NOT NULL
+                  THEN cast(
+                    round(estimate.estimated_visits * estimate.gen_ai_share_bps / 10000.0)
+                    AS INTEGER
+                  )
+              END,
+              estimate.captured_at,
+              ?
+            FROM country_estimates estimate
+            """,
+            [TRAFFIC_SOURCE, selected_month, snapshot_id, now],
+        )
+        await build_market_snapshot_facet_rollups_from_d1(
+            d1,
+            snapshot_id,
+            catalog_eligibility_revision,
+            now,
+        )
+        coverage = await get_market_snapshot_coverage(d1, snapshot_id)
+        if coverage["total_tools"] <= 0 or coverage["traffic_tools"] <= 0:
+            raise RuntimeError(f"Market snapshot {snapshot_id} produced no usable catalog rows")
+        validate_market_snapshot_facet_rollups(snapshot_id, coverage)
+        built_at = utc_now_iso()
+        await d1.run(
+            """
+            UPDATE market_snapshot_versions
+            SET status = 'candidate', coverage_json = ?, built_at = ?, updated_at = ?, last_error = NULL
+            WHERE id = ? AND status = 'building'
+            """,
+            [
+                json.dumps(market_snapshot_coverage_payload(coverage), sort_keys=True),
+                built_at,
+                built_at,
+                snapshot_id,
+            ],
+        )
+    except Exception as error:
+        failed_at = utc_now_iso()
+        try:
+            await d1.run(
+                """
+                UPDATE market_snapshot_versions
+                SET status = 'failed', last_error = ?, updated_at = ?
+                WHERE id = ? AND status = 'building'
+                """,
+                [str(error)[:2000], failed_at, snapshot_id],
+            )
+        except Exception as status_error:
+            log_error(
+                "market_snapshot.failed_status_write",
+                snapshot_id=snapshot_id,
+                error=str(status_error)[:300],
+            )
+        raise
+
+    result: dict[str, Any] = {
+        "snapshot_id": snapshot_id,
+        "status": "candidate",
+        "traffic_month": selected_month,
+        "baseline_month": baseline_month,
+        "coverage": coverage,
+    }
+    if activate:
+        activation = await activate_market_snapshot_from_d1(d1, snapshot_id)
+        result.update(activation)
+    return result
+
+
+async def build_market_snapshot(
+    config: Config,
+    traffic_month: str | None = None,
+    *,
+    activate: bool = False,
+) -> dict[str, Any]:
+    async with D1Client(config) as d1:
+        return await build_market_snapshot_from_d1(
+            d1,
+            traffic_month,
+            activate=activate,
+        )
+
+
+async def activate_market_snapshot(
+    config: Config,
+    snapshot_id: int,
+) -> dict[str, Any]:
+    async with D1Client(config) as d1:
+        return await activate_market_snapshot_from_d1(d1, snapshot_id)
+
+
+async def preview_market_snapshot(
+    config: Config,
+    traffic_month: str | None = None,
+) -> dict[str, Any]:
+    async with D1Client(config) as d1:
+        return await preview_market_snapshot_from_d1(d1, traffic_month)
+
+
 class RunnerTelemetry:
-    WORKLOADS = ["assets", "traffic", "domain_state", "pricing", "enrichment"]
+    WORKLOADS = ["assets", "traffic", "domain_state", "pricing", "taxonomy", "enrichment"]
 
     def __init__(self, d1: D1Client, config: Config):
         self.d1 = d1
@@ -3609,11 +6167,11 @@ class D1EnrichmentStore:
         self.d1 = d1
 
     async def evaluate_tool(self, tool_id: int) -> str:
-        rows = await self.d1.query(
-            """
+        query_with_category_status = """
             SELECT
               t.id,
               state.readiness AS previous_readiness,
+              CASE WHEN t.content_safety_status = 'safe' THEN 1 ELSE 0 END AS has_content_safety,
               CASE WHEN EXISTS (
                 SELECT 1 FROM tool_assets a
                 WHERE a.tool_id = t.id AND a.asset_kind = 'screenshot' AND a.is_current = 1
@@ -3628,6 +6186,12 @@ class D1EnrichmentStore:
                   AND l.published_at IS NOT NULL AND trim(l.name) <> ''
                   AND trim(coalesce(l.short_description, '')) <> ''
               ) THEN 1 ELSE 0 END AS has_localization,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM tool_localizations l
+                WHERE l.tool_id = t.id AND l.translation_status = 'published'
+                  AND l.published_at IS NOT NULL AND trim(l.name) <> ''
+                  AND coalesce(l.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
+              ) THEN 1 ELSE 0 END AS has_name_quality,
               CASE WHEN EXISTS (SELECT 1 FROM tool_key_features f WHERE f.tool_id = t.id)
                      OR EXISTS (
                        SELECT 1 FROM tool_localizations l
@@ -3638,6 +6202,7 @@ class D1EnrichmentStore:
               CASE WHEN t.primary_category_id IS NOT NULL
                      OR EXISTS (SELECT 1 FROM tool_categories tc WHERE tc.tool_id = t.id)
                    THEN 1 ELSE 0 END AS has_category,
+              CASE WHEN t.category_classification_status = 'needs_manual' THEN 1 ELSE 0 END AS category_needs_manual,
               CASE WHEN EXISTS (SELECT 1 FROM tool_sources s WHERE s.tool_id = t.id)
                    THEN 1 ELSE 0 END AS has_source,
               CASE WHEN EXISTS (
@@ -3659,17 +6224,85 @@ class D1EnrichmentStore:
             LEFT JOIN tool_enrichment_states state ON state.tool_id = t.id
             WHERE t.id = ?
             LIMIT 1
-            """,
-            [TRAFFIC_SOURCE, DOMAIN_STATE_SOURCE, tool_id],
-        )
+            """
+        query_legacy = """
+            SELECT
+              t.id,
+              state.readiness AS previous_readiness,
+              CASE WHEN t.content_safety_status = 'safe' THEN 1 ELSE 0 END AS has_content_safety,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM tool_assets a
+                WHERE a.tool_id = t.id AND a.asset_kind = 'screenshot' AND a.is_current = 1
+              ) THEN 1 ELSE 0 END AS has_screenshot,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM tool_assets a
+                WHERE a.tool_id = t.id AND a.asset_kind = 'favicon' AND a.is_current = 1
+              ) THEN 1 ELSE 0 END AS has_favicon,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM tool_localizations l
+                WHERE l.tool_id = t.id AND l.translation_status = 'published'
+                  AND l.published_at IS NOT NULL AND trim(l.name) <> ''
+                  AND trim(coalesce(l.short_description, '')) <> ''
+              ) THEN 1 ELSE 0 END AS has_localization,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM tool_localizations l
+                WHERE l.tool_id = t.id AND l.translation_status = 'published'
+                  AND l.published_at IS NOT NULL AND trim(l.name) <> ''
+                  AND coalesce(l.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
+              ) THEN 1 ELSE 0 END AS has_name_quality,
+              CASE WHEN EXISTS (SELECT 1 FROM tool_key_features f WHERE f.tool_id = t.id)
+                     OR EXISTS (
+                       SELECT 1 FROM tool_localizations l
+                       WHERE l.tool_id = t.id AND l.translation_status = 'published'
+                         AND l.published_at IS NOT NULL
+                         AND json_array_length(coalesce(l.feature_highlights, '[]')) > 0
+                     ) THEN 1 ELSE 0 END AS has_features,
+              CASE WHEN t.primary_category_id IS NOT NULL
+                     OR EXISTS (SELECT 1 FROM tool_categories tc WHERE tc.tool_id = t.id)
+                   THEN 1 ELSE 0 END AS has_category,
+              0 AS category_needs_manual,
+              CASE WHEN EXISTS (SELECT 1 FROM tool_sources s WHERE s.tool_id = t.id)
+                   THEN 1 ELSE 0 END AS has_source,
+              CASE WHEN EXISTS (
+                SELECT 1
+                FROM domain_traffic_monthly tm
+                WHERE tm.normalized_domain = t.normalized_domain
+                  AND tm.source = ?
+              ) THEN 1 ELSE 0 END AS has_traffic,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM domain_states ds
+                WHERE ds.normalized_domain = t.normalized_domain AND ds.source = ?
+                  AND ds.last_crawled_at IS NOT NULL
+              ) THEN 1 ELSE 0 END AS has_domain_state,
+              CASE WHEN t.pricing_model <> 'unknown' OR EXISTS (
+                SELECT 1 FROM pricing_sources ps
+                WHERE ps.tool_id = t.id AND ps.is_active = 1 AND ps.last_success_at IS NOT NULL
+              ) THEN 1 ELSE 0 END AS has_pricing
+            FROM tools t
+            LEFT JOIN tool_enrichment_states state ON state.tool_id = t.id
+            WHERE t.id = ?
+            LIMIT 1
+            """
+        try:
+            rows = await self.d1.query(
+                query_with_category_status,
+                [TRAFFIC_SOURCE, DOMAIN_STATE_SOURCE, tool_id],
+            )
+        except Exception:
+            rows = await self.d1.query(
+                query_legacy,
+                [TRAFFIC_SOURCE, DOMAIN_STATE_SOURCE, tool_id],
+            )
         if not rows:
             return "missing"
         row = rows[0]
         blocking = [
             name
             for name, column in (
+                ("content_safety", "has_content_safety"),
                 ("screenshot", "has_screenshot"),
                 ("published_localization", "has_localization"),
+                ("name_quality", "has_name_quality"),
                 ("key_feature", "has_features"),
                 ("category", "has_category"),
                 ("source_evidence", "has_source"),
@@ -3686,6 +6319,10 @@ class D1EnrichmentStore:
             )
             if not int(row.get(column) or 0)
         ]
+        # Keep the manual-review marker visible while the missing category remains blocking.
+        if int(row.get("category_needs_manual") or 0):
+            if "category_needs_manual" not in warnings:
+                warnings.append("category_needs_manual")
         readiness = "ready" if not blocking else "blocked"
         now = utc_now_iso()
         transitioned_at = now if row.get("previous_readiness") != readiness else None
@@ -3774,7 +6411,8 @@ class D1AssetStore:
               AND t.duplicate_of_tool_id IS NULL
               AND trim(t.normalized_domain) <> ''
               AND (
-                NOT EXISTS (
+                (t.status IN ('pending_enrich', 'pending_review') AND t.content_safety_status <> 'safe')
+                OR NOT EXISTS (
                   SELECT 1
                   FROM tool_assets ta
                   WHERE ta.tool_id = t.id
@@ -4025,20 +6663,426 @@ class D1AssetStore:
             [task.tool_id, asset_kind, ASSET_DB_STORAGE_BUCKET, storage_object_path, public_url, mime_type, width, height],
         )
 
+    async def category_catalog(self) -> list[CategoryCatalogEntry]:
+        """Load active taxonomy with optional definition fields for classification prompts."""
+        try:
+            rows = await self.d1.query(
+                """
+                SELECT
+                  c.canonical_slug AS slug,
+                  parent.canonical_slug AS parent_slug,
+                  c.definition AS definition,
+                  c.includes AS includes,
+                  c.excludes AS excludes,
+                  c.examples AS examples
+                FROM categories c
+                LEFT JOIN categories parent
+                  ON parent.id = c.parent_category_id
+                 AND parent.status = 'active'
+                WHERE c.status = 'active'
+                ORDER BY c.parent_category_id IS NOT NULL, c.display_order, c.canonical_slug
+                """,
+            )
+        except Exception:
+            # Pre-migration environments without definition columns.
+            rows = await self.d1.query(
+                """
+                SELECT
+                  c.canonical_slug AS slug,
+                  parent.canonical_slug AS parent_slug
+                FROM categories c
+                LEFT JOIN categories parent
+                  ON parent.id = c.parent_category_id
+                 AND parent.status = 'active'
+                WHERE c.status = 'active'
+                ORDER BY c.parent_category_id IS NOT NULL, c.display_order, c.canonical_slug
+                """,
+            )
+        entries: list[CategoryCatalogEntry] = []
+        for row in rows:
+            slug = clean_category_slug(row.get("slug") or row.get("canonical_slug"))
+            if not slug:
+                continue
+            entries.append(
+                CategoryCatalogEntry(
+                    slug=slug,
+                    parent_slug=clean_category_slug(row.get("parent_slug")),
+                    definition=clean_asset_text(row.get("definition"), 280),
+                    includes=clean_asset_text(row.get("includes"), 280),
+                    excludes=clean_asset_text(row.get("excludes"), 280),
+                    examples=clean_asset_text(row.get("examples"), 200),
+                )
+            )
+        return entries
+
     async def category_options(self) -> list[str]:
-        rows = await self.d1.query(
-            """
-            SELECT canonical_slug
-            FROM categories
-            WHERE status = 'active'
-            ORDER BY parent_category_id IS NOT NULL, display_order, canonical_slug
-            """,
+        return [entry.slug for entry in await self.category_catalog()]
+
+    async def published_legacy_category_tasks(
+        self,
+        limit: int,
+        *,
+        after_tool_id: int = 0,
+        tool_ids: list[int] | None = None,
+    ) -> list[AssetTask]:
+        """Return published tools whose categories still need hierarchical reclassification.
+
+        Scope:
+        - status = published only (rejected/draft/pending_* are never selected)
+        - must already have at least one category assignment
+        - skip tools with any source=manual assignment
+        - skip tools already successfully backfilled (raw.backfill marker) or
+          already classified with the current hierarchical prompt version
+        """
+        if limit <= 0:
+            return []
+
+        params: list[Any] = []
+        id_filter = ""
+        if tool_ids:
+            cleaned = sorted({int(tool_id) for tool_id in tool_ids if int(tool_id) > 0})
+            if not cleaned:
+                return []
+            placeholders = ",".join("?" for _ in cleaned)
+            id_filter = f"AND t.id IN ({placeholders})"
+            params.extend(cleaned)
+        else:
+            id_filter = "AND t.id > ?"
+            params.append(int(after_tool_id or 0))
+
+        # Prefer json_extract when raw is valid JSON; fall back to LIKE for resilience.
+        already_done = f"""
+            (
+              t.category_classification_status = 'auto_ok'
+              AND t.category_classification_raw IS NOT NULL
+              AND trim(t.category_classification_raw) <> ''
+              AND (
+                json_extract(t.category_classification_raw, '$.backfill') = ?
+                OR t.category_classification_raw LIKE ?
+                OR (
+                  json_extract(t.category_classification_raw, '$.prompt_version') = ?
+                  AND json_extract(t.category_classification_raw, '$.mode') = 'hierarchical'
+                )
+              )
+            )
+        """
+        params.extend(
+            [
+                PUBLISHED_CATEGORY_BACKFILL_VERSION,
+                f'%"backfill":"{PUBLISHED_CATEGORY_BACKFILL_VERSION}"%',
+                CATEGORY_CLASSIFICATION_PROMPT_VERSION,
+            ]
         )
-        return [str(row.get("canonical_slug") or "") for row in rows if row.get("canonical_slug")]
+
+        rows = await self.d1.query(
+            f"""
+            SELECT
+              t.id AS tool_id,
+              t.canonical_slug,
+              t.normalized_domain,
+              t.official_url
+            FROM tools t
+            WHERE t.status = 'published'
+              {id_filter}
+              AND (
+                t.primary_category_id IS NOT NULL
+                OR EXISTS (SELECT 1 FROM tool_categories tc WHERE tc.tool_id = t.id)
+              )
+              AND NOT EXISTS (
+                SELECT 1
+                FROM tool_categories tc
+                WHERE tc.tool_id = t.id
+                  AND tc.source = 'manual'
+              )
+              AND NOT {already_done}
+            ORDER BY t.id ASC
+            LIMIT ?
+            """,
+            [*params, limit],
+        )
+        tasks: list[AssetTask] = []
+        for row in rows:
+            tool_id = to_integer(row.get("tool_id")) or 0
+            if tool_id <= 0:
+                continue
+            tasks.append(
+                AssetTask(
+                    tool_id=tool_id,
+                    canonical_slug=str(row.get("canonical_slug") or f"tool-{tool_id}"),
+                    normalized_domain=str(row.get("normalized_domain") or ""),
+                    official_url=str(row.get("official_url") or ""),
+                    attempts=0,
+                    max_attempts=1,
+                    generation=0,
+                    lease_token="published-category-backfill",
+                )
+            )
+        return tasks
+
+    async def load_tool_category_snapshot(self, tool_id: int) -> dict[str, Any]:
+        tool_rows = await self.d1.query(
+            """
+            SELECT id, primary_category_id, category_classification_status, category_classification_raw
+            FROM tools
+            WHERE id = ?
+            LIMIT 1
+            """,
+            [tool_id],
+        )
+        tool = tool_rows[0] if tool_rows else {}
+        category_rows = await self.d1.query(
+            """
+            SELECT
+              tc.category_id,
+              tc.source,
+              tc.raw_output,
+              tc.classified_at,
+              c.canonical_slug AS slug,
+              parent.canonical_slug AS parent_slug
+            FROM tool_categories tc
+            JOIN categories c ON c.id = tc.category_id
+            LEFT JOIN categories parent ON parent.id = c.parent_category_id
+            WHERE tc.tool_id = ?
+            ORDER BY c.parent_category_id IS NOT NULL, c.canonical_slug
+            """,
+            [tool_id],
+        )
+        return {
+            "tool_id": tool_id,
+            "primary_category_id": to_integer(tool.get("primary_category_id")),
+            "category_classification_status": tool.get("category_classification_status"),
+            "category_classification_raw": tool.get("category_classification_raw"),
+            "categories": [
+                {
+                    "category_id": to_integer(row.get("category_id")),
+                    "slug": row.get("slug"),
+                    "parent_slug": row.get("parent_slug"),
+                    "source": row.get("source") or "auto",
+                    "classified_at": row.get("classified_at"),
+                }
+                for row in category_rows
+            ],
+        }
+
+    async def apply_published_category_backfill(
+        self,
+        task: AssetTask,
+        result: AssetFetchResult,
+        *,
+        dry_run: bool = False,
+    ) -> dict[str, Any]:
+        """Atomically replace non-manual categories for one published tool.
+
+        On failure paths the caller must not invoke this. Live categories stay untouched
+        until this batch commits (delete non-manual + insert new + update primary + audit).
+        """
+        if not published_category_backfill_success(result):
+            raise ValueError(result.metadata_error or "category_backfill_invalid_result")
+
+        slugs = [slug for slug in (result.category_l2, result.category_l1) if slug]
+        slugs = list(dict.fromkeys(slugs))
+        slug_placeholders = ",".join("?" for _ in slugs)
+        rows = await self.d1.query(
+            f"""
+            SELECT
+              c.id,
+              c.canonical_slug,
+              c.parent_category_id,
+              parent.id AS parent_id,
+              parent.canonical_slug AS parent_slug
+            FROM categories c
+            LEFT JOIN categories parent
+              ON parent.id = c.parent_category_id
+             AND parent.status = 'active'
+            WHERE c.status = 'active'
+              AND c.canonical_slug IN ({slug_placeholders})
+            """,
+            slugs,
+        )
+        by_slug = {str(row.get("canonical_slug")): row for row in rows}
+        specific = next((by_slug.get(slug) for slug in slugs if by_slug.get(slug)), None)
+        if not specific:
+            raise ValueError("category_backfill_unresolved_slugs")
+
+        primary_id = int(specific.get("parent_id") or specific.get("id") or 0)
+        specific_id = int(specific.get("id") or 0)
+        if primary_id <= 0 or specific_id <= 0:
+            raise ValueError("category_backfill_invalid_ids")
+
+        category_ids = list(dict.fromkeys([primary_id, specific_id]))
+        now = utc_now_iso()
+        raw_output = annotate_published_category_backfill_raw(
+            result.category_raw_output
+            or json.dumps(
+                {"category_l1": result.category_l1, "category_l2": result.category_l2},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+            result,
+        )
+        taxonomy_version = ""
+        try:
+            parsed_raw = json.loads(raw_output)
+            if isinstance(parsed_raw, dict):
+                taxonomy_version = str(parsed_raw.get("taxonomy_version") or "")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            taxonomy_version = ""
+
+        old_snapshot = await self.load_tool_category_snapshot(task.tool_id)
+        if any(item.get("source") == "manual" for item in old_snapshot.get("categories") or []):
+            raise ValueError("category_backfill_manual_present")
+
+        new_snapshot = {
+            "primary_category_id": primary_id,
+            "category_l1": result.category_l1,
+            "category_l2": result.category_l2,
+            "category_ids": category_ids,
+            "backfill": PUBLISHED_CATEGORY_BACKFILL_VERSION,
+            "prompt_version": CATEGORY_CLASSIFICATION_PROMPT_VERSION,
+        }
+        summary = {
+            "tool_id": task.tool_id,
+            "slug": task.canonical_slug,
+            "old": old_snapshot,
+            "new": new_snapshot,
+            "applied": False,
+            "dry_run": dry_run,
+        }
+        if dry_run:
+            return summary
+
+        statements: list[tuple[str, list[Any]]] = [
+            (
+                """
+                INSERT INTO tool_change_log (
+                  tool_id, change_type, old_value, new_value, notes, detected_at
+                )
+                VALUES (?, 'category_backfill', ?, ?, ?, ?)
+                """,
+                [
+                    task.tool_id,
+                    json.dumps(old_snapshot, ensure_ascii=False, separators=(",", ":")),
+                    json.dumps(new_snapshot, ensure_ascii=False, separators=(",", ":")),
+                    f"published category backfill {PUBLISHED_CATEGORY_BACKFILL_VERSION}",
+                    now,
+                ],
+            ),
+            (
+                """
+                DELETE FROM tool_categories
+                WHERE tool_id = ?
+                  AND (source IS NULL OR source <> 'manual')
+                """,
+                [task.tool_id],
+            ),
+        ]
+        for category_id in category_ids:
+            statements.append(
+                (
+                    """
+                    INSERT INTO tool_categories (
+                      tool_id, category_id, source, raw_output, classified_at
+                    )
+                    VALUES (?, ?, 'auto', ?, ?)
+                    """,
+                    [task.tool_id, category_id, raw_output, now],
+                )
+            )
+        statements.append(
+            (
+                """
+                UPDATE tools
+                SET primary_category_id = ?,
+                    category_classification_status = 'auto_ok',
+                    category_classification_attempts = 0,
+                    category_classification_last_error = NULL,
+                    category_classification_raw = ?,
+                    category_classification_updated_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = 'published'
+                """,
+                [primary_id, raw_output, now, now, task.tool_id],
+            )
+        )
+        statements.append(
+            (
+                """
+                INSERT INTO tool_category_classification_events (
+                  tool_id, outcome, category_l1_slug, category_l2_slug,
+                  model_name, prompt_version, taxonomy_version, raw_output, error
+                )
+                VALUES (?, 'auto_ok', ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                [
+                    task.tool_id,
+                    result.category_l1 or None,
+                    result.category_l2 or None,
+                    DEFAULT_CATEGORY_CLASSIFICATION_MODEL,
+                    CATEGORY_CLASSIFICATION_PROMPT_VERSION,
+                    taxonomy_version,
+                    raw_output,
+                ],
+            )
+        )
+        await self.d1.batch(statements)
+        summary["applied"] = True
+        return summary
+
+    async def record_published_category_backfill_failure(
+        self,
+        task: AssetTask,
+        *,
+        error: str,
+        raw_output: str = "",
+        dry_run: bool = False,
+    ) -> None:
+        """Record a failed reclassification without mutating live category assignments."""
+        if dry_run:
+            return
+        message = (error or "category_backfill_failed")[:500]
+        now = utc_now_iso()
+        try:
+            await self.d1.run(
+                """
+                UPDATE tools
+                SET category_classification_last_error = ?,
+                    category_classification_raw = CASE
+                      WHEN ? <> '' THEN ?
+                      ELSE category_classification_raw
+                    END,
+                    category_classification_updated_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                  AND status = 'published'
+                """,
+                [message, raw_output, raw_output, now, now, task.tool_id],
+            )
+        except Exception:
+            pass
+        await self.record_category_classification_event(
+            task.tool_id,
+            outcome="auto_failed",
+            raw_output=raw_output,
+            error=message,
+        )
 
     async def save_tool_localization(self, task: AssetTask, result: AssetFetchResult) -> None:
         title = clean_asset_text(result.title, 120)
         description = clean_asset_text(result.description, 500)
+        name_source = clean_asset_text(result.name_source, 80) or "unknown"
+        name_confidence = max(0, min(100, int(result.name_confidence or 0)))
+        name_evidence = clean_asset_text(result.name_evidence, 500)
+        name_review_status = result.name_review_status
+        invalid_reason = invalid_tool_name_reason(title)
+        if invalid_reason:
+            title = domain_fallback_tool_name(task.normalized_domain)
+            name_source = "domain_fallback"
+            name_confidence = 45
+            name_evidence = invalid_reason
+            name_review_status = "needs_review"
+        elif name_confidence < AUTO_APPROVE_TOOL_NAME_CONFIDENCE:
+            name_review_status = "needs_review"
         if not title and not description:
             return
         rows = await self.d1.query(
@@ -4072,9 +7116,11 @@ class D1AssetStore:
                     """
                     INSERT OR IGNORE INTO tool_localizations (
                       tool_id, locale_code, localized_slug, name, tagline, short_description, feature_highlights,
-                      translation_status, published_at
+                      translation_status, published_at, name_source, name_confidence, name_evidence,
+                      name_review_status, last_name_checked_at
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, '[]', 'published', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
+                    VALUES (?, ?, ?, ?, ?, ?, '[]', 'published', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                            ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
                     """,
                     [
                         task.tool_id,
@@ -4083,6 +7129,10 @@ class D1AssetStore:
                         title or localized_slug,
                         description or None,
                         description or None,
+                        name_source,
+                        name_confidence,
+                        name_evidence or None,
+                        name_review_status,
                     ],
                 )
                 if int(meta.get("changes") or 0) > 0:
@@ -4099,10 +7149,26 @@ class D1AssetStore:
             """
             UPDATE tool_localizations
             SET name = CASE
-                  WHEN ? <> '' AND (name IS NULL OR trim(name) = '' OR name = ?)
+                  WHEN ? <> '' AND (
+                    name IS NULL OR trim(name) = '' OR name = ?
+                    OR name_review_status IN ('needs_review', 'rejected')
+                  )
                   THEN ?
                   ELSE name
                 END,
+                name_source = CASE
+                  WHEN ? <> '' AND (name IS NULL OR trim(name) = '' OR name = ? OR name_review_status IN ('needs_review', 'rejected'))
+                  THEN ? ELSE name_source END,
+                name_confidence = CASE
+                  WHEN ? <> '' AND (name IS NULL OR trim(name) = '' OR name = ? OR name_review_status IN ('needs_review', 'rejected'))
+                  THEN ? ELSE name_confidence END,
+                name_evidence = CASE
+                  WHEN ? <> '' AND (name IS NULL OR trim(name) = '' OR name = ? OR name_review_status IN ('needs_review', 'rejected'))
+                  THEN ? ELSE name_evidence END,
+                name_review_status = CASE
+                  WHEN ? <> '' AND (name IS NULL OR trim(name) = '' OR name = ? OR name_review_status IN ('needs_review', 'rejected'))
+                  THEN ? ELSE name_review_status END,
+                last_name_checked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 tagline = CASE
                   WHEN ? <> '' AND (tagline IS NULL OR trim(tagline) = '')
                   THEN ?
@@ -4121,6 +7187,18 @@ class D1AssetStore:
                 title,
                 task.canonical_slug,
                 title,
+                title,
+                task.canonical_slug,
+                name_source,
+                title,
+                task.canonical_slug,
+                name_confidence,
+                title,
+                task.canonical_slug,
+                name_evidence or None,
+                title,
+                task.canonical_slug,
+                name_review_status,
                 description,
                 description,
                 description,
@@ -4159,23 +7237,207 @@ class D1AssetStore:
             return
         primary_id = int(specific.get("parent_id") or specific.get("id") or 0)
         specific_id = int(specific.get("id") or 0)
+        now = utc_now_iso()
+        raw_output = result.category_raw_output or json.dumps(
+            {"category_l1": result.category_l1, "category_l2": result.category_l2},
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
         for category_id in dict.fromkeys([primary_id, specific_id]):
             if category_id > 0:
-                await self.d1.run(
-                    "INSERT OR IGNORE INTO tool_categories (tool_id, category_id) VALUES (?, ?)",
-                    [task.tool_id, category_id],
-                )
+                # Prefer provenance columns when migration 0029 is applied.
+                try:
+                    await self.d1.run(
+                        """
+                        INSERT INTO tool_categories (tool_id, category_id, source, raw_output, classified_at)
+                        VALUES (?, ?, 'auto', ?, ?)
+                        ON CONFLICT(tool_id, category_id) DO UPDATE SET
+                          source = CASE
+                            WHEN tool_categories.source = 'manual' THEN tool_categories.source
+                            ELSE excluded.source
+                          END,
+                          raw_output = CASE
+                            WHEN tool_categories.source = 'manual' THEN tool_categories.raw_output
+                            ELSE excluded.raw_output
+                          END,
+                          classified_at = CASE
+                            WHEN tool_categories.source = 'manual' THEN tool_categories.classified_at
+                            ELSE excluded.classified_at
+                          END
+                        """,
+                        [task.tool_id, category_id, raw_output, now],
+                    )
+                except Exception:
+                    await self.d1.run(
+                        "INSERT OR IGNORE INTO tool_categories (tool_id, category_id) VALUES (?, ?)",
+                        [task.tool_id, category_id],
+                    )
         if primary_id > 0:
+            try:
+                await self.d1.run(
+                    """
+                    UPDATE tools
+                    SET primary_category_id = ?,
+                        category_classification_status = 'auto_ok',
+                        category_classification_raw = ?,
+                        category_classification_last_error = NULL,
+                        category_classification_updated_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND primary_category_id IS NULL
+                    """,
+                    [primary_id, raw_output, now, now, task.tool_id],
+                )
+            except Exception:
+                await self.d1.run(
+                    """
+                    UPDATE tools
+                    SET primary_category_id = ?,
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE id = ?
+                      AND primary_category_id IS NULL
+                    """,
+                    [primary_id, task.tool_id],
+                )
+        await self.record_category_classification_event(
+            task.tool_id,
+            outcome="auto_ok",
+            category_l1=result.category_l1,
+            category_l2=result.category_l2,
+            raw_output=raw_output,
+        )
+
+    async def record_category_classification_event(
+        self,
+        tool_id: int,
+        *,
+        outcome: str,
+        category_l1: str = "",
+        category_l2: str = "",
+        raw_output: str = "",
+        error: str = "",
+    ) -> None:
+        metadata: dict[str, Any] = {}
+        try:
+            parsed = json.loads(raw_output) if raw_output else {}
+            metadata = parsed if isinstance(parsed, dict) else {}
+        except ValueError:
+            metadata = {}
+        model_chain = metadata.get("model_chain")
+        requested_model = (
+            str(model_chain[0])
+            if isinstance(model_chain, list) and model_chain
+            else DEFAULT_CATEGORY_CLASSIFICATION_MODEL
+        )
+        try:
+            await self.d1.run(
+                """
+                INSERT INTO tool_category_classification_events (
+                  tool_id, outcome, category_l1_slug, category_l2_slug,
+                  model_name, prompt_version, taxonomy_version, raw_output, error
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    tool_id,
+                    outcome,
+                    category_l1 or None,
+                    category_l2 or None,
+                    requested_model,
+                    str(metadata.get("prompt_version") or CATEGORY_CLASSIFICATION_PROMPT_VERSION),
+                    str(metadata.get("taxonomy_version") or ""),
+                    raw_output or None,
+                    error[:500] or None,
+                ],
+            )
+        except Exception:
+            # Migration 0030 may not be present during a rolling deploy.
+            return
+
+    async def get_category_classification_state(self, tool_id: int) -> dict[str, Any]:
+        try:
+            rows = await self.d1.query(
+                """
+                SELECT
+                  category_classification_status AS status,
+                  category_classification_attempts AS attempts,
+                  category_classification_last_error AS last_error
+                FROM tools
+                WHERE id = ?
+                LIMIT 1
+                """,
+                [tool_id],
+            )
+        except Exception:
+            return {"status": None, "attempts": 0, "last_error": None}
+        row = rows[0] if rows else {}
+        return {
+            "status": row.get("status"),
+            "attempts": int(row.get("attempts") or 0),
+            "last_error": row.get("last_error"),
+        }
+
+    async def record_category_classification_failure(
+        self,
+        tool_id: int,
+        error: str,
+        *,
+        raw_output: str = "",
+    ) -> dict[str, Any]:
+        """Increment attempts and stop automatic retries after repeated failures."""
+        now = utc_now_iso()
+        message = (error or "category_failed")[:500]
+        try:
             await self.d1.run(
                 """
                 UPDATE tools
-                SET primary_category_id = ?,
-                    updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                SET category_classification_attempts = coalesce(category_classification_attempts, 0) + 1,
+                    category_classification_last_error = ?,
+                    category_classification_raw = CASE
+                      WHEN ? <> '' THEN ?
+                      ELSE category_classification_raw
+                    END,
+                    category_classification_updated_at = ?,
+                    updated_at = ?
                 WHERE id = ?
-                  AND primary_category_id IS NULL
                 """,
-                [primary_id, task.tool_id],
+                [message, raw_output, raw_output, now, now, tool_id],
             )
+            state = await self.get_category_classification_state(tool_id)
+            attempts = int(state.get("attempts") or 0)
+            if attempts >= CATEGORY_CLASSIFICATION_MAX_ATTEMPTS and state.get("status") != "auto_ok":
+                await self.d1.run(
+                    """
+                    UPDATE tools
+                    SET category_classification_status = 'needs_manual',
+                        category_classification_updated_at = ?,
+                        updated_at = ?
+                    WHERE id = ?
+                      AND (category_classification_status IS NULL OR category_classification_status <> 'auto_ok')
+                    """,
+                    [now, now, tool_id],
+                )
+                state = await self.get_category_classification_state(tool_id)
+            outcome = "needs_manual" if state.get("status") == "needs_manual" else "auto_failed"
+            await self.record_category_classification_event(
+                tool_id,
+                outcome=outcome,
+                raw_output=raw_output,
+                error=message,
+            )
+            return state
+        except Exception as exc:
+            log_info(
+                "assets.category_classification.record_failed",
+                tool_id=tool_id,
+                error=str(exc)[:200],
+            )
+            return {"status": None, "attempts": 0, "last_error": message}
+
+    async def category_is_waived(self, tool_id: int) -> bool:
+        """True when automatic classification retries should stop for manual review."""
+        state = await self.get_category_classification_state(tool_id)
+        return str(state.get("status") or "") == "needs_manual"
 
     async def save_tool_features(self, task: AssetTask, result: AssetFetchResult) -> None:
         features = clean_key_features(result.key_features)
@@ -4219,6 +7481,10 @@ class D1AssetStore:
             """
             SELECT
               CASE WHEN EXISTS (
+                SELECT 1 FROM tools t
+                WHERE t.id = ? AND t.content_safety_status = 'safe'
+              ) THEN 1 ELSE 0 END AS has_content_safety,
+              CASE WHEN EXISTS (
                 SELECT 1
                 FROM tool_localizations tl
                 WHERE tl.tool_id = ?
@@ -4245,12 +7511,13 @@ class D1AssetStore:
                 SELECT 1 FROM tool_categories tc WHERE tc.tool_id = ?
               ) THEN 1 ELSE 0 END AS has_category
             """,
-            [tool_id, tool_id, tool_id, tool_id, tool_id],
+            [tool_id, tool_id, tool_id, tool_id, tool_id, tool_id],
         )
         row = rows[0] if rows else {}
         return [
             name
             for name, column in (
+                ("content_safety", "has_content_safety"),
                 ("description", "has_description"),
                 ("key_features", "has_features"),
                 ("category", "has_category"),
@@ -4262,6 +7529,10 @@ class D1AssetStore:
         rows = await self.d1.query(
             """
             SELECT
+              CASE WHEN EXISTS (
+                SELECT 1 FROM tools t
+                WHERE t.id = ? AND t.content_safety_status = 'safe'
+              ) THEN 1 ELSE 0 END AS has_content_safety,
               CASE WHEN EXISTS (
                 SELECT 1
                 FROM tool_assets ta
@@ -4310,6 +7581,7 @@ class D1AssetStore:
             """,
             [
                 tool_id,
+                tool_id,
                 ASSET_DB_STORAGE_BUCKET,
                 tool_id,
                 tool_id,
@@ -4321,17 +7593,94 @@ class D1AssetStore:
         )
         row = rows[0] if rows else {}
         columns = {
+            "content_safety": "has_content_safety",
             "screenshot": "has_screenshot",
             "favicon": "has_favicon",
             "description": "has_description",
             "key_features": "has_key_features",
             "category": "has_category",
         }
-        return [
+        missing = [
             requirement
             for requirement in ASSET_REQUIREMENT_ORDER
             if not int(row.get(columns[requirement]) or 0)
         ]
+        # The asset task can finish, but readiness still blocks until an admin assigns a category.
+        if "category" in missing and await self.category_is_waived(tool_id):
+            missing = [item for item in missing if item != "category"]
+        return missing
+
+    async def save_content_safety(
+        self,
+        task: AssetTask,
+        assessment: ContentSafetyAssessment,
+    ) -> ContentSafetyAssessment:
+        existing_rows = await self.d1.query(
+            "SELECT status, content_safety_status FROM tools WHERE id = ? LIMIT 1",
+            [task.tool_id],
+        )
+        existing = existing_rows[0] if existing_rows else {}
+        previous_status = str(existing.get("content_safety_status") or "unknown")
+        tool_status = str(existing.get("status") or "")
+        stored = assessment
+        if tool_status == "published" and assessment.status == "nsfw":
+            stored = ContentSafetyAssessment(
+                "needs_review",
+                assessment.risk_score,
+                assessment.confidence,
+                "published_tool_requires_human_confirmation",
+                (assessment.evidence + ["proposed:nsfw"])[:12],
+                assessment.source,
+            )
+
+        now = utc_now_iso()
+        evidence_json = json.dumps(stored.evidence, ensure_ascii=False, separators=(",", ":"))
+        await self.d1.batch([
+            (
+                """
+                UPDATE tools
+                SET content_safety_status = ?,
+                    content_safety_score = ?,
+                    content_safety_confidence = ?,
+                    content_safety_source = ?,
+                    content_safety_reason = ?,
+                    content_safety_evidence = ?,
+                    content_safety_checked_at = ?,
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                [
+                    stored.status,
+                    stored.risk_score,
+                    stored.confidence,
+                    stored.source,
+                    stored.reason,
+                    evidence_json,
+                    now,
+                    now,
+                    task.tool_id,
+                ],
+            ),
+            (
+                """
+                INSERT INTO tool_content_safety_events (
+                  tool_id, previous_status, decision, risk_score, confidence,
+                  source, reason, evidence_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    task.tool_id,
+                    previous_status,
+                    stored.status,
+                    stored.risk_score,
+                    stored.confidence,
+                    stored.source,
+                    stored.reason,
+                    evidence_json,
+                ],
+            ),
+        ])
+        return stored
 
     async def has_tool_enrichment(self, tool_id: int) -> bool:
         return not await self.missing_tool_enrichment_requirements(tool_id)
@@ -4353,6 +7702,37 @@ class D1AssetStore:
         )
         return int(meta.get("changes") or 0) > 0
 
+    async def record_page_quality(
+        self,
+        task: AssetTask,
+        assessment: PageQualityAssessment,
+    ) -> bool:
+        meta = await self.d1.run(
+            """
+            UPDATE asset_tasks
+            SET page_state = ?,
+                page_state_reason = ?,
+                last_page_checked_at = ?,
+                updated_at = ?
+            WHERE tool_id = ?
+              AND source = ?
+              AND status = 'processing'
+              AND generation = ?
+              AND lease_token = ?
+            """,
+            [
+                assessment.state,
+                f"{assessment.reason}:{assessment.evidence}"[:500],
+                utc_now_iso(),
+                utc_now_iso(),
+                task.tool_id,
+                ASSET_SOURCE,
+                task.generation,
+                task.lease_token,
+            ],
+        )
+        return int(meta.get("changes") or 0) > 0
+
     async def complete_task(
         self,
         task: AssetTask,
@@ -4360,6 +7740,7 @@ class D1AssetStore:
         error: str | None = None,
         *,
         retryable: bool = True,
+        retry_after_hours: int | None = None,
     ) -> bool:
         now = utc_now_iso()
         exhausted = task.attempts >= task.max_attempts or not retryable
@@ -4385,7 +7766,9 @@ class D1AssetStore:
             [
                 status,
                 now,
-                None if status == "done" or exhausted else iso_delta(days=1),
+                None
+                if status == "done" or exhausted
+                else iso_delta(hours=retry_after_hours) if retry_after_hours is not None else iso_delta(days=1),
                 (error or "")[:2000] or None,
                 now if status != "done" and exhausted else None,
                 now,
@@ -4517,20 +7900,29 @@ class D1TaskStore:
         now = utc_now_iso()
         candidates = await self.d1.query(
             """
-            SELECT t.normalized_domain
-            FROM tools t
+            WITH monitored_domains AS (
+              SELECT normalized_domain
+              FROM tools
+              WHERE status IN ('published', 'pending_enrich', 'pending_review')
+                AND duplicate_of_tool_id IS NULL
+                AND trim(normalized_domain) <> ''
+              UNION
+              SELECT normalized_domain
+              FROM ai_directory_sites
+              WHERE status = 'active'
+                AND trim(normalized_domain) <> ''
+            )
+            SELECT monitored.normalized_domain
+            FROM monitored_domains monitored
             LEFT JOIN domain_traffic_monthly tm
-              ON tm.normalized_domain = t.normalized_domain
+              ON tm.normalized_domain = monitored.normalized_domain
              AND tm.source = ?
              AND tm.traffic_month = ?
             LEFT JOIN traffic_tasks task
-              ON task.normalized_domain = t.normalized_domain
+              ON task.normalized_domain = monitored.normalized_domain
              AND task.source = ?
              AND task.traffic_month = ?
-            WHERE t.status IN ('published', 'pending_enrich', 'pending_review')
-              AND t.duplicate_of_tool_id IS NULL
-              AND trim(t.normalized_domain) <> ''
-              AND tm.traffic_month IS NULL
+            WHERE tm.traffic_month IS NULL
               AND (
                 task.normalized_domain IS NULL
                 OR task.status = 'done'
@@ -4548,8 +7940,8 @@ class D1TaskStore:
                   AND task.lease_expires_at <= ?
                 )
               )
-            GROUP BY t.normalized_domain
-            ORDER BY min(coalesce(task.updated_at, '')) ASC, min(t.id) ASC
+            GROUP BY monitored.normalized_domain
+            ORDER BY min(coalesce(task.updated_at, '')) ASC, monitored.normalized_domain ASC
             LIMIT ?
             """,
             [TRAFFIC_SOURCE, traffic_month, TRAFFIC_SOURCE, traffic_month, now, now, limit],
@@ -4805,11 +8197,19 @@ class D1DomainStateStore:
             """
             INSERT INTO domain_state_tasks (
               normalized_domain, source, status, attempts, last_queued_at,
-              next_retry_at, last_error, created_at, updated_at
+              next_retry_at, last_error, created_at, updated_at,
+              fetch_domain_rating, fetch_rdap
             )
-            SELECT due.normalized_domain, ?, 'queued', 0, ?, NULL, NULL, ?, ?
+            SELECT due.normalized_domain, ?, 'queued', 0, ?, NULL, NULL, ?, ?,
+                   due.fetch_domain_rating, due.fetch_rdap
             FROM (
-              SELECT t.normalized_domain
+              SELECT
+                t.normalized_domain,
+                CASE
+                  WHEN ds.last_crawled_at IS NULL OR ds.last_crawled_at < ? THEN 1
+                  ELSE 0
+                END AS fetch_domain_rating,
+                CASE WHEN ds.rdap_checked_at IS NULL THEN 1 ELSE 0 END AS fetch_rdap
               FROM tools t
               LEFT JOIN domain_states ds
                 ON ds.normalized_domain = t.normalized_domain
@@ -4820,6 +8220,7 @@ class D1DomainStateStore:
                 AND (
                   ds.last_crawled_at IS NULL
                   OR ds.last_crawled_at < ?
+                  OR ds.rdap_checked_at IS NULL
                 )
               GROUP BY t.normalized_domain
               ORDER BY CASE WHEN min(ds.last_crawled_at) IS NULL THEN 0 ELSE 1 END,
@@ -4832,6 +8233,8 @@ class D1DomainStateStore:
               status = 'queued',
               attempts = 0,
               generation = domain_state_tasks.generation + 1,
+              fetch_domain_rating = excluded.fetch_domain_rating,
+              fetch_rdap = excluded.fetch_rdap,
               last_queued_at = excluded.last_queued_at,
               next_retry_at = NULL,
               last_error = NULL,
@@ -4847,6 +8250,7 @@ class D1DomainStateStore:
                 now,
                 now,
                 now,
+                stale_before,
                 DOMAIN_STATE_SOURCE,
                 stale_before,
                 limit,
@@ -4889,7 +8293,8 @@ class D1DomainStateStore:
               ORDER BY coalesce(next_retry_at, ''), updated_at, normalized_domain
               LIMIT ?
             )
-            RETURNING normalized_domain, attempts, max_attempts, generation, lease_token
+            RETURNING normalized_domain, attempts, max_attempts, generation, lease_token,
+                      fetch_domain_rating, fetch_rdap
             """,
             [now, lease_owner, lease_expires_at, now, DOMAIN_STATE_SOURCE, now, now, limit],
         )
@@ -4900,6 +8305,8 @@ class D1DomainStateStore:
                 max_attempts=int(row.get("max_attempts") or 5),
                 generation=int(row.get("generation") or 1),
                 lease_token=str(row.get("lease_token") or ""),
+                fetch_domain_rating=bool(row.get("fetch_domain_rating")),
+                fetch_rdap=bool(row.get("fetch_rdap")),
             )
             for row in rows
             if row.get("normalized_domain") and row.get("lease_token")
@@ -4920,6 +8327,53 @@ class D1DomainStateStore:
 
     async def complete_task(self, task: DomainStateTask, result: DomainStateResult) -> bool:
         now = utc_now_iso()
+        domain_rating_checked_at = now if task.fetch_domain_rating and result.status in ("done", "no_data") else None
+        rdap_checked_at = now if result.rdap_status is not None else None
+
+        state_statement = (
+            """
+            INSERT INTO domain_states (
+              normalized_domain, source, domain_rating, last_crawled_at, domain_created_at,
+              rdap_status, rdap_checked_at, rdap_last_error
+            )
+            SELECT ?, ?, ?, ?, ?, ?, ?, ?
+            WHERE EXISTS (
+              SELECT 1 FROM domain_state_tasks
+              WHERE normalized_domain = ? AND source = ?
+                AND status = 'processing' AND generation = ? AND lease_token = ?
+            )
+            ON CONFLICT (normalized_domain, source) DO UPDATE SET
+              domain_rating = coalesce(excluded.domain_rating, domain_states.domain_rating),
+              last_crawled_at = coalesce(excluded.last_crawled_at, domain_states.last_crawled_at),
+              domain_created_at = coalesce(excluded.domain_created_at, domain_states.domain_created_at),
+              rdap_status = case
+                when excluded.rdap_checked_at is not null then excluded.rdap_status
+                else domain_states.rdap_status
+              end,
+              rdap_checked_at = coalesce(excluded.rdap_checked_at, domain_states.rdap_checked_at),
+              rdap_last_error = case
+                when excluded.rdap_checked_at is not null then excluded.rdap_last_error
+                else domain_states.rdap_last_error
+              end,
+              updated_at = ?
+            """,
+            [
+                task.normalized_domain,
+                DOMAIN_STATE_SOURCE,
+                result.domain_rating,
+                domain_rating_checked_at,
+                result.domain_created_at,
+                result.rdap_status,
+                rdap_checked_at,
+                (result.rdap_error or "")[:2000] or None,
+                task.normalized_domain,
+                DOMAIN_STATE_SOURCE,
+                task.generation,
+                task.lease_token,
+                now,
+            ],
+        )
+
         if result.status in ("done", "no_data"):
             statements: list[tuple[str, list[Any]]] = []
             if result.domain_rating is not None:
@@ -4955,41 +8409,13 @@ class D1DomainStateStore:
                 )
             statements.extend(
                 [
-                    (
-                        """
-                        INSERT INTO domain_states (
-                          normalized_domain, source, domain_rating, last_crawled_at, domain_created_at
-                        )
-                        SELECT ?, ?, ?, ?, ?
-                        WHERE EXISTS (
-                          SELECT 1 FROM domain_state_tasks
-                          WHERE normalized_domain = ? AND source = ?
-                            AND status = 'processing' AND generation = ? AND lease_token = ?
-                        )
-                        ON CONFLICT (normalized_domain, source) DO UPDATE SET
-                          domain_rating = coalesce(excluded.domain_rating, domain_states.domain_rating),
-                          last_crawled_at = excluded.last_crawled_at,
-                          domain_created_at = coalesce(excluded.domain_created_at, domain_states.domain_created_at),
-                          updated_at = ?
-                        """,
-                        [
-                            task.normalized_domain,
-                            DOMAIN_STATE_SOURCE,
-                            result.domain_rating,
-                            now,
-                            result.domain_created_at,
-                            task.normalized_domain,
-                            DOMAIN_STATE_SOURCE,
-                            task.generation,
-                            task.lease_token,
-                            now,
-                        ],
-                    ),
+                    state_statement,
                     (
                         """
                         UPDATE domain_state_tasks
                         SET status = ?, last_fetched_at = ?, last_completed_at = ?,
                             next_retry_at = NULL, last_error = NULL,
+                            fetch_rdap = case when ? is not null then 0 else fetch_rdap end,
                             lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL,
                             updated_at = ?
                         WHERE normalized_domain = ? AND source = ?
@@ -4999,6 +8425,7 @@ class D1DomainStateStore:
                             result.status,
                             now,
                             now,
+                            rdap_checked_at,
                             now,
                             task.normalized_domain,
                             DOMAIN_STATE_SOURCE,
@@ -5014,32 +8441,40 @@ class D1DomainStateStore:
 
         exhausted = task.attempts >= task.max_attempts
         retry_minutes = min(60, 2 ** min(task.attempts, 6))
-        meta = await self.d1.run(
-            """
-            UPDATE domain_state_tasks
-            SET status = 'failed',
-                next_retry_at = ?,
-                last_error = ?,
-                dead_letter_at = ?,
-                lease_owner = NULL,
-                lease_token = NULL,
-                lease_expires_at = NULL,
-                updated_at = ?
-            WHERE normalized_domain = ? AND source = ?
-              AND status = 'processing' AND generation = ? AND lease_token = ?
-            """,
+        batch_results = await self.d1.batch(
             [
-                None if exhausted else iso_delta(minutes=retry_minutes),
-                (result.error or "Domain state fetch failed")[:2000],
-                now if exhausted else None,
-                now,
-                task.normalized_domain,
-                DOMAIN_STATE_SOURCE,
-                task.generation,
-                task.lease_token,
-            ],
+                state_statement,
+                (
+                    """
+                    UPDATE domain_state_tasks
+                    SET status = 'failed',
+                        next_retry_at = ?,
+                        last_error = ?,
+                        dead_letter_at = ?,
+                        fetch_rdap = case when ? is not null then 0 else fetch_rdap end,
+                        lease_owner = NULL,
+                        lease_token = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = ?
+                    WHERE normalized_domain = ? AND source = ?
+                      AND status = 'processing' AND generation = ? AND lease_token = ?
+                    """,
+                    [
+                        None if exhausted else iso_delta(minutes=retry_minutes),
+                        (result.error or "Domain state fetch failed")[:2000],
+                        now if exhausted else None,
+                        rdap_checked_at,
+                        now,
+                        task.normalized_domain,
+                        DOMAIN_STATE_SOURCE,
+                        task.generation,
+                        task.lease_token,
+                    ],
+                ),
+            ]
         )
-        return int(meta.get("changes") or 0) > 0
+        task_meta = batch_results[-1].get("meta") if batch_results else {}
+        return int((task_meta or {}).get("changes") or 0) > 0
 
 
 class D1PricingStore:
@@ -5390,10 +8825,120 @@ class D1PricingStore:
         )
         return int(meta.get("changes") or 0) > 0
 
-    async def insert_snapshot(self, task: PricingTask, result: PricingFetchResult) -> int:
+    async def prepare_pricing_claims_shadow(
+        self,
+        task: PricingTask,
+        bundle: PricingSnapshotBundle,
+        uploader: R2AssetUploader,
+    ) -> SnapshotCapturePlan:
+        previous_rows = await self.d1.query(
+            """
+            SELECT pricing_region_hash, snapshot_format_version
+            FROM pricing_snapshots
+            WHERE pricing_source_id = ? AND pricing_region_hash IS NOT NULL
+            ORDER BY fetched_at DESC, id DESC
+            LIMIT 1
+            """,
+            [task.pricing_source_id],
+        )
+        previous_region_hash = (
+            str(previous_rows[0].get("pricing_region_hash") or "") if previous_rows else None
+        ) or None
+        previous_format_version = (
+            str(previous_rows[0].get("snapshot_format_version") or "") if previous_rows else None
+        ) or None
+        object_keys = [payload.artifact.object_key for payload in bundle.artifacts]
+        placeholders = ", ".join("?" for _ in object_keys)
+        existing_rows = await self.d1.query(
+            f"SELECT DISTINCT object_key FROM pricing_snapshot_artifacts WHERE object_key IN ({placeholders})",
+            object_keys,
+        ) if object_keys else []
+        existing_keys = {
+            str(row.get("object_key") or "")
+            for row in existing_rows
+            if row.get("object_key")
+        }
+        plan = plan_snapshot_capture(
+            [payload.artifact for payload in bundle.artifacts],
+            previous_region_hash=previous_region_hash,
+            current_region_hash=bundle.region.region_hash,
+            existing_artifact_keys=existing_keys,
+            pipeline_version_changed=bool(
+                previous_format_version and previous_format_version != bundle.format_version
+            ),
+        )
+        payload_by_key = {payload.artifact.object_key: payload for payload in bundle.artifacts}
+        for artifact in plan.upload_artifacts:
+            payload = payload_by_key[artifact.object_key]
+            await uploader.put_object(artifact.object_key, payload.body, artifact.content_type)
+        return plan
+
+    async def insert_snapshot(
+        self,
+        task: PricingTask,
+        result: PricingFetchResult,
+        claims_bundle: PricingSnapshotBundle | None = None,
+    ) -> int:
         text = parse_pricing_html(result.html).text if result.html else ""
         raw_hash = sha256_text(result.html or f"{result.status}:{result.final_url}")
         text_hash = sha256_text(text)
+        if claims_bundle is not None:
+            artifact_keys = {
+                payload.artifact.artifact_type: payload.artifact.object_key
+                for payload in claims_bundle.artifacts
+            }
+            rendered = "browser_run" in result.discovery_method
+            meta = await self.d1.run(
+                """
+                INSERT INTO pricing_snapshots (
+                  pricing_source_id,
+                  pricing_task_id,
+                  final_url,
+                  http_status,
+                  content_type,
+                  html_object_key,
+                  text_object_key,
+                  rendered_html_object_key,
+                  structured_data_object_key,
+                  dom_map_object_key,
+                  pricing_region_hash,
+                  renderer_version,
+                  snapshot_format_version,
+                  requested_locale,
+                  requested_region,
+                  accept_language,
+                  geo_mode,
+                  observed_currency_context,
+                  raw_hash,
+                  semantic_hash,
+                  fetch_mode,
+                  error
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'en-US', 'US',
+                        'en-US,en;q=0.9', 'default_egress', ?, ?, ?, ?, ?)
+                """,
+                [
+                    task.pricing_source_id,
+                    task.task_id,
+                    result.final_url or result.url,
+                    result.status or None,
+                    result.content_type or None,
+                    artifact_keys.get("html"),
+                    artifact_keys.get("text"),
+                    artifact_keys.get("rendered_html"),
+                    artifact_keys.get("structured_data"),
+                    artifact_keys.get("dom_map"),
+                    claims_bundle.region.region_hash,
+                    "cloudflare-browser-run-v1" if rendered else None,
+                    claims_bundle.format_version,
+                    claims_bundle.observed_currency_context,
+                    raw_hash,
+                    text_hash,
+                    "browser_run" if rendered else "static",
+                    result.error or None,
+                ],
+            )
+            return int(meta.get("last_row_id") or 0)
         meta = await self.d1.run(
             """
             INSERT INTO pricing_snapshots (
@@ -5421,6 +8966,308 @@ class D1PricingStore:
             ],
         )
         return int(meta.get("last_row_id") or 0)
+
+    async def insert_pricing_claims_shadow(
+        self,
+        task: PricingTask,
+        snapshot_id: int,
+        bundle: PricingSnapshotBundle,
+        capture_plan: SnapshotCapturePlan | None = None,
+    ) -> dict[str, int]:
+        artifact_statements = [
+            (
+                """
+                INSERT OR IGNORE INTO pricing_snapshot_artifacts (
+                  snapshot_id, artifact_type, state_key, object_key, content_hash,
+                  byte_size, content_type, retention_class
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    snapshot_id,
+                    payload.artifact.artifact_type,
+                    payload.artifact.state_key,
+                    payload.artifact.object_key,
+                    payload.artifact.content_hash,
+                    payload.artifact.byte_size,
+                    payload.artifact.content_type,
+                    (
+                        payload.artifact.retention_class
+                        if capture_plan is None or capture_plan.region_changed
+                        else "diagnostic"
+                    ),
+                ],
+            )
+            for payload in bundle.artifacts
+        ]
+        await self.d1.batch(artifact_statements)
+
+        subject_rows = await self.d1.query(
+            """
+            INSERT INTO pricing_subjects (
+              tool_id, pricing_source_id, subject_type, subject_key, source_scope,
+              region_identity, current_name, first_seen_snapshot_id, last_seen_snapshot_id,
+              identity_metadata_json, last_match_score, last_match_reason, updated_at
+            ) VALUES (?, ?, 'product', 'product:root', 'default', 'pricing-main', ?, ?, ?, '{}',
+                      100, 'stable product root', ?)
+            ON CONFLICT (pricing_source_id, subject_key) DO UPDATE SET
+              last_seen_snapshot_id = excluded.last_seen_snapshot_id,
+              current_name = COALESCE(excluded.current_name, pricing_subjects.current_name),
+              last_match_score = 100,
+              last_match_reason = 'stable product root',
+              updated_at = excluded.updated_at
+            RETURNING id
+            """,
+            [
+                task.tool_id,
+                task.pricing_source_id,
+                task.canonical_slug,
+                snapshot_id,
+                snapshot_id,
+                utc_now_iso(),
+            ],
+        )
+        if not subject_rows:
+            subject_rows = await self.d1.query(
+                "SELECT id FROM pricing_subjects WHERE pricing_source_id = ? AND subject_key = 'product:root'",
+                [task.pricing_source_id],
+            )
+        if not subject_rows:
+            raise RuntimeError("Unable to create or resolve the pricing product subject")
+        subject_id = int(subject_rows[0]["id"])
+
+        inserted = 0
+        continued = 0
+        superseded = 0
+        evidence_rows = 0
+        auto_verified = 0
+        unresolved = 0
+        normalization_failed = 0
+        validation_conflicts = 0
+        semantic_validator_required = 0
+        for raw_claim in bundle.raw_claims:
+            normalization = normalize_raw_claim(raw_claim)
+            validation = validate_raw_claim(
+                raw_claim,
+                normalization,
+                bundle.dom_map,
+                bundle.region,
+            )
+            decision_status = (
+                "auto_verified"
+                if validation.status == "entailed"
+                and normalization.status in {"normalized", "not_applicable"}
+                else "unresolved"
+            )
+            auto_verified += int(decision_status == "auto_verified")
+            unresolved += int(decision_status == "unresolved")
+            normalization_failed += int(normalization.status == "failed")
+            validation_conflicts += int(validation.status == "conflict")
+            semantic_validator_required += int(validation.semantic_required)
+            assert_claim_invariants(
+                ClaimState(
+                    normalization.status,
+                    validation.status,
+                    decision_status,
+                    "active",
+                    "not_eligible",
+                ),
+                claim_type=raw_claim.claim_type,
+            )
+            normalized_value_json = (
+                json.dumps(
+                    normalization.normalized_value,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                )
+                if normalization.normalized_value is not None
+                else None
+            )
+            normalization_errors_json = json.dumps(
+                normalization.errors,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+            validation_result_json = json.dumps(
+                {
+                    "confidence": validation.confidence,
+                    "conflicts": validation.conflicts,
+                    "missing_fields": validation.missing_fields,
+                    "reason": validation.reason,
+                    "semantic_required": validation.semantic_required,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            exact_rows = await self.d1.query(
+                """
+                SELECT id
+                FROM pricing_claims
+                WHERE subject_id = ? AND claim_type = ? AND claim_fingerprint = ?
+                  AND lifecycle_status IN ('active', 'aging')
+                ORDER BY last_seen_at DESC, id DESC
+                LIMIT 1
+                """,
+                [subject_id, raw_claim.claim_type, raw_claim.claim_fingerprint],
+            )
+            if exact_rows:
+                claim_id = int(exact_rows[0]["id"])
+                await self.d1.run(
+                    """
+                    UPDATE pricing_claims
+                    SET last_seen_snapshot_id = ?, consecutive_seen_count = consecutive_seen_count + 1,
+                        miss_count = 0, last_seen_at = ?, lifecycle_status = 'active',
+                        normalized_value_json = ?, normalization_errors_json = ?,
+                        validation_result_json = ?, normalization_status = ?, validation_status = ?,
+                        decision_status = ?, normalization_confidence = ?, completeness_score = ?,
+                        normalizer_version = ?, validator_version = ?, updated_at = ?
+                    WHERE id = ?
+                    """,
+                    [
+                        snapshot_id,
+                        utc_now_iso(),
+                        normalized_value_json,
+                        normalization_errors_json,
+                        validation_result_json,
+                        normalization.status,
+                        validation.status,
+                        decision_status,
+                        normalization.confidence,
+                        normalization.completeness_score,
+                        normalization.version,
+                        validation.version,
+                        utc_now_iso(),
+                        claim_id,
+                    ],
+                )
+                continued += 1
+            else:
+                changed_rows = await self.d1.query(
+                    """
+                    SELECT id
+                    FROM pricing_claims
+                    WHERE subject_id = ? AND claim_type = ?
+                      AND lifecycle_status IN ('active', 'aging')
+                    ORDER BY last_seen_at DESC, id DESC
+                    """,
+                    [subject_id, raw_claim.claim_type],
+                )
+                for changed in changed_rows:
+                    await self.d1.run(
+                        """
+                        UPDATE pricing_claims
+                        SET lifecycle_status = 'superseded',
+                            publication_status = CASE
+                              WHEN publication_status IN ('eligible', 'published') THEN 'withdrawn'
+                              ELSE publication_status
+                            END,
+                            updated_at = ?
+                        WHERE id = ?
+                        """,
+                        [utc_now_iso(), int(changed["id"])],
+                    )
+                    superseded += 1
+                    await self.d1.run(
+                        """
+                        INSERT INTO pricing_claim_events (
+                          claim_id, event_type, event_payload_json
+                        ) VALUES (?, 'change_detected', ?)
+                        """,
+                        [
+                            int(changed["id"]),
+                            json.dumps(
+                                {
+                                    "new_claim_fingerprint": raw_claim.claim_fingerprint,
+                                    "observed_snapshot_id": snapshot_id,
+                                },
+                                separators=(",", ":"),
+                                sort_keys=True,
+                            ),
+                        ],
+                    )
+                claim_rows = await self.d1.query(
+                    """
+                    INSERT INTO pricing_claims (
+                      tool_id, pricing_source_id, snapshot_id, subject_id, subject_key,
+                      claim_type, subject_type, locale_context, region_context,
+                      raw_value_json, normalized_value_json, claim_fingerprint,
+                      normalization_status, validation_status, decision_status,
+                      extraction_confidence, normalization_confidence, completeness_score,
+                      first_seen_snapshot_id, last_seen_snapshot_id, extractor_version,
+                      normalizer_version, validator_version, normalization_errors_json,
+                      validation_result_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'en-US', 'US', ?, ?, ?, ?, ?, ?, 90,
+                              ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    RETURNING id
+                    """,
+                    [
+                        task.tool_id,
+                        task.pricing_source_id,
+                        snapshot_id,
+                        subject_id,
+                        raw_claim.subject_key,
+                        raw_claim.claim_type,
+                        raw_claim.subject_type,
+                        json.dumps(raw_claim.raw_value, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
+                        normalized_value_json,
+                        raw_claim.claim_fingerprint,
+                        normalization.status,
+                        validation.status,
+                        decision_status,
+                        normalization.confidence,
+                        normalization.completeness_score,
+                        snapshot_id,
+                        snapshot_id,
+                        raw_claim.extractor_version,
+                        normalization.version,
+                        validation.version,
+                        normalization_errors_json,
+                        validation_result_json,
+                    ],
+                )
+                if not claim_rows:
+                    raise RuntimeError(f"Unable to insert raw pricing claim {raw_claim.claim_type}")
+                claim_id = int(claim_rows[0]["id"])
+                inserted += 1
+
+            for evidence in raw_claim.evidence:
+                snapshot_evidence_hash = hashlib.sha256(
+                    f"{snapshot_id}:{evidence.evidence_hash}".encode("utf-8")
+                ).hexdigest()
+                await self.d1.run(
+                    """
+                    INSERT OR IGNORE INTO pricing_claim_evidence (
+                      claim_id, snapshot_id, evidence_type, node_id, container_node_id,
+                      table_row, table_column, quote, selector_hint, evidence_hash, display_order
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
+                    """,
+                    [
+                        claim_id,
+                        snapshot_id,
+                        evidence.evidence_type,
+                        evidence.node_id,
+                        evidence.container_node_id,
+                        evidence.table_row,
+                        evidence.table_column,
+                        evidence.quote,
+                        evidence.selector_hint,
+                        snapshot_evidence_hash,
+                    ],
+                )
+                evidence_rows += 1
+        return {
+            "artifacts": len(bundle.artifacts),
+            "claims_inserted": inserted,
+            "claims_continued": continued,
+            "claims_superseded": superseded,
+            "evidence_rows": evidence_rows,
+            "claims_auto_verified": auto_verified,
+            "claims_unresolved": unresolved,
+            "normalization_failed": normalization_failed,
+            "validation_conflicts": validation_conflicts,
+            "semantic_validator_required": semantic_validator_required,
+        }
 
     async def insert_extraction(
         self,
@@ -5893,6 +9740,10 @@ async def process_domain_state(
     max_retries: int,
 ) -> str:
     result = DomainStateResult(status="failed", domain_rating=None, domain_created_at=None, error="not_started")
+    rdap_attempted = False
+    rdap_status: str | None = None
+    rdap_created_at: str | None = None
+    rdap_error: str | None = None
     for attempt in range(max_retries + 1):
         log_info(
             "domain_state.fetch_attempt.start",
@@ -5900,10 +9751,38 @@ async def process_domain_state(
             attempt=attempt + 1,
             max_attempts=max_retries + 1,
         )
+        fetch_rdap = task.fetch_rdap and not rdap_attempted
+        rdap_attempted = rdap_attempted or fetch_rdap
         try:
-            result = await client.fetch(task.normalized_domain)
+            current_result = await client.fetch(
+                task.normalized_domain,
+                fetch_domain_rating=task.fetch_domain_rating,
+                fetch_rdap=fetch_rdap,
+            )
+            if current_result.rdap_status is not None:
+                rdap_status = current_result.rdap_status
+                rdap_created_at = current_result.domain_created_at
+                rdap_error = current_result.rdap_error
+            result = DomainStateResult(
+                status=current_result.status,
+                domain_rating=current_result.domain_rating,
+                domain_created_at=rdap_created_at,
+                error=current_result.error,
+                rdap_status=rdap_status,
+                rdap_error=rdap_error,
+            )
         except Exception as error:
-            result = DomainStateResult(status="failed", domain_rating=None, domain_created_at=None, error=str(error)[:300])
+            if fetch_rdap:
+                rdap_status = "failed"
+                rdap_error = str(error)[:300]
+            result = DomainStateResult(
+                status="failed",
+                domain_rating=None,
+                domain_created_at=rdap_created_at,
+                error=str(error)[:300],
+                rdap_status=rdap_status,
+                rdap_error=rdap_error,
+            )
         log_info(
             "domain_state.fetch_attempt.done",
             domain=task.normalized_domain,
@@ -6091,10 +9970,11 @@ async def process_asset_task(
     store: D1AssetStore,
     public_base_url: str,
     max_retries: int,
-    category_options: list[str],
+    category_options: list[str] | list[CategoryCatalogEntry],
 ) -> str:
     last_error = "not_started"
     last_retryable = True
+    last_retry_after_hours: int | None = None
     for attempt in range(max_retries + 1):
         missing_before = await store.missing_asset_requirements(task.tool_id)
         if not missing_before:
@@ -6133,11 +10013,40 @@ async def process_asset_task(
                 requirements=missing_before,
             )
 
-            if "description" in missing_before:
+            preflight_method = getattr(browser_client, "preflight_homepage", None)
+            if callable(preflight_method):
+                page_assessment = await preflight_method(task)
+                if not await store.renew_lease(task):
+                    return "stale"
+                await store.record_page_quality(task, page_assessment)
+                if not page_assessment.is_valid:
+                    retry_hours = 6 if task.attempts <= 1 else 24 if task.attempts == 2 else 72
+                    raise PageQualityError(page_assessment, retry_after_hours=retry_hours)
+
+            if "description" in missing_before or "content_safety" in missing_before:
                 try:
                     core_result = await browser_client.fetch_homepage_core_metadata(task)
+                    if core_result.page_state != "valid_product_page":
+                        assessment = PageQualityAssessment(
+                            core_result.page_state,
+                            core_result.page_state_reason or "core_metadata_page_invalid",
+                            core_result.page_title,
+                        )
+                        retry_hours = 6 if task.attempts <= 1 else 24 if task.attempts == 2 else 72
+                        raise PageQualityError(assessment, retry_after_hours=retry_hours)
                     if not await store.renew_lease(task):
                         return "stale"
+                    content_safety = ContentSafetyAssessment(
+                        core_result.content_safety_status,
+                        core_result.content_safety_score,
+                        core_result.content_safety_confidence,
+                        core_result.content_safety_reason or "missing_content_safety_reason",
+                        core_result.content_safety_evidence or [],
+                        core_result.content_safety_source or "homepage_core_metadata",
+                    )
+                    stored_safety = await store.save_content_safety(task, content_safety)
+                    if stored_safety.status != "safe":
+                        raise ContentSafetyError(stored_safety)
                     await store.save_tool_localization(task, core_result)
                     if core_result.metadata_error:
                         record_stage_error(
@@ -6146,6 +10055,8 @@ async def process_asset_task(
                             retryable=core_result.metadata_retryable,
                         )
                 except Exception as error:
+                    if isinstance(error, (PageQualityError, ContentSafetyError)):
+                        raise
                     record_stage_error("description", error)
 
             if "key_features" in missing_before:
@@ -6165,18 +10076,59 @@ async def process_asset_task(
 
             if "category" in missing_before:
                 try:
-                    category_result = await browser_client.fetch_homepage_categories(task, category_options)
-                    if not await store.renew_lease(task):
-                        return "stale"
-                    await store.save_tool_categories(task, category_result)
-                    if category_result.metadata_error:
-                        record_stage_error(
-                            "category",
-                            category_result.metadata_error,
-                            retryable=category_result.metadata_retryable,
+                    if await store.category_is_waived(task.tool_id):
+                        log_info(
+                            "assets.category.waived_needs_manual",
+                            tool_id=task.tool_id,
+                            slug=task.canonical_slug,
                         )
+                    else:
+                        category_result = await browser_client.fetch_homepage_categories(
+                            task,
+                            category_options,
+                        )
+                        if not await store.renew_lease(task):
+                            return "stale"
+                        if category_result.metadata_error or (
+                            not category_result.category_l1 and not category_result.category_l2
+                        ):
+                            state = await store.record_category_classification_failure(
+                                task.tool_id,
+                                category_result.metadata_error or "category_empty",
+                                raw_output=category_result.category_raw_output,
+                            )
+                            waived = str(state.get("status") or "") == "needs_manual"
+                            record_stage_error(
+                                "category",
+                                category_result.metadata_error or "category_empty",
+                                # After max attempts, leave the category for an admin instead of retrying forever.
+                                retryable=not waived,
+                            )
+                            if waived:
+                                log_info(
+                                    "assets.category.needs_manual",
+                                    tool_id=task.tool_id,
+                                    slug=task.canonical_slug,
+                                    attempts=state.get("attempts"),
+                                    error=(category_result.metadata_error or "category_empty")[:200],
+                                )
+                        else:
+                            await store.save_tool_categories(task, category_result)
                 except Exception as error:
-                    record_stage_error("category", error)
+                    state = await store.record_category_classification_failure(
+                        task.tool_id,
+                        str(error)[:500],
+                    )
+                    waived = str(state.get("status") or "") == "needs_manual"
+                    record_stage_error("category", error, retryable=not waived)
+                    if waived:
+                        log_info(
+                            "assets.category.needs_manual",
+                            tool_id=task.tool_id,
+                            slug=task.canonical_slug,
+                            attempts=state.get("attempts"),
+                            error=str(error)[:200],
+                        )
 
             if "screenshot" in missing_before:
                 try:
@@ -6229,6 +10181,9 @@ async def process_asset_task(
                 for requirement in missing_requirements
                 if requirement != "favicon"
             ]
+            # Category may still appear missing if migration not applied; double-check waiver.
+            if "category" in blocking_requirements and await store.category_is_waived(task.tool_id):
+                blocking_requirements = [item for item in blocking_requirements if item != "category"]
             if blocking_requirements:
                 details = [f"missing={','.join(blocking_requirements)}"]
                 if stage_errors:
@@ -6253,6 +10208,7 @@ async def process_asset_task(
         except Exception as error:
             last_error = str(error)[:900]
             last_retryable = bool(getattr(error, "retryable", True))
+            last_retry_after_hours = getattr(error, "retry_after_hours", None)
             log_error(
                 "asset_task.fetch_attempt.failed",
                 tool_id=task.tool_id,
@@ -6261,13 +10217,125 @@ async def process_asset_task(
                 attempt=attempt + 1,
                 error=last_error,
             )
-            if attempt < max_retries and last_retryable:
+            if attempt < max_retries and last_retryable and not isinstance(error, PageQualityError):
                 await asyncio.sleep(random.uniform(1.0, 3.0))
             else:
                 break
 
-    completed = await store.complete_task(task, "failed", last_error, retryable=last_retryable)
+    completed = await store.complete_task(
+        task,
+        "failed",
+        last_error,
+        retryable=last_retryable,
+        retry_after_hours=last_retry_after_hours,
+    )
     return "failed" if completed else "stale"
+
+
+DOMAIN_TRAFFIC_COUNTRY_DELETE_SQL = """
+    DELETE FROM domain_traffic_country_monthly
+    WHERE normalized_domain = ? AND source = ? AND traffic_month = ?
+"""
+
+
+DOMAIN_TRAFFIC_COUNTRY_REFRESH_ESTIMATES_SQL = """
+    UPDATE domain_traffic_country_monthly
+    SET estimated_visits = cast(round(? * traffic_share_bps / 10000.0) AS INTEGER),
+        updated_at = ?
+    WHERE normalized_domain = ? AND source = ? AND traffic_month = ?
+"""
+
+
+DOMAIN_TRAFFIC_COUNTRY_UPSERT_SQL = """
+    INSERT INTO domain_traffic_country_monthly (
+      normalized_domain, source, traffic_month, country_code, country_position,
+      traffic_share_bps, estimated_visits, source_snapshot_id, captured_at
+    )
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT (normalized_domain, source, traffic_month, country_code) DO UPDATE
+    SET country_position = excluded.country_position,
+        traffic_share_bps = excluded.traffic_share_bps,
+        estimated_visits = excluded.estimated_visits,
+        source_snapshot_id = coalesce(
+          excluded.source_snapshot_id,
+          domain_traffic_country_monthly.source_snapshot_id
+        ),
+        captured_at = excluded.captured_at,
+        updated_at = excluded.captured_at
+"""
+
+
+def build_domain_traffic_country_upsert_statements(
+    domain: str,
+    rows: list[dict[str, Any]],
+    *,
+    captured_at: str,
+) -> list[tuple[str, list[Any]]]:
+    statements: list[tuple[str, list[Any]]] = []
+    for row in rows:
+        traffic_month = str(row.get("traffic_month") or "").strip()
+        if not traffic_month:
+            continue
+
+        observed_countries: list[tuple[int, str, int]] = []
+        seen_country_codes: set[str] = set()
+        for country_position in range(1, 6):
+            country_code = normalize_country_code(row.get(f"top_country_{country_position}"))
+            traffic_share_bps = traffic_share_to_bps(
+                row.get(f"top_country_{country_position}_traffic_share")
+            )
+            if country_code is None or traffic_share_bps is None or country_code in seen_country_codes:
+                continue
+            seen_country_codes.add(country_code)
+            observed_countries.append((country_position, country_code, traffic_share_bps))
+
+        if not observed_countries:
+            visits = to_integer(row.get("visits"))
+            if visits is not None:
+                # Compact historical rows carry visits but no TopCountryShares.
+                # Preserve the last observed shares and keep their estimate in sync.
+                statements.append(
+                    (
+                        DOMAIN_TRAFFIC_COUNTRY_REFRESH_ESTIMATES_SQL,
+                        [visits, captured_at, domain, TRAFFIC_SOURCE, traffic_month],
+                    )
+                )
+            continue
+
+        # Reconcile a newly observed Top 5 as a set. This removes countries that
+        # fell out of a later complete provider response.
+        statements.append(
+            (
+                DOMAIN_TRAFFIC_COUNTRY_DELETE_SQL,
+                [domain, TRAFFIC_SOURCE, traffic_month],
+            )
+        )
+        source_snapshot_id = to_integer(row.get("_source_snapshot_id"))
+        for country_position, country_code, traffic_share_bps in observed_countries:
+            statements.append(
+                (
+                    DOMAIN_TRAFFIC_COUNTRY_UPSERT_SQL,
+                    [
+                        domain,
+                        TRAFFIC_SOURCE,
+                        traffic_month,
+                        country_code,
+                        country_position,
+                        traffic_share_bps,
+                        estimate_visits_from_bps(row.get("visits"), traffic_share_bps),
+                        source_snapshot_id,
+                        captured_at,
+                    ],
+                )
+            )
+    return statements
+
+
+def is_missing_market_country_schema_error(error: Exception) -> bool:
+    message = str(error).lower()
+    return "domain_traffic_country_monthly" in message and (
+        "no such table" in message or "table does not exist" in message
+    )
 
 
 async def run_openai_pricing_extraction(
@@ -6420,6 +10488,7 @@ async def process_pricing_task(
     max_retries: int,
     approve_pricing: bool,
     dry_run: bool,
+    claims_shadow_uploader: R2AssetUploader | None = None,
 ) -> str:
     result = PricingFetchResult(task.source_url, task.source_url, 0, "", "", "not_started")
     for attempt in range(max_retries + 1):
@@ -6444,6 +10513,7 @@ async def process_pricing_task(
         if attempt < max_retries:
             await asyncio.sleep(random.uniform(1.0, 3.0))
 
+    original_fetch_result = result
     payload, review_status, confidence, validation_errors = extract_pricing_payload(
         result.html,
         task.source_url,
@@ -6539,7 +10609,78 @@ async def process_pricing_task(
 
     if not await store.renew_lease(task):
         return "stale"
-    snapshot_id = await store.insert_snapshot(task, result)
+    claims_bundle: PricingSnapshotBundle | None = None
+    shadow_plan: SnapshotCapturePlan | None = None
+    if claims_shadow_uploader is not None and result.html:
+        try:
+            claims_bundle = build_pricing_snapshot_bundle(
+                result.html,
+                rendered="browser_run" in result.discovery_method,
+                original_html=(
+                    original_fetch_result.html
+                    if "browser_run" in result.discovery_method and original_fetch_result.html
+                    else None
+                ),
+            )
+            shadow_plan = await store.prepare_pricing_claims_shadow(
+                task,
+                claims_bundle,
+                claims_shadow_uploader,
+            )
+            log_info(
+                "pricing_claims_shadow.prepared",
+                task_id=task.task_id,
+                region_found=bool(claims_bundle.region.root_node_ids),
+                region_changed=shadow_plan.region_changed,
+                run_extraction=shadow_plan.run_extraction,
+                raw_claims=len(claims_bundle.raw_claims),
+                artifacts_uploaded=len(shadow_plan.upload_artifacts),
+            )
+        except Exception as error:
+            claims_bundle = None
+            shadow_plan = None
+            log_error(
+                "pricing_claims_shadow.prepare_failed",
+                task_id=task.task_id,
+                error=str(error)[:500],
+            )
+
+    try:
+        snapshot_id = await store.insert_snapshot(task, result, claims_bundle)
+    except Exception as error:
+        if claims_bundle is None:
+            raise
+        log_error(
+            "pricing_claims_shadow.snapshot_insert_fallback",
+            task_id=task.task_id,
+            error=str(error)[:500],
+        )
+        claims_bundle = None
+        shadow_plan = None
+        snapshot_id = await store.insert_snapshot(task, result)
+
+    if claims_bundle is not None:
+        try:
+            shadow_counts = await store.insert_pricing_claims_shadow(
+                task,
+                snapshot_id,
+                claims_bundle,
+                shadow_plan,
+            )
+            log_info(
+                "pricing_claims_shadow.persisted",
+                task_id=task.task_id,
+                snapshot_id=snapshot_id,
+                region_changed=shadow_plan.region_changed if shadow_plan is not None else None,
+                **shadow_counts,
+            )
+        except Exception as error:
+            log_error(
+                "pricing_claims_shadow.persist_failed",
+                task_id=task.task_id,
+                snapshot_id=snapshot_id,
+                error=str(error)[:500],
+            )
     await store.insert_extraction(
         snapshot_id,
         payload,
@@ -6566,12 +10707,19 @@ async def process_pricing_task(
 
 async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = None) -> dict[str, int]:
     effective_limit = limit or config.asset_limit
-    log_info("assets_runner.batch.start", limit=effective_limit, concurrency=config.concurrency)
+    log_info(
+        "assets_runner.batch.start",
+        limit=effective_limit,
+        concurrency=config.concurrency,
+        category_model=config.category_classification_model,
+        category_fallback_model=config.category_classification_fallback_model,
+        category_prompt_version=CATEGORY_CLASSIFICATION_PROMPT_VERSION,
+    )
     browser_client = CloudflareBrowserRunAssetClient(config)
     uploader = R2AssetUploader(config)
     await uploader.check_access()
     store = D1AssetStore(d1)
-    category_options = await store.category_options()
+    category_options = await store.category_catalog()
     queued = await store.queue_missing_asset_tasks(effective_limit)
     log_info("assets_runner.queue_missing_asset_tasks.done", queued=queued)
     tasks = await store.claim_due_tasks(effective_limit, config.runner_instance_id)
@@ -6758,12 +10906,18 @@ async def _run_pricing_once(
     timeout_seconds: int | None = None,
 ) -> dict[str, int]:
     effective_limit = limit or config.pricing_limit
+    assert_safe_pricing_claim_flags(
+        shadow_enabled=config.pricing_claims_shadow,
+        publish_enabled=config.pricing_claims_publish,
+    )
     log_info(
         "pricing_runner.batch.start",
         limit=effective_limit,
         concurrency=config.concurrency,
         dry_run=dry_run,
         approve_pricing=approve_pricing,
+        pricing_claims_shadow=config.pricing_claims_shadow,
+        pricing_claims_publish=config.pricing_claims_publish,
     )
     store = D1PricingStore(d1)
     materialized = 0
@@ -6808,6 +10962,16 @@ async def _run_pricing_once(
         "pricing_runner.browser_rendering_config",
         enabled=browser_renderer is not None,
         timeout_seconds=config.browser_rendering_timeout_seconds if browser_renderer is not None else None,
+    )
+    claims_shadow_uploader = (
+        R2AssetUploader(config)
+        if config.pricing_claims_shadow and not dry_run
+        else None
+    )
+    log_info(
+        "pricing_runner.claims_shadow_storage_config",
+        enabled=claims_shadow_uploader is not None,
+        bucket=config.r2_bucket if claims_shadow_uploader is not None else None,
     )
     queued = 0
     discovered_sources = 0
@@ -6855,6 +11019,7 @@ async def _run_pricing_once(
                     config.max_retries,
                     approve_pricing=approve_pricing,
                     dry_run=dry_run,
+                    claims_shadow_uploader=claims_shadow_uploader,
                 )
             except Exception as error:
                 status = "failed" if dry_run else "manual_review"
@@ -6974,6 +11139,54 @@ async def run_domain_state_loop(config: Config, limit: int | None, interval_seco
         await asyncio.sleep(interval_seconds)
 
 
+async def run_taxonomy_once(config: Config) -> dict[str, int]:
+    from taxonomy_shadow import run_shadow_taxonomy
+
+    async with D1Client(config) as telemetry_d1:
+        return await run_with_telemetry(
+            config,
+            telemetry_d1,
+            "taxonomy",
+            lambda: run_shadow_taxonomy(
+                config,
+                config.taxonomy_limit,
+                allow_unresolved_entity=True,
+                include_capabilities=False,
+                concurrency=config.taxonomy_concurrency,
+                auto_accept_threshold=config.taxonomy_auto_accept_confidence,
+            ),
+        )
+
+
+async def run_taxonomy_loop(config: Config) -> None:
+    log_info(
+        "taxonomy_runner.loop.start",
+        interval_seconds=config.taxonomy_interval_seconds,
+        limit=config.taxonomy_limit,
+        concurrency=config.taxonomy_concurrency,
+        auto_accept_confidence=config.taxonomy_auto_accept_confidence,
+        primary_only=True,
+    )
+    while True:
+        delay = config.taxonomy_interval_seconds
+        try:
+            counts = await run_taxonomy_once(config)
+            log_info("taxonomy_runner.batch.summary", **counts)
+            if int(counts.get("provider_blocked") or 0) > 0:
+                delay = config.taxonomy_provider_backoff_seconds
+                log_error(
+                    "taxonomy_runner.provider_backoff",
+                    delay_seconds=delay,
+                    provider_blocked=counts.get("provider_blocked", 0),
+                    deferred=counts.get("deferred", 0),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log_error("taxonomy_runner.batch.failed", error=str(error)[:500])
+        await asyncio.sleep(delay)
+
+
 async def run_all_loop(config: Config, limit: int | None, interval_seconds: int, timeout_seconds: int | None) -> None:
     shared_interval = interval_seconds or 300
     assets_interval = max(60, shared_interval // 2)
@@ -6986,13 +11199,179 @@ async def run_all_loop(config: Config, limit: int | None, interval_seconds: int,
         traffic_interval_seconds=traffic_interval,
         domain_state_interval_seconds=domain_state_interval,
         pricing_interval_seconds=pricing_interval,
+        taxonomy_enabled=config.taxonomy_auto_enabled,
+        taxonomy_interval_seconds=config.taxonomy_interval_seconds,
     )
-    await asyncio.gather(
+    loops = [
         run_assets_loop(config, config.asset_limit, assets_interval),
         run_loop(config, limit or config.limit, traffic_interval),
         run_domain_state_loop(config, config.domain_state_limit, domain_state_interval),
         run_pricing_loop(config, config.pricing_limit, pricing_interval, None, False, False, timeout_seconds),
-    )
+    ]
+    if config.taxonomy_auto_enabled:
+        loops.append(run_taxonomy_loop(config))
+    await asyncio.gather(*loops)
+
+
+async def backfill_published_categories(
+    config: Config,
+    limit: int | None = None,
+    *,
+    dry_run: bool = False,
+    tool_ids: list[int] | None = None,
+    page_size: int = 25,
+) -> dict[str, int]:
+    """Reclassify published tools that still carry pre-hierarchical category data.
+
+    Safety rules:
+    - only status=published
+    - never touch rejected
+    - never overwrite source=manual assignments
+    - only replace live categories after a successful L1 (and valid L2 if provided)
+    - failures keep the previous live categories and write audit/error only
+    - resume via category_classification_raw.backfill / hierarchical prompt markers
+    """
+    effective_limit = limit if limit is not None else 100
+    if effective_limit <= 0:
+        effective_limit = 100
+
+    counts = {
+        "scanned": 0,
+        "applied": 0,
+        "would_apply": 0,
+        "failed": 0,
+        "skipped": 0,
+        "unchanged": 0,
+    }
+    after_tool_id = 0
+
+    async with D1Client(config) as d1:
+        store = D1AssetStore(d1)
+        browser_client = CloudflareBrowserRunAssetClient(config)
+        catalog = await store.category_catalog()
+        log_info(
+            "published_category_backfill.start",
+            limit=effective_limit,
+            dry_run=dry_run,
+            tool_ids=len(tool_ids or []),
+            catalog_size=len(catalog),
+            backfill_version=PUBLISHED_CATEGORY_BACKFILL_VERSION,
+            prompt_version=CATEGORY_CLASSIFICATION_PROMPT_VERSION,
+            model=config.category_classification_model,
+        )
+
+        while counts["scanned"] < effective_limit:
+            remaining = min(page_size, effective_limit - counts["scanned"])
+            if remaining <= 0:
+                break
+            tasks = await store.published_legacy_category_tasks(
+                remaining,
+                after_tool_id=after_tool_id,
+                tool_ids=tool_ids,
+            )
+            if not tasks:
+                break
+
+            for task in tasks:
+                after_tool_id = max(after_tool_id, task.tool_id)
+                counts["scanned"] += 1
+                try:
+                    result = await browser_client.fetch_homepage_categories(task, catalog)
+                except Exception as error:
+                    counts["failed"] += 1
+                    message = str(error)[:500] or type(error).__name__
+                    log_error(
+                        "published_category_backfill.fetch_failed",
+                        tool_id=task.tool_id,
+                        slug=task.canonical_slug,
+                        error=message,
+                    )
+                    await store.record_published_category_backfill_failure(
+                        task,
+                        error=message,
+                        dry_run=dry_run,
+                    )
+                    continue
+
+                if not published_category_backfill_success(result):
+                    counts["failed"] += 1
+                    message = result.metadata_error or "category_backfill_invalid_result"
+                    log_error(
+                        "published_category_backfill.invalid_result",
+                        tool_id=task.tool_id,
+                        slug=task.canonical_slug,
+                        error=message,
+                        category_l1=result.category_l1,
+                        category_l2=result.category_l2,
+                    )
+                    await store.record_published_category_backfill_failure(
+                        task,
+                        error=message,
+                        raw_output=result.category_raw_output,
+                        dry_run=dry_run,
+                    )
+                    continue
+
+                try:
+                    summary = await store.apply_published_category_backfill(
+                        task,
+                        result,
+                        dry_run=dry_run,
+                    )
+                except Exception as error:
+                    counts["failed"] += 1
+                    message = str(error)[:500] or type(error).__name__
+                    log_error(
+                        "published_category_backfill.apply_failed",
+                        tool_id=task.tool_id,
+                        slug=task.canonical_slug,
+                        error=message,
+                    )
+                    await store.record_published_category_backfill_failure(
+                        task,
+                        error=message,
+                        raw_output=result.category_raw_output,
+                        dry_run=dry_run,
+                    )
+                    continue
+
+                old_ids = sorted(
+                    int(item["category_id"])
+                    for item in (summary.get("old") or {}).get("categories") or []
+                    if item.get("category_id")
+                )
+                new_ids = sorted(int(value) for value in (summary.get("new") or {}).get("category_ids") or [])
+                if old_ids == new_ids and int((summary.get("old") or {}).get("primary_category_id") or 0) == int(
+                    (summary.get("new") or {}).get("primary_category_id") or 0
+                ):
+                    counts["unchanged"] += 1
+                if dry_run:
+                    counts["would_apply"] += 1
+                else:
+                    counts["applied"] += 1
+                log_info(
+                    "published_category_backfill.item",
+                    tool_id=task.tool_id,
+                    slug=task.canonical_slug,
+                    dry_run=dry_run,
+                    applied=bool(summary.get("applied")),
+                    category_l1=result.category_l1,
+                    category_l2=result.category_l2,
+                    old_primary=(summary.get("old") or {}).get("primary_category_id"),
+                    new_primary=(summary.get("new") or {}).get("primary_category_id"),
+                )
+
+            # Explicit tool_ids lists are processed in one pass.
+            if tool_ids:
+                break
+
+            log_info(
+                "published_category_backfill.page",
+                after_tool_id=after_tool_id,
+                **counts,
+            )
+
+    return counts
 
 
 def parse_args() -> argparse.Namespace:
@@ -7006,27 +11385,207 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--backfill-traffic-monthly",
         action="store_true",
-        help="rebuild domain_traffic_monthly from raw Similarweb snapshots",
+        help=(
+            "rebuild domain_traffic_monthly and domain_traffic_country_monthly "
+            "from raw Similarweb snapshots"
+        ),
+    )
+    parser.add_argument(
+        "--after-snapshot-id",
+        type=int,
+        default=0,
+        help=(
+            "with --backfill-traffic-monthly: resume after this completed "
+            "domain_traffic_snapshots id"
+        ),
+    )
+    parser.add_argument(
+        "--build-market-snapshot",
+        action="store_true",
+        help="build a complete market serving candidate from release-gated traffic data",
+    )
+    parser.add_argument(
+        "--market-traffic-month",
+        default=None,
+        help="with --build-market-snapshot: explicit traffic month (default: latest release-gated month)",
+    )
+    parser.add_argument(
+        "--activate-market-snapshot",
+        action="store_true",
+        help="with --build-market-snapshot: atomically activate the validated candidate",
+    )
+    parser.add_argument(
+        "--activate-market-snapshot-id",
+        type=int,
+        default=None,
+        help=(
+            "WRITE: apply coverage gates, then atomically activate an existing "
+            "candidate by id without rebuilding it; mutually exclusive with "
+            "--build-market-snapshot"
+        ),
+    )
+    parser.add_argument(
+        "--backfill-published-categories",
+        action="store_true",
+        help="reclassify published tools that still have pre-hierarchical category data",
+    )
+    parser.add_argument(
+        "--shadow-taxonomy",
+        action="store_true",
+        help="P2A Shadow Mode: entity-gated primary leaf + optional capabilities (no legacy category writes)",
+    )
+    parser.add_argument(
+        "--allow-unresolved-entity",
+        action="store_true",
+        help="with --shadow-taxonomy: include entity_kind=unresolved published tools",
+    )
+    parser.add_argument(
+        "--primary-only",
+        action="store_true",
+        help="with --shadow-taxonomy: classify entity + primary leaf and defer capabilities",
+    )
+    parser.add_argument(
+        "--after-tool-id",
+        type=int,
+        default=0,
+        help="with --shadow-taxonomy: select only tools after this id (resume cursor)",
+    )
+    parser.add_argument(
+        "--shadow-concurrency",
+        type=int,
+        default=1,
+        help="with --shadow-taxonomy: concurrent tool workers, 1-8 (default: 1)",
+    )
+    parser.add_argument(
+        "--eval-gold",
+        action="store_true",
+        help="P2B: evaluate Shadow vs Gold CSV and write metrics/diff report (read-only for legacy tables)",
+    )
+    parser.add_argument(
+        "--gold-csv",
+        default=None,
+        help="path to Gold dataset CSV (default: docs/taxonomy/gold-dataset-seed-draft.csv)",
+    )
+    parser.add_argument(
+        "--report-dir",
+        default=None,
+        help="directory for Gold eval reports (default: docs/taxonomy/reports)",
+    )
+    parser.add_argument(
+        "--auto-accepted-threshold",
+        type=float,
+        default=None,
+        help="simulate auto_accepted when provisional confidence >= threshold (default 0.85)",
     )
     parser.add_argument("--all", action="store_true", help="run traffic, domain-state, pricing, and assets loops in one process")
     parser.add_argument("--approve-pricing", action="store_true", help="write approved pricing extractions into active catalogs")
-    parser.add_argument("--dry-run", action="store_true", help="for pricing mode, fetch and extract without D1 writes")
-    parser.add_argument("--task-id", type=int, action="append", default=[], help="pricing task id to run; can be repeated")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="for pricing, market snapshot, category backfill, or Shadow taxonomy: run without writes",
+    )
+    parser.add_argument(
+        "--task-id",
+        type=int,
+        action="append",
+        default=[],
+        help="pricing task id, or published tool id with category/Shadow modes; can be repeated",
+    )
     parser.add_argument("--timeout", type=int, default=None, help="pricing HTTP timeout in seconds")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--interval-seconds", type=int, default=None)
     args = parser.parse_args()
-    selected = [args.pricing, args.assets, args.domain_state, args.backfill_traffic_monthly, args.all]
+    selected = [
+        args.pricing,
+        args.assets,
+        args.domain_state,
+        args.backfill_traffic_monthly,
+        args.build_market_snapshot,
+        args.activate_market_snapshot_id is not None,
+        args.backfill_published_categories,
+        args.shadow_taxonomy,
+        args.eval_gold,
+        args.all,
+    ]
     if sum(1 for value in selected if value) > 1:
-        parser.error("--pricing, --assets, --domain-state, --backfill-traffic-monthly, and --all are mutually exclusive")
+        parser.error(
+            "--pricing, --assets, --domain-state, --backfill-traffic-monthly, "
+            "--build-market-snapshot, --activate-market-snapshot-id, "
+            "--backfill-published-categories, --shadow-taxonomy, "
+            "--eval-gold, and --all are mutually exclusive"
+        )
     if args.all and not args.loop:
         parser.error("--all requires --loop")
     if args.approve_pricing:
         parser.error("--approve-pricing is retired; approve the stored extraction in ainav Admin")
-    if (args.approve_pricing or args.task_id or args.dry_run) and not args.pricing:
-        parser.error("--approve-pricing, --task-id, and --dry-run require --pricing")
+    if args.approve_pricing and not args.pricing:
+        parser.error("--approve-pricing requires --pricing")
+    if args.task_id and not (
+        args.pricing
+        or args.backfill_published_categories
+        or args.shadow_taxonomy
+        or args.eval_gold
+    ):
+        parser.error(
+            "--task-id requires --pricing, --backfill-published-categories, "
+            "--shadow-taxonomy, or --eval-gold"
+        )
+    if args.dry_run and not (
+        args.pricing
+        or args.build_market_snapshot
+        or args.backfill_published_categories
+        or args.shadow_taxonomy
+    ):
+        parser.error(
+            "--dry-run requires --pricing, --build-market-snapshot, "
+            "--backfill-published-categories, or --shadow-taxonomy"
+        )
+    if args.market_traffic_month and not args.build_market_snapshot:
+        parser.error("--market-traffic-month requires --build-market-snapshot")
+    if args.after_snapshot_id and not args.backfill_traffic_monthly:
+        parser.error("--after-snapshot-id requires --backfill-traffic-monthly")
+    if args.after_snapshot_id < 0:
+        parser.error("--after-snapshot-id must be non-negative")
+    if args.activate_market_snapshot and not args.build_market_snapshot:
+        parser.error("--activate-market-snapshot requires --build-market-snapshot")
+    if args.activate_market_snapshot and args.dry_run:
+        parser.error("--activate-market-snapshot cannot be combined with --dry-run")
+    if args.activate_market_snapshot_id is not None and args.activate_market_snapshot_id <= 0:
+        parser.error("--activate-market-snapshot-id must be positive")
+    if args.allow_unresolved_entity and not args.shadow_taxonomy:
+        parser.error("--allow-unresolved-entity requires --shadow-taxonomy")
+    if args.primary_only and not args.shadow_taxonomy:
+        parser.error("--primary-only requires --shadow-taxonomy")
+    if args.after_tool_id and not args.shadow_taxonomy:
+        parser.error("--after-tool-id requires --shadow-taxonomy")
+    if args.after_tool_id < 0:
+        parser.error("--after-tool-id must be non-negative")
+    if args.after_tool_id and args.task_id:
+        parser.error("--after-tool-id cannot be combined with --task-id")
+    if args.shadow_concurrency != 1 and not args.shadow_taxonomy:
+        parser.error("--shadow-concurrency requires --shadow-taxonomy")
+    if not 1 <= args.shadow_concurrency <= 8:
+        parser.error("--shadow-concurrency must be between 1 and 8")
     if args.backfill_traffic_monthly and args.loop:
         parser.error("--backfill-traffic-monthly cannot be combined with --loop")
+    if args.build_market_snapshot and args.loop:
+        parser.error("--build-market-snapshot cannot be combined with --loop")
+    if args.activate_market_snapshot_id is not None and args.loop:
+        parser.error("--activate-market-snapshot-id cannot be combined with --loop")
+    if args.backfill_published_categories and args.loop:
+        parser.error("--backfill-published-categories cannot be combined with --loop")
+    if args.shadow_taxonomy and args.loop:
+        parser.error("--shadow-taxonomy cannot be combined with --loop")
+    if args.eval_gold and args.loop:
+        parser.error("--eval-gold cannot be combined with --loop")
+    if args.task_id and args.eval_gold:
+        pass  # allowed: filter gold subset
+    if args.gold_csv and not args.eval_gold:
+        parser.error("--gold-csv requires --eval-gold")
+    if args.report_dir and not args.eval_gold:
+        parser.error("--report-dir requires --eval-gold")
+    if args.auto_accepted_threshold is not None and not args.eval_gold:
+        parser.error("--auto-accepted-threshold requires --eval-gold")
     return args
 
 
@@ -7038,12 +11597,99 @@ def main() -> None:
             or args.assets
             or args.domain_state
             or args.backfill_traffic_monthly
+            or args.build_market_snapshot
+            or args.activate_market_snapshot_id is not None
+            or args.backfill_published_categories
+            or args.shadow_taxonomy
+            or args.eval_gold
         )
     )
     interval_seconds = args.interval_seconds or config.poll_interval_seconds
+    if args.activate_market_snapshot_id is not None:
+        result = asyncio.run(
+            activate_market_snapshot(config, args.activate_market_snapshot_id)
+        )
+        log_info("market_snapshot.activate.summary", **result)
+        return
+    if args.build_market_snapshot:
+        if args.dry_run:
+            result = asyncio.run(
+                preview_market_snapshot(config, args.market_traffic_month)
+            )
+        else:
+            result = asyncio.run(
+                build_market_snapshot(
+                    config,
+                    args.market_traffic_month,
+                    activate=args.activate_market_snapshot,
+                )
+            )
+        log_info("market_snapshot.build.summary", **result)
+        return
     if args.backfill_traffic_monthly:
-        counts = asyncio.run(backfill_domain_traffic_monthly(config, args.limit))
+        counts = asyncio.run(
+            backfill_domain_traffic_monthly(
+                config,
+                args.limit,
+                after_snapshot_id=args.after_snapshot_id,
+            )
+        )
         log_info("traffic_projection_backfill.summary", **counts)
+        return
+    if args.backfill_published_categories:
+        counts = asyncio.run(
+            backfill_published_categories(
+                config,
+                args.limit,
+                dry_run=args.dry_run,
+                tool_ids=args.task_id or None,
+            )
+        )
+        log_info("published_category_backfill.summary", **counts)
+        return
+    if args.shadow_taxonomy:
+        from taxonomy_shadow import run_shadow_taxonomy
+
+        counts = asyncio.run(
+            run_shadow_taxonomy(
+                config,
+                args.limit,
+                dry_run=args.dry_run,
+                tool_ids=args.task_id or None,
+                allow_unresolved_entity=args.allow_unresolved_entity,
+                after_tool_id=args.after_tool_id,
+                include_capabilities=not args.primary_only,
+                concurrency=args.shadow_concurrency,
+                auto_accept_threshold=config.taxonomy_auto_accept_confidence,
+            )
+        )
+        log_info("shadow_taxonomy.summary", **counts)
+        return
+    if args.eval_gold:
+        from taxonomy_eval import (
+            DEFAULT_AUTO_ACCEPTED_THRESHOLD,
+            default_gold_csv_path,
+            default_report_dir,
+            run_gold_evaluation,
+        )
+
+        gold_csv = args.gold_csv or str(default_gold_csv_path())
+        report_dir = args.report_dir or str(default_report_dir())
+        threshold = (
+            DEFAULT_AUTO_ACCEPTED_THRESHOLD
+            if args.auto_accepted_threshold is None
+            else float(args.auto_accepted_threshold)
+        )
+        result = asyncio.run(
+            run_gold_evaluation(
+                config,
+                gold_csv=gold_csv,
+                report_dir=report_dir,
+                auto_accepted_threshold=threshold,
+                tool_ids=args.task_id or None,
+            )
+        )
+        log_info("gold_eval.done", **result["summary"])
         return
     if args.all:
         asyncio.run(run_all_loop(config, args.limit, interval_seconds, args.timeout))
