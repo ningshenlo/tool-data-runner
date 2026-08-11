@@ -8379,6 +8379,38 @@ class D1DomainStateStore:
     def __init__(self, d1: D1Client):
         self.d1 = d1
 
+    async def requeue_missing_credential_tasks(self, limit: int) -> int:
+        now = utc_now_iso()
+        meta = await self.d1.run(
+            """
+            UPDATE domain_state_tasks
+            SET status = 'queued',
+                attempts = 0,
+                generation = generation + 1,
+                last_queued_at = ?,
+                next_retry_at = NULL,
+                last_error = NULL,
+                lease_owner = NULL,
+                lease_token = NULL,
+                lease_expires_at = NULL,
+                dead_letter_at = NULL,
+                updated_at = ?
+            WHERE rowid IN (
+              SELECT rowid
+              FROM domain_state_tasks
+              WHERE source = ?
+                AND status = 'failed'
+                AND attempts >= max_attempts
+                AND dead_letter_at IS NOT NULL
+                AND last_error = 'AHREF_API_KEY is required for Ahrefs Domain Rating requests'
+              ORDER BY updated_at, normalized_domain
+              LIMIT ?
+            )
+            """,
+            [now, now, DOMAIN_STATE_SOURCE, limit],
+        )
+        return int(meta.get("changes") or 0)
+
     async def queue_due_tasks(self, limit: int, max_age_days: int) -> int:
         stale_before = iso_delta(days=-max_age_days)
         now = utc_now_iso()
@@ -8403,9 +8435,16 @@ class D1DomainStateStore:
               LEFT JOIN domain_states ds
                 ON ds.normalized_domain = t.normalized_domain
                AND ds.source = ?
+              LEFT JOIN domain_state_tasks existing_task
+                ON existing_task.normalized_domain = t.normalized_domain
+               AND existing_task.source = ?
               WHERE t.status IN ('published', 'pending_enrich', 'pending_review')
                 AND t.duplicate_of_tool_id IS NULL
                 AND trim(t.normalized_domain) <> ''
+                AND (
+                  existing_task.normalized_domain IS NULL
+                  OR existing_task.status IN ('done', 'no_data')
+                )
                 AND (
                   ds.last_crawled_at IS NULL
                   OR ds.last_crawled_at < ?
@@ -8440,6 +8479,7 @@ class D1DomainStateStore:
                 now,
                 now,
                 stale_before,
+                DOMAIN_STATE_SOURCE,
                 DOMAIN_STATE_SOURCE,
                 stale_before,
                 limit,
@@ -10038,6 +10078,15 @@ async def _run_domain_state_once(config: Config, d1: D1Client, limit: int | None
     log_info("domain_state_runner.batch.start", limit=effective_limit, concurrency=config.concurrency)
     store = D1DomainStateStore(d1)
     client = DomainStateClient(config.ahref_api_key)
+    credential_requeued = (
+        await store.requeue_missing_credential_tasks(effective_limit)
+        if config.ahref_api_key
+        else 0
+    )
+    log_info(
+        "domain_state_runner.requeue_missing_credential_tasks.done",
+        requeued=credential_requeued,
+    )
     queued = await store.queue_due_tasks(effective_limit, config.domain_state_max_age_days)
     log_info("domain_state_runner.queue_due_tasks.done", queued=queued)
     tasks = await store.claim_due_tasks(effective_limit, config.runner_instance_id)
@@ -10045,6 +10094,7 @@ async def _run_domain_state_once(config: Config, d1: D1Client, limit: int | None
 
     semaphore = asyncio.Semaphore(config.concurrency)
     counts = {
+        "credential_requeued": credential_requeued,
         "queued": queued,
         "claimed": len(tasks),
         "done": 0,
@@ -10365,11 +10415,12 @@ async def process_asset_task(
                     record_stage_error("favicon", error)
 
             missing_requirements = await store.missing_asset_requirements(task.tool_id)
-            blocking_requirements = [
-                requirement
-                for requirement in missing_requirements
-                if requirement != "favicon"
-            ]
+            # Screenshot and favicon are both durable catalog assets. A missing
+            # favicon must keep the task in the bounded retry state machine;
+            # marking the task done here would let the 24-hour missing-data scan
+            # revive it forever. Successful stages are still skipped on every
+            # retry because missing_before is recomputed at the top of the loop.
+            blocking_requirements = list(missing_requirements)
             # Category may still appear missing if migration not applied; double-check waiver.
             if "category" in blocking_requirements and await store.category_is_waived(task.tool_id):
                 blocking_requirements = [item for item in blocking_requirements if item != "category"]

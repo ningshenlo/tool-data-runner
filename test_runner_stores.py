@@ -893,6 +893,26 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.connection.commit()
         return int(cursor.lastrowid)
 
+    def seed_complete_enrichment(self, tool_id: int, suffix: str) -> None:
+        category = self.connection.execute(
+            "SELECT id FROM categories WHERE status = 'active' ORDER BY id LIMIT 1"
+        ).fetchone()
+        self.assertIsNotNone(category)
+        self.connection.execute(
+            "UPDATE tools SET primary_category_id = ? WHERE id = ?",
+            [category["id"], tool_id],
+        )
+        self.connection.execute(
+            """
+            INSERT INTO tool_localizations (
+              tool_id, locale_code, localized_slug, name, short_description,
+              feature_highlights, translation_status, published_at
+            ) VALUES (?, 'en', ?, ?, 'Complete description', '["Feature one"]', 'published', ?)
+            """,
+            [tool_id, suffix, suffix, runner.utc_now_iso()],
+        )
+        self.connection.commit()
+
     def task_row(self, table: str, where: str, params: list[Any]) -> sqlite3.Row:
         row = self.connection.execute(f"SELECT * FROM {table} WHERE {where}", params).fetchone()
         self.assertIsNotNone(row)
@@ -1163,6 +1183,91 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await store.missing_asset_requirements(tool_id), [])
         row = self.task_row("asset_tasks", "tool_id = ? AND source = ?", [tool_id, runner.ASSET_SOURCE])
         self.assert_completed_lease(row, "done")
+
+    async def test_successful_screenshot_is_not_recaptured_while_favicon_retries(self) -> None:
+        tool_id = self.add_tool("asset-stage-once")
+        self.seed_complete_enrichment(tool_id, "asset-stage-once")
+        store = runner.D1AssetStore(self.d1)
+        self.assertEqual(await store.queue_missing_asset_tasks(10), 1)
+        task = (await store.claim_due_tasks(10, "asset-worker"))[0]
+
+        class CaptureOnceClient:
+            def __init__(self) -> None:
+                self.screenshot_calls = 0
+
+            async def capture_homepage_screenshot(
+                self,
+                current_task: runner.AssetTask,
+            ) -> runner.AssetFetchResult:
+                self.screenshot_calls += 1
+                return runner.AssetFetchResult(
+                    final_url=current_task.official_url,
+                    screenshot=b"screenshot",
+                )
+
+        browser_client = CaptureOnceClient()
+        uploader = AsyncMock()
+        favicon_fetch = AsyncMock(
+            side_effect=[
+                None,
+                runner.FaviconAsset(b"favicon", "asset-stage-once/favicon.ico", "image/x-icon"),
+            ]
+        )
+        with (
+            patch.object(runner, "fetch_favicon_asset", new=favicon_fetch),
+            patch.object(runner.asyncio, "sleep", new=AsyncMock()),
+        ):
+            status = await runner.process_asset_task(
+                task,
+                browser_client,  # type: ignore[arg-type]
+                uploader,
+                store,
+                "https://img.example.test",
+                1,
+                [],
+            )
+
+        self.assertEqual(status, "done")
+        self.assertEqual(browser_client.screenshot_calls, 1)
+        self.assertEqual(favicon_fetch.await_count, 2)
+        self.assertEqual(uploader.put_object.await_count, 2)
+        self.assertEqual(await store.missing_asset_requirements(tool_id), [])
+
+    async def test_missing_favicon_stays_in_bounded_failure_state(self) -> None:
+        tool_id = self.add_tool("asset-favicon-failure")
+        self.seed_complete_enrichment(tool_id, "asset-favicon-failure")
+        self.connection.execute(
+            """
+            INSERT INTO tool_assets (
+              tool_id, asset_kind, storage_bucket, storage_object_path, is_current
+            ) VALUES (?, 'screenshot', 'sitesimgs', 'asset-favicon-failure/screenshot.png', 1)
+            """,
+            [tool_id],
+        )
+        self.connection.commit()
+
+        store = runner.D1AssetStore(self.d1)
+        self.assertEqual(await store.queue_missing_asset_tasks(10), 1)
+        task = (await store.claim_due_tasks(10, "asset-worker"))[0]
+        uploader = AsyncMock()
+        with patch.object(runner, "fetch_favicon_asset", new=AsyncMock(return_value=None)):
+            status = await runner.process_asset_task(
+                task,
+                object(),  # type: ignore[arg-type]
+                uploader,
+                store,
+                "https://img.example.test",
+                0,
+                [],
+            )
+
+        self.assertEqual(status, "failed")
+        self.assertEqual(await store.missing_asset_requirements(tool_id), ["favicon"])
+        row = self.task_row("asset_tasks", "tool_id = ? AND source = ?", [tool_id, runner.ASSET_SOURCE])
+        self.assertEqual(row["status"], "failed")
+        self.assertIsNotNone(row["next_retry_at"])
+        self.assertIsNone(row["dead_letter_at"])
+        uploader.put_object.assert_not_awaited()
 
     async def test_asset_category_materialization_writes_parent_and_child(self) -> None:
         tool_id = self.add_tool("asset-category-materialization")
@@ -1663,6 +1768,102 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["status"], "failed")
         self.assertEqual(row["attempts"], 3)
         self.assertEqual(row["last_error"], "keep me too")
+
+    async def test_terminal_domain_failures_do_not_starve_stale_completed_domains(self) -> None:
+        store = runner.D1DomainStateStore(self.d1)
+        for index in range(3):
+            suffix = f"domain-terminal-{index}"
+            self.add_tool(suffix)
+            self.connection.execute(
+                """
+                INSERT INTO domain_state_tasks (
+                  normalized_domain, source, status, attempts, max_attempts,
+                  next_retry_at, last_error
+                ) VALUES (?, ?, 'failed', 5, 5, NULL, 'terminal failure')
+                """,
+                [f"{suffix}.example", runner.DOMAIN_STATE_SOURCE],
+            )
+
+        self.add_tool("domain-stale-completed")
+        self.connection.execute(
+            """
+            INSERT INTO domain_states (
+              normalized_domain, source, domain_rating, last_crawled_at,
+              rdap_status, rdap_checked_at
+            ) VALUES (?, ?, 42, '2020-01-01T00:00:00Z', 'done', '2020-01-01T00:00:00Z')
+            """,
+            ["domain-stale-completed.example", runner.DOMAIN_STATE_SOURCE],
+        )
+        self.connection.execute(
+            """
+            INSERT INTO domain_state_tasks (
+              normalized_domain, source, status, attempts, generation,
+              fetch_domain_rating, fetch_rdap, last_completed_at
+            ) VALUES (?, ?, 'done', 1, 1, 1, 0, '2020-01-01T00:00:00Z')
+            """,
+            ["domain-stale-completed.example", runner.DOMAIN_STATE_SOURCE],
+        )
+        self.connection.commit()
+
+        self.assertEqual(await store.queue_due_tasks(1, 30), 1)
+
+        stale = self.task_row(
+            "domain_state_tasks",
+            "normalized_domain = ? AND source = ?",
+            ["domain-stale-completed.example", runner.DOMAIN_STATE_SOURCE],
+        )
+        self.assertEqual(stale["status"], "queued")
+        self.assertEqual(stale["generation"], 2)
+        self.assertEqual(stale["attempts"], 0)
+
+        terminal = self.task_row(
+            "domain_state_tasks",
+            "normalized_domain = ? AND source = ?",
+            ["domain-terminal-0.example", runner.DOMAIN_STATE_SOURCE],
+        )
+        self.assertEqual(terminal["status"], "failed")
+        self.assertEqual(terminal["attempts"], 5)
+
+    async def test_configured_ahrefs_key_can_recover_only_missing_key_dead_letters(self) -> None:
+        store = runner.D1DomainStateStore(self.d1)
+        for suffix, error in (
+            ("domain-missing-key", "AHREF_API_KEY is required for Ahrefs Domain Rating requests"),
+            ("domain-real-failure", "ahrefs_http_500"),
+        ):
+            self.add_tool(suffix)
+            self.connection.execute(
+                """
+                INSERT INTO domain_state_tasks (
+                  normalized_domain, source, status, attempts, max_attempts,
+                  generation, last_error, dead_letter_at
+                ) VALUES (?, ?, 'failed', 5, 5, 1, ?, '2026-01-01T00:00:00Z')
+                """,
+                [f"{suffix}.example", runner.DOMAIN_STATE_SOURCE, error],
+            )
+        self.connection.commit()
+
+        self.assertEqual(await store.requeue_missing_credential_tasks(10), 1)
+
+        recovered = self.task_row(
+            "domain_state_tasks",
+            "normalized_domain = ? AND source = ?",
+            ["domain-missing-key.example", runner.DOMAIN_STATE_SOURCE],
+        )
+        self.assertEqual(recovered["status"], "queued")
+        self.assertEqual(recovered["attempts"], 0)
+        self.assertEqual(recovered["generation"], 2)
+        self.assertIsNone(recovered["last_error"])
+        self.assertIsNone(recovered["dead_letter_at"])
+
+        untouched = self.task_row(
+            "domain_state_tasks",
+            "normalized_domain = ? AND source = ?",
+            ["domain-real-failure.example", runner.DOMAIN_STATE_SOURCE],
+        )
+        self.assertEqual(untouched["status"], "failed")
+        self.assertEqual(untouched["attempts"], 5)
+        self.assertEqual(untouched["last_error"], "ahrefs_http_500")
+        self.assertIsNotNone(untouched["dead_letter_at"])
 
     async def test_stale_asset_completion_cannot_overwrite_new_generation_and_token(self) -> None:
         tool_id = self.add_tool("asset-stale-complete")
