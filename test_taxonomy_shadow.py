@@ -180,6 +180,34 @@ class ShadowTaskSourceTests(unittest.IsolatedAsyncioTestCase):
             [500, SHADOW_PROMPT_VERSION, SHADOW_PROMPT_VERSION, 100],
         )
 
+    async def test_batch_query_scopes_failure_budget_to_active_primary_model(self):
+        observed: dict[str, object] = {}
+
+        class FakeD1:
+            async def query(self, sql, params):
+                observed["sql"] = sql
+                observed["params"] = params
+                return []
+
+        await load_shadow_tasks(
+            FakeD1(),
+            limit=20,
+            allow_unresolved_entity=True,
+            retry_model_name="deepseek/deepseek-v4-flash",
+        )
+
+        self.assertIn("failed_run.model_name = ?", str(observed["sql"]))
+        self.assertEqual(
+            observed["params"],
+            [
+                0,
+                SHADOW_PROMPT_VERSION,
+                SHADOW_PROMPT_VERSION,
+                "deepseek/deepseek-v4-flash",
+                20,
+            ],
+        )
+
 
 class EntityDecisionTests(unittest.TestCase):
     def test_accepts_high_confidence_evidenced_independent_product(self):

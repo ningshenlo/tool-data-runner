@@ -69,11 +69,13 @@ pages. Results between the evidence floor (`0.35`) and the auto-accept threshold
 remain `provisional`; lower-confidence leaves are `unresolved`. Existing verified
 manual primaries are immutable and always win.
 
-Production defaults process 10 tools every 15 minutes with concurrency 2. A
+Production defaults process 20 tools every 5 minutes with concurrency 3. A
 billing, quota, rate-limit, or authentication response trips a batch circuit
 breaker and backs taxonomy off for 6 hours. Set `TAXONOMY_AUTO_ENABLED=0` as the
 emergency kill switch. Genuine failed runs retry at most three times; succeeded,
-partial, and skipped results are not repeatedly charged.
+partial, and skipped results are not repeatedly charged. Failed-run budgets are
+scoped to the active primary model, so switching providers can recover previously
+exhausted tools without deleting their audit history.
 
 Combined `--all` mode deliberately leaves new pricing results in `manual_review`. The legacy `--approve-pricing` switch is rejected so a refetch cannot bypass the audited Admin review.
 

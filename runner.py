@@ -654,12 +654,12 @@ def load_config(require_brightdata: bool = True) -> Config:
         pricing_limit=read_int_env("RUNNER_PRICING_LIMIT", 20),
         pricing_timeout_seconds=read_int_env("RUNNER_PRICING_TIMEOUT_SECONDS", 20),
         taxonomy_auto_enabled=read_bool_env("TAXONOMY_AUTO_ENABLED", True),
-        taxonomy_limit=max(1, read_int_env("RUNNER_TAXONOMY_LIMIT", 10)),
+        taxonomy_limit=max(1, read_int_env("RUNNER_TAXONOMY_LIMIT", 20)),
         taxonomy_interval_seconds=max(
-            300, read_int_env("RUNNER_TAXONOMY_INTERVAL_SECONDS", 900)
+            300, read_int_env("RUNNER_TAXONOMY_INTERVAL_SECONDS", 300)
         ),
         taxonomy_concurrency=min(
-            8, max(1, read_int_env("RUNNER_TAXONOMY_CONCURRENCY", 2))
+            8, max(1, read_int_env("RUNNER_TAXONOMY_CONCURRENCY", 3))
         ),
         taxonomy_auto_accept_confidence=min(
             1.0,

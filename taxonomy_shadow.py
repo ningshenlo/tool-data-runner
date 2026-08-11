@@ -914,6 +914,7 @@ async def load_shadow_tasks(
     after_tool_id: int = 0,
     allow_unresolved_entity: bool = False,
     skip_current_prompt: bool = True,
+    retry_model_name: str = "",
 ) -> list[dict[str, Any]]:
     """Select tools eligible for Shadow pipeline.
 
@@ -971,6 +972,9 @@ async def load_shadow_tasks(
 
     current_prompt_clause = ""
     if skip_current_prompt:
+        failed_model_clause = (
+            "AND failed_run.model_name = ?" if retry_model_name else ""
+        )
         current_prompt_clause = """
           AND NOT EXISTS (
             SELECT 1 FROM classification_runs current_run
@@ -983,8 +987,9 @@ async def load_shadow_tasks(
             WHERE failed_run.tool_id = t.id
               AND failed_run.prompt_version = ?
               AND failed_run.run_status = 'failed'
+              {failed_model_clause}
           ) < 3
-        """
+        """.format(failed_model_clause=failed_model_clause)
 
     sql = f"""
         SELECT
@@ -1009,6 +1014,8 @@ async def load_shadow_tasks(
     params: list[Any] = [int(after_tool_id or 0)]
     if skip_current_prompt:
         params.extend([SHADOW_PROMPT_VERSION, SHADOW_PROMPT_VERSION])
+        if retry_model_name:
+            params.append(retry_model_name)
     params.append(limit)
     return await d1.query(sql, params)
 
@@ -1828,6 +1835,13 @@ async def run_shadow_taxonomy(
             log_error("shadow_taxonomy.catalog_empty")
             return counts
 
+        browser_client = CloudflareBrowserRunAssetClient(config)
+        custom_ai = browser_client.category_custom_ai()
+        model_chain = [
+            str(item.get("model") or "")
+            for item in custom_ai
+            if isinstance(item, dict) and item.get("model")
+        ]
         rows = await load_shadow_tasks(
             d1,
             limit=batch_limit,
@@ -1835,6 +1849,9 @@ async def run_shadow_taxonomy(
             after_tool_id=after_tool_id,
             allow_unresolved_entity=allow_unresolved_entity or bool(tool_ids),
             skip_current_prompt=not bool(tool_ids),
+            # A provider/model change starts a fresh bounded retry budget while
+            # preserving old failed runs as immutable audit history.
+            retry_model_name=(model_chain[0] if model_chain else ""),
         )
         counts["selected"] = len(rows)
         log_info(
@@ -1851,7 +1868,6 @@ async def run_shadow_taxonomy(
             capabilities=len(catalog.capabilities()),
         )
 
-        browser_client = CloudflareBrowserRunAssetClient(config)
         semaphore = asyncio.Semaphore(worker_limit)
         provider_blocked = asyncio.Event()
 
