@@ -264,6 +264,26 @@ class PageAndNameQualityTests(unittest.TestCase):
         self.assertEqual(result.product_name, "Example Tool")
         self.assertEqual(result.review_status, "needs_review")
 
+    def test_deterministic_description_and_features_use_official_page_content(self) -> None:
+        task = runner.AssetTask(
+            tool_id=1,
+            canonical_slug="example-ai",
+            normalized_domain="example.ai",
+            official_url="https://example.ai/",
+            attempts=1,
+            max_attempts=5,
+            generation=1,
+            lease_token="test",
+        )
+        html_body = (
+            "<html><body><h2>Automated research</h2>"
+            "<p>Example AI researches sources and summarizes findings for teams.</p></body></html>"
+        )
+        description = runner.deterministic_fallback_description(task, html_body, "Example AI")
+        features = runner.deterministic_fallback_key_features("Example AI", description, html_body)
+        self.assertIn("researches sources", description)
+        self.assertEqual(features[0]["name"], "Automated research")
+
     def test_explicit_adult_generator_is_nsfw(self) -> None:
         result = runner.assess_content_safety(
             "<html><body>Generate NSFW AI porn images and videos.</body></html>",
@@ -295,6 +315,19 @@ class PageAndNameQualityTests(unittest.TestCase):
 
 
 class CategoryPromptHelperTests(unittest.TestCase):
+    def test_deterministic_category_fallback_prefers_matching_taxonomy_leaf(self) -> None:
+        result = runner.deterministic_fallback_category(
+            "AI writing assistant for blog content generation and editing",
+            [
+                runner.CategoryCatalogEntry(slug="writing-text"),
+                runner.CategoryCatalogEntry(slug="content-generation", parent_slug="writing-text"),
+                runner.CategoryCatalogEntry(slug="coding-development"),
+            ],
+        )
+        self.assertEqual(result.category_l1, "writing-text")
+        self.assertEqual(result.category_l2, "content-generation")
+        self.assertIn("deterministic_fallback", result.category_raw_output)
+
     def test_normalize_structured_json_payload_unwraps_openai_chat_content(self) -> None:
         payload = {
             "choices": [
@@ -1178,11 +1211,88 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status, "done")
         self.assertEqual(browser_client.feature_calls, 1)
-        self.assertEqual(browser_client.category_calls, 2)
+        self.assertEqual(browser_client.category_calls, 1)
         self.assertEqual(uploader.calls, [])
         self.assertEqual(await store.missing_asset_requirements(tool_id), [])
         row = self.task_row("asset_tasks", "tool_id = ? AND source = ?", [tool_id, runner.ASSET_SOURCE])
         self.assert_completed_lease(row, "done")
+
+    async def test_asset_fallbacks_advance_a_qualified_tool_to_pending_review(self) -> None:
+        tool_id = self.add_tool("auto-publish-ready")
+        now = runner.utc_now_iso()
+        self.connection.execute(
+            """
+            INSERT INTO tool_sources (
+              tool_id, source_type, source_label, source_url, first_seen_at, last_seen_at
+            ) VALUES (?, 'official_site', 'Discovery official website',
+                      'https://auto-publish-ready.example/', ?, ?)
+            """,
+            [tool_id, now, now],
+        )
+        self.connection.commit()
+        store = runner.D1AssetStore(self.d1)
+        self.assertEqual(await store.queue_missing_asset_tasks(10), 1)
+        task = (await store.claim_due_tasks(10, "asset-worker"))[0]
+
+        class EmptyModelClient:
+            async def fetch_homepage_core_metadata(self, current_task: runner.AssetTask) -> runner.AssetFetchResult:
+                return runner.AssetFetchResult(
+                    final_url=current_task.official_url,
+                    html=(
+                        "<html><head><title>Auto Publish Ready</title></head>"
+                        "<body><h2>Team automation</h2></body></html>"
+                    ),
+                    title="Auto Publish Ready",
+                    description="An AI assistant that automates team research workflows.",
+                    name_source="page_title_segment",
+                    name_confidence=72,
+                    name_review_status="needs_review",
+                    content_safety_status="safe",
+                    content_safety_confidence=95,
+                    content_safety_reason="no_explicit_content_signals",
+                )
+
+            async def fetch_homepage_key_features(self, current_task: runner.AssetTask) -> runner.AssetFetchResult:
+                return runner.AssetFetchResult(
+                    final_url=current_task.official_url,
+                    key_features=[],
+                    metadata_error="features_empty",
+                )
+
+            async def fetch_homepage_categories(
+                self,
+                current_task: runner.AssetTask,
+                _: list[str],
+            ) -> runner.AssetFetchResult:
+                return runner.AssetFetchResult(
+                    final_url=current_task.official_url,
+                    metadata_error="category_empty",
+                )
+
+            async def capture_homepage_screenshot(self, current_task: runner.AssetTask) -> runner.AssetFetchResult:
+                return runner.AssetFetchResult(final_url=current_task.official_url, screenshot=b"png")
+
+        class RecordingUploader:
+            async def put_object(self, *_: Any) -> None:
+                return None
+
+        favicon = runner.FaviconAsset(body=b"icon", key="auto-publish-ready/favicon.ico", mime_type="image/x-icon")
+        with patch.object(runner, "fetch_favicon_asset", new=AsyncMock(return_value=favicon)):
+            status = await runner.process_asset_task(
+                task,
+                EmptyModelClient(),
+                RecordingUploader(),
+                store,
+                "https://img.example.test",
+                0,
+                await store.category_catalog(),
+            )
+
+        self.assertEqual(status, "done")
+        readiness = await runner.D1EnrichmentStore(self.d1).evaluate_tool(tool_id)
+        self.assertEqual(readiness, "ready")
+        tool = self.connection.execute("SELECT status FROM tools WHERE id = ?", [tool_id]).fetchone()
+        self.assertEqual(tool["status"], "pending_review")
 
     async def test_successful_screenshot_is_not_recaptured_while_favicon_retries(self) -> None:
         tool_id = self.add_tool("asset-stage-once")
@@ -1546,8 +1656,8 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(runner.published_category_backfill_success(bad_l2))
 
-    async def test_category_failures_stop_retries_but_remain_readiness_blocker(self) -> None:
-        tool_id = self.add_tool("asset-category-manual-review")
+    async def test_category_failures_remain_eligible_for_automatic_recovery(self) -> None:
+        tool_id = self.add_tool("asset-category-auto-recovery")
         store = runner.D1AssetStore(self.d1)
 
         for attempt in range(runner.CATEGORY_CLASSIFICATION_MAX_ATTEMPTS):
@@ -1557,15 +1667,15 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 raw_output=json.dumps({"attempt": attempt + 1}),
             )
 
-        self.assertEqual(state["status"], "needs_manual")
+        self.assertEqual(state["status"], "auto_failed")
         self.assertEqual(state["attempts"], runner.CATEGORY_CLASSIFICATION_MAX_ATTEMPTS)
-        self.assertTrue(await store.category_is_waived(tool_id))
+        self.assertFalse(await store.category_is_waived(tool_id))
 
         readiness = await runner.D1EnrichmentStore(self.d1).evaluate_tool(tool_id)
         self.assertEqual(readiness, "blocked")
         enrichment = self.task_row("tool_enrichment_states", "tool_id = ?", [tool_id])
         self.assertIn("category", json.loads(enrichment["blocking_json"]))
-        self.assertIn("category_needs_manual", json.loads(enrichment["warnings_json"]))
+        self.assertNotIn("category_needs_manual", json.loads(enrichment["warnings_json"]))
 
         outcomes = [
             row["outcome"]
@@ -1574,7 +1684,7 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 [tool_id],
             ).fetchall()
         ]
-        self.assertEqual(outcomes, ["auto_failed", "auto_failed", "needs_manual"])
+        self.assertEqual(outcomes, ["auto_failed", "auto_failed", "auto_failed"])
 
     async def test_asset_localization_uses_clean_public_slug_and_numbers_real_collisions(self) -> None:
         existing_tool_id = self.add_tool("existing-hocoos")
@@ -1619,7 +1729,7 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(localization["localized_slug"], "hocoos-2")
         self.assertEqual(localization["name"], "Hocoos AI Website Builder")
 
-    async def test_low_confidence_name_is_persisted_for_review_but_blocks_readiness(self) -> None:
+    async def test_low_confidence_name_uses_publish_review_fallback(self) -> None:
         tool_id = self.add_tool("uncertain-name")
         task = runner.AssetTask(
             tool_id=tool_id,
@@ -1647,13 +1757,13 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             [tool_id],
         ).fetchone()
         self.assertEqual(localization["name"], "Uncertain Name")
-        self.assertEqual(localization["name_confidence"], 45)
-        self.assertEqual(localization["name_review_status"], "needs_review")
+        self.assertEqual(localization["name_confidence"], runner.AUTO_APPROVE_TOOL_NAME_CONFIDENCE)
+        self.assertEqual(localization["name_review_status"], "auto_approved")
 
         readiness = await runner.D1EnrichmentStore(self.d1).evaluate_tool(tool_id)
         self.assertEqual(readiness, "blocked")
         enrichment = self.task_row("tool_enrichment_states", "tool_id = ?", [tool_id])
-        self.assertIn("name_quality", json.loads(enrichment["blocking_json"]))
+        self.assertNotIn("name_quality", json.loads(enrichment["blocking_json"]))
 
     async def test_public_slug_data_migration_is_global_collision_safe_and_idempotent(self) -> None:
         existing_runway_id = self.add_tool("runway", status="published")
@@ -1741,6 +1851,61 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["status"], "failed")
         self.assertEqual(row["attempts"], 2)
         self.assertEqual(row["last_error"], "keep me")
+
+    async def test_incomplete_asset_dead_letter_is_revived_after_cooldown(self) -> None:
+        tool_id = self.add_tool("asset-auto-revive")
+        store = runner.D1AssetStore(self.d1)
+        self.connection.execute(
+            "UPDATE tools SET category_classification_status = 'needs_manual', category_classification_attempts = 3 WHERE id = ?",
+            [tool_id],
+        )
+        self.connection.execute(
+            """
+            INSERT INTO asset_tasks (
+              tool_id, normalized_domain, source, status, attempts, max_attempts,
+              generation, last_error, dead_letter_at
+            )
+            VALUES (?, 'asset-auto-revive.example', ?, 'failed', 5, 5, 1,
+                    'asset_enrichment_incomplete: missing=key_features,category',
+                    '2000-01-01T00:00:00Z')
+            """,
+            [tool_id, runner.ASSET_SOURCE],
+        )
+        self.connection.commit()
+
+        self.assertEqual(await store.revive_incomplete_dead_letter_tasks(10), 1)
+        task = self.task_row("asset_tasks", "tool_id = ? AND source = ?", [tool_id, runner.ASSET_SOURCE])
+        self.assertEqual(task["status"], "queued")
+        self.assertEqual(task["attempts"], 0)
+        self.assertEqual(task["generation"], 2)
+        self.assertIsNone(task["dead_letter_at"])
+        tool = self.connection.execute(
+            "SELECT category_classification_status, category_classification_attempts FROM tools WHERE id = ?",
+            [tool_id],
+        ).fetchone()
+        self.assertEqual(tool["category_classification_status"], "auto_retry")
+        self.assertEqual(tool["category_classification_attempts"], 0)
+
+    async def test_content_safety_dead_letter_is_not_automatically_revived(self) -> None:
+        tool_id = self.add_tool("asset-unsafe")
+        store = runner.D1AssetStore(self.d1)
+        self.connection.execute(
+            """
+            INSERT INTO asset_tasks (
+              tool_id, normalized_domain, source, status, attempts, max_attempts,
+              generation, last_error, dead_letter_at
+            )
+            VALUES (?, 'asset-unsafe.example', ?, 'failed', 1, 5, 1,
+                    'content_safety_blocked:nsfw:strong_signal',
+                    '2000-01-01T00:00:00Z')
+            """,
+            [tool_id, runner.ASSET_SOURCE],
+        )
+        self.connection.commit()
+
+        self.assertEqual(await store.revive_incomplete_dead_letter_tasks(10), 0)
+        task = self.task_row("asset_tasks", "tool_id = ? AND source = ?", [tool_id, runner.ASSET_SOURCE])
+        self.assertIsNotNone(task["dead_letter_at"])
 
     async def test_domain_failed_task_is_not_reset_or_revived_by_normal_queue(self) -> None:
         self.add_tool("domain-failed")
@@ -3115,6 +3280,54 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             help_output.getvalue(),
         )
 
+    async def test_split_worker_cli_modes_are_exclusive_and_profiled(self) -> None:
+        periodic_args = runner.parse_args(["--periodic-facts", "--loop"])
+        self.assertTrue(periodic_args.periodic_facts)
+        self.assertEqual(
+            runner.runtime_profile_for_args(periodic_args),
+            ("periodic-facts-worker", ("traffic", "domain_state")),
+        )
+
+        taxonomy_args = runner.parse_args(["--taxonomy", "--loop"])
+        self.assertTrue(taxonomy_args.taxonomy)
+        self.assertEqual(
+            runner.runtime_profile_for_args(taxonomy_args),
+            ("taxonomy-worker", ("taxonomy",)),
+        )
+
+        with (
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            runner.parse_args(["--periodic-facts", "--assets", "--loop"])
+
+    async def test_periodic_facts_once_keeps_workload_results_separate(self) -> None:
+        config = type(
+            "PeriodicFactsConfig",
+            (),
+            {"limit": 500, "domain_state_limit": 50},
+        )()
+        with (
+            patch.object(
+                runner,
+                "run_once",
+                new=AsyncMock(return_value={"claimed": 20, "done": 19, "failed": 1}),
+            ) as run_traffic,
+            patch.object(
+                runner,
+                "run_domain_state_once",
+                new=AsyncMock(return_value={"claimed": 2, "done": 2, "failed": 0}),
+            ) as run_domain,
+        ):
+            counts = await runner.run_periodic_facts_once(config, traffic_limit=100)
+
+        run_traffic.assert_awaited_once_with(config, 100)
+        run_domain.assert_awaited_once_with(config, 50)
+        self.assertEqual(counts["traffic_claimed"], 20)
+        self.assertEqual(counts["traffic_failed"], 1)
+        self.assertEqual(counts["domain_claimed"], 2)
+        self.assertEqual(counts["domain_failed"], 0)
+
     async def test_activate_market_snapshot_id_cli_does_not_require_brightdata(self) -> None:
         config = type("ActivationConfig", (), {"poll_interval_seconds": 60})()
         with (
@@ -3649,6 +3862,332 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertTrue(source["last_success_at"])
 
+    async def test_pricing_shadow_replays_manual_review_once_after_normal_work(self) -> None:
+        replay_tool_id = self.add_tool("pricing-shadow-replay")
+        normal_tool_id = self.add_tool("pricing-normal-priority")
+        store = runner.D1PricingStore(self.d1)
+        replay_url = "https://pricing-shadow-replay.example/pricing"
+        normal_url = "https://pricing-normal-priority.example/pricing"
+        await store.insert_pricing_source(replay_tool_id, replay_url, "manual", 100)
+        await store.insert_pricing_source(normal_tool_id, normal_url, "manual", 100)
+        self.assertEqual(await store.queue_due_tasks(10), 2)
+
+        task_rows = self.connection.execute(
+            "SELECT id, tool_id FROM pricing_tasks ORDER BY id"
+        ).fetchall()
+        replay_task_id = next(row["id"] for row in task_rows if row["tool_id"] == replay_tool_id)
+        normal_task_id = next(row["id"] for row in task_rows if row["tool_id"] == normal_tool_id)
+        self.connection.execute(
+            "UPDATE pricing_tasks SET status = 'manual_review', attempts = 1, finished_at = ? WHERE id = ?",
+            [runner.utc_now_iso(), replay_task_id],
+        )
+        self.connection.commit()
+
+        normal_claimed = await store.claim_due_tasks(
+            2,
+            lease_owner="pricing-shadow-normal-worker",
+            replay_manual_review=False,
+        )
+        self.assertEqual([task.task_id for task in normal_claimed], [normal_task_id])
+        self.assertFalse(normal_claimed[0].is_manual_review_replay)
+        replay_claimed = await store.claim_due_tasks(
+            1,
+            lease_owner="pricing-shadow-replay-worker",
+            replay_manual_review=True,
+        )
+        self.assertEqual([task.task_id for task in replay_claimed], [replay_task_id])
+        self.assertTrue(replay_claimed[0].is_manual_review_replay)
+        self.assertEqual(replay_claimed[0].attempts, 2)
+        running_replay_row = self.connection.execute(
+            "SELECT last_error FROM pricing_tasks WHERE id = ?",
+            [replay_task_id],
+        ).fetchone()
+        self.assertEqual(
+            running_replay_row["last_error"],
+            runner.PRICING_CLAIMS_V2_REPLAY_RUNNING_MARKER,
+        )
+        self.assertEqual(
+            await store.claim_due_tasks(
+                2,
+                lease_owner="pricing-shadow-race-worker",
+                replay_manual_review=True,
+            ),
+            [],
+        )
+
+        replay_task = replay_claimed[0]
+        html_body = """
+        <section id="pricing" aria-label="Pricing plans">
+          <h1>Pricing</h1><p>This product is free forever.</p>
+        </section>
+        """
+        result = runner.PricingFetchResult(
+            url=replay_url,
+            final_url=replay_url,
+            status=200,
+            content_type="text/html",
+            html=html_body,
+        )
+        bundle = runner.build_pricing_snapshot_bundle(html_body)
+        snapshot_id = await store.insert_snapshot(replay_task, result, bundle)
+        self.assertGreater(snapshot_id, 0)
+        await store.insert_pricing_claims_shadow(replay_task, snapshot_id, bundle)
+        self.assertTrue(
+            await store.finish_task(
+                replay_task,
+                "manual_review",
+                runner.pricing_claims_v2_replay_error(
+                    "Python extraction pending manual approval",
+                    len(bundle.raw_claims),
+                ),
+                result,
+            )
+        )
+        replay_row = self.connection.execute(
+            "SELECT last_error FROM pricing_tasks WHERE id = ?",
+            [replay_task_id],
+        ).fetchone()
+        source_row = self.connection.execute(
+            "SELECT last_error FROM pricing_sources WHERE id = ?",
+            [replay_task.pricing_source_id],
+        ).fetchone()
+        self.assertTrue(replay_row["last_error"].startswith("pricing_claims_v2_replayed:claims="))
+        self.assertEqual(source_row["last_error"], "Python extraction pending manual approval")
+        replayed_again = await store.claim_due_tasks(
+            10,
+            lease_owner="pricing-shadow-replay-worker-two",
+            replay_manual_review=True,
+        )
+        self.assertFalse(any(task.task_id == replay_task_id for task in replayed_again))
+
+    async def test_pricing_manual_review_replay_identity_survives_expired_lease(self) -> None:
+        tool_id = self.add_tool("pricing-shadow-replay-expired")
+        store = runner.D1PricingStore(self.d1)
+        source_url = "https://pricing-shadow-replay-expired.example/pricing"
+        await store.insert_pricing_source(tool_id, source_url, "manual", 100)
+        self.assertEqual(await store.queue_due_tasks(10), 1)
+        self.connection.execute(
+            "UPDATE pricing_tasks SET status = 'manual_review', attempts = 1, finished_at = ? WHERE tool_id = ?",
+            [runner.utc_now_iso(), tool_id],
+        )
+        self.connection.commit()
+
+        replay_task = (
+            await store.claim_due_tasks(
+                1,
+                lease_owner="pricing-shadow-replay-expired-one",
+                replay_manual_review=True,
+            )
+        )[0]
+        self.connection.execute(
+            "UPDATE pricing_tasks SET lease_expires_at = ? WHERE id = ?",
+            [runner.iso_delta(hours=-1), replay_task.task_id],
+        )
+        self.connection.commit()
+
+        recovered = (
+            await store.claim_due_tasks(
+                1,
+                lease_owner="pricing-shadow-replay-expired-two",
+            )
+        )[0]
+        self.assertEqual(recovered.task_id, replay_task.task_id)
+        self.assertTrue(recovered.is_manual_review_replay)
+        recovered_row = self.connection.execute(
+            "SELECT last_error FROM pricing_tasks WHERE id = ?",
+            [recovered.task_id],
+        ).fetchone()
+        self.assertEqual(
+            recovered_row["last_error"],
+            runner.PRICING_CLAIMS_V2_REPLAY_RUNNING_MARKER,
+        )
+
+    async def test_pricing_manual_review_replay_requires_shadow_opt_in(self) -> None:
+        tool_id = self.add_tool("pricing-shadow-disabled")
+        store = runner.D1PricingStore(self.d1)
+        await store.insert_pricing_source(
+            tool_id,
+            "https://pricing-shadow-disabled.example/pricing",
+            "manual",
+            100,
+        )
+        self.assertEqual(await store.queue_due_tasks(10), 1)
+        self.connection.execute(
+            "UPDATE pricing_tasks SET status = 'manual_review', attempts = 1, finished_at = ? WHERE tool_id = ?",
+            [runner.utc_now_iso(), tool_id],
+        )
+        self.connection.commit()
+
+        self.assertEqual(
+            await store.claim_due_tasks(
+                10,
+                lease_owner="pricing-shadow-disabled-worker",
+                replay_manual_review=False,
+            ),
+            [],
+        )
+
+    async def test_pricing_shadow_replays_only_latest_task_for_active_eligible_source(self) -> None:
+        tool_id = self.add_tool("pricing-shadow-latest-only", status="published")
+        store = runner.D1PricingStore(self.d1)
+        source_url = "https://pricing-shadow-latest-only.example/pricing"
+        await store.insert_pricing_source(tool_id, source_url, "manual", 100)
+        self.assertEqual(await store.queue_due_tasks(10), 1)
+        first_task_id = self.connection.execute(
+            "SELECT id FROM pricing_tasks WHERE tool_id = ?",
+            [tool_id],
+        ).fetchone()["id"]
+        now = runner.utc_now_iso()
+        self.connection.execute(
+            "UPDATE pricing_tasks SET status = 'manual_review', attempts = 1, finished_at = ? WHERE id = ?",
+            [now, first_task_id],
+        )
+        second_task_id = self.connection.execute(
+            """
+            INSERT INTO pricing_tasks (
+              pricing_source_id, tool_id, status, run_after, attempts, max_attempts,
+              finished_at, last_error
+            )
+            SELECT pricing_source_id, tool_id, 'manual_review', ?, 1, 3, ?, 'newer review'
+            FROM pricing_tasks WHERE id = ?
+            """,
+            [now, now, first_task_id],
+        ).lastrowid
+        self.connection.commit()
+
+        replayed = await store.claim_due_tasks(
+            10,
+            lease_owner="pricing-shadow-latest-only-worker",
+            replay_manual_review=True,
+        )
+        self.assertEqual([task.task_id for task in replayed], [second_task_id])
+
+        self.connection.execute(
+            "UPDATE pricing_tasks SET status = 'manual_review', lease_owner = NULL, lease_token = NULL, lease_expires_at = NULL WHERE id = ?",
+            [second_task_id],
+        )
+        self.connection.execute(
+            "UPDATE pricing_sources SET is_active = 0 WHERE tool_id = ?",
+            [tool_id],
+        )
+        self.connection.commit()
+        self.assertEqual(
+            await store.claim_due_tasks(
+                10,
+                lease_owner="pricing-shadow-inactive-source-worker",
+                replay_manual_review=True,
+            ),
+            [],
+        )
+
+    async def test_pricing_zero_claim_v2_snapshot_still_checkpoints_replay(self) -> None:
+        tool_id = self.add_tool("pricing-shadow-zero-claim")
+        store = runner.D1PricingStore(self.d1)
+        source_url = "https://pricing-shadow-zero-claim.example/pricing"
+        await store.insert_pricing_source(tool_id, source_url, "manual", 100)
+        self.assertEqual(await store.queue_due_tasks(10), 1)
+        self.connection.execute(
+            "UPDATE pricing_tasks SET status = 'manual_review', attempts = 1, finished_at = ? WHERE tool_id = ?",
+            [runner.utc_now_iso(), tool_id],
+        )
+        self.connection.commit()
+        replay_task = (
+            await store.claim_due_tasks(
+                10,
+                lease_owner="pricing-shadow-zero-claim-worker",
+                replay_manual_review=True,
+            )
+        )[0]
+
+        html_body = "<section id='pricing'><h1>Pricing</h1><p>Compare product capabilities.</p></section>"
+        bundle = runner.build_pricing_snapshot_bundle(html_body)
+        self.assertEqual(bundle.raw_claims, ())
+        result = runner.PricingFetchResult(
+            url=source_url,
+            final_url=source_url,
+            status=200,
+            content_type="text/html",
+            html=html_body,
+        )
+        snapshot_id = await store.insert_snapshot(replay_task, result, bundle)
+        counts = await store.insert_pricing_claims_shadow(replay_task, snapshot_id, bundle)
+        self.assertEqual(counts["claims_inserted"], 0)
+        self.assertTrue(
+            await store.finish_task(
+                replay_task,
+                "manual_review",
+                runner.pricing_claims_v2_replay_error("no deterministic claims", 0),
+                result,
+            )
+        )
+
+        self.assertEqual(
+            await store.claim_due_tasks(
+                10,
+                lease_owner="pricing-shadow-zero-claim-worker-two",
+                replay_manual_review=True,
+            ),
+            [],
+        )
+
+    async def test_pricing_incomplete_v2_snapshot_retries_full_shadow_extraction(self) -> None:
+        tool_id = self.add_tool("pricing-shadow-incomplete")
+        store = runner.D1PricingStore(self.d1)
+        source_url = "https://pricing-shadow-incomplete.example/pricing"
+        await store.insert_pricing_source(tool_id, source_url, "manual", 100)
+        self.assertEqual(await store.queue_due_tasks(10), 1)
+        first_task = (await store.claim_due_tasks(10, lease_owner="pricing-shadow-incomplete-one"))[0]
+        html_body = """
+        <section id="pricing" aria-label="Pricing plans">
+          <h1>Pricing</h1><p>Pro costs USD 29 per month.</p>
+        </section>
+        """
+        bundle = runner.build_pricing_snapshot_bundle(html_body)
+        result = runner.PricingFetchResult(
+            url=source_url,
+            final_url=source_url,
+            status=200,
+            content_type="text/html",
+            html=html_body,
+        )
+        incomplete_snapshot_id = await store.insert_snapshot(first_task, result, bundle)
+        self.assertGreater(incomplete_snapshot_id, 0)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT count(*) AS total FROM pricing_snapshot_artifacts WHERE snapshot_id = ?",
+                [incomplete_snapshot_id],
+            ).fetchone()["total"],
+            0,
+        )
+        self.assertTrue(
+            await store.finish_task(
+                first_task,
+                "manual_review",
+                "shadow persistence interrupted",
+                result,
+            )
+        )
+
+        replay_task = (
+            await store.claim_due_tasks(
+                10,
+                lease_owner="pricing-shadow-incomplete-two",
+                replay_manual_review=True,
+            )
+        )[0]
+
+        class StubUploader:
+            async def put_object(self, key: str, body: bytes, content_type: str) -> None:
+                return None
+
+        retry_plan = await store.prepare_pricing_claims_shadow(
+            replay_task,
+            bundle,
+            StubUploader(),
+        )
+        self.assertTrue(retry_plan.region_changed)
+        self.assertTrue(retry_plan.run_extraction)
+
     async def test_pricing_claims_shadow_deduplicates_artifacts_and_continues_claims(self) -> None:
         tool_id = self.add_tool("pricing-claims-shadow")
         store = runner.D1PricingStore(self.d1)
@@ -4095,6 +4634,27 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(run["status"], "failed")
         self.assertEqual(run["error"], "Batch completed with failed=1")
         self.assertEqual(run["counts_json"], '{"claimed": 1, "failed": 1}')
+
+    async def test_telemetry_records_split_service_and_workload_heartbeat(self) -> None:
+        class TelemetryConfig:
+            runner_instance_id = "periodic-facts-test"
+            runner_version = "test-version"
+            runner_service_name = "periodic-facts-worker"
+            runner_workloads = ("traffic", "domain_state")
+
+        telemetry = runner.RunnerTelemetry(self.d1, TelemetryConfig(), "traffic")
+        run_id = await telemetry.start("traffic")
+        await telemetry.heartbeat()
+        await telemetry.finish(run_id, {"claimed": 1, "done": 1})
+
+        instance = self.connection.execute(
+            "SELECT service, workloads_json, metadata_json FROM runner_instances WHERE instance_id = ?",
+            [TelemetryConfig.runner_instance_id],
+        ).fetchone()
+        self.assertEqual(instance["service"], "periodic-facts-worker")
+        self.assertEqual(json.loads(instance["workloads_json"]), ["traffic", "domain_state"])
+        metadata = json.loads(instance["metadata_json"])
+        self.assertIn("traffic", metadata["workload_heartbeats"])
 
 
 if __name__ == "__main__":
