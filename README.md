@@ -26,7 +26,7 @@ Category classification first fetches rendered homepage HTML, removes navigation
 
 Published-category backfill re-runs hierarchical classification for `status='published'` tools that still carry pre-hierarchical / unprovenanced category rows. It never selects `rejected` tools, never overwrites `source='manual'` assignments, and only replaces live categories after a successful classification. Failures keep the previous live categories and write audit/error only. Successful runs stamp `category_classification_raw.backfill = published-legacy-v1` so the job is resumable.
 
-Domain-state mode refreshes Ahrefs DR every 30 days by default. RDAP is independent and currently runs only once per domain; `done`, `no_data`, and `failed` outcomes are persisted so later DR refreshes never repeat the RDAP request. Tasks use expiring leases and fenced completion tokens before updating `domain_states`. Every workload writes D1-backed runner heartbeats and batch history to `runner_instances` and `runner_runs`.
+Domain-state mode refreshes each Ahrefs DR once every 30 days by default. Request starts are paced at 60 per minute: one request per second, matching Ahrefs' documented default limit. The domain queue polls every second instead of pausing for the former fixed 15-minute interval between batches. RDAP is independent and currently runs only once per domain; `done`, `no_data`, and `failed` outcomes are persisted so later DR refreshes never repeat the RDAP request. Tasks use expiring leases and fenced completion tokens before updating `domain_states`. Every workload writes D1-backed runner heartbeats and batch history to `runner_instances` and `runner_runs`.
 
 ## Setup
 
@@ -41,6 +41,8 @@ Fill `.env` with:
 
 - `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_D1_DATABASE_ID`, `CLOUDFLARE_API_TOKEN`: D1 REST API access.
 - `AHREF_API_KEY`: Ahrefs free Domain Rating API authentication. The runner sends it as `Authorization: Bearer <token>`.
+- DR cadence and provider budget: `RUNNER_DOMAIN_STATE_MAX_AGE_DAYS` (default `30`), `RUNNER_DOMAIN_POLL_INTERVAL_SECONDS` (default `1`), and `RUNNER_AHREFS_REQUESTS_PER_MINUTE` (default `60`, hard-clamped to Ahrefs' documented ceiling). The free DR endpoint does not consume API units; HTTP 429 responses honor `Retry-After` before retrying.
+  The limiter is process-local, so production should run one `periodic-facts-worker` replica. If that service is intentionally scaled out, divide the 60 requests/minute budget across replicas.
 - `BRIGHTDATA_PROXY_USER`, `BRIGHTDATA_PROXY_PASSWORD`: Bright Data proxy credentials for traffic mode.
 - Optional runner identity and tuning: stable `RUNNER_INSTANCE_ID`, `RUNNER_SERVICE_NAME`, deploy label `RUNNER_VERSION`, `RUNNER_LIMIT`, `RUNNER_PRICING_LIMIT`, `RUNNER_PRICING_MANUAL_REVIEW_REPLAY_LIMIT`, `RUNNER_PRICING_TIMEOUT_SECONDS`.
 - Workload concurrency: `RUNNER_TRAFFIC_CONCURRENCY`, `RUNNER_DOMAIN_CONCURRENCY`, `RUNNER_ASSET_CONCURRENCY`, and `RUNNER_PRICING_CONCURRENCY`. Each falls back to legacy `RUNNER_CONCURRENCY` when omitted.

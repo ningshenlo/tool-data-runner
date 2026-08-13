@@ -871,8 +871,22 @@ class WorkerControlTests(unittest.IsolatedAsyncioTestCase):
 
 
 class DomainStateClientContractTests(unittest.IsolatedAsyncioTestCase):
+    async def test_ahrefs_request_pacer_evenly_spaces_request_starts(self) -> None:
+        pacer = runner.AsyncRequestPacer(60)
+        sleep = AsyncMock()
+        with (
+            patch.object(runner.time, "monotonic", side_effect=[100.0, 100.0]),
+            patch.object(runner.asyncio, "sleep", sleep),
+        ):
+            await pacer.wait()
+            await pacer.wait()
+
+        sleep.assert_awaited_once()
+        self.assertAlmostEqual(sleep.await_args.args[0], 1.0)
+
     async def test_ahrefs_domain_rating_request_uses_bearer_token(self) -> None:
         observed: dict[str, Any] = {}
+        request_pacer = AsyncMock()
 
         class FakeResponse:
             status_code = 200
@@ -899,12 +913,46 @@ class DomainStateClientContractTests(unittest.IsolatedAsyncioTestCase):
                 return FakeResponse()
 
         with patch.object(runner.httpx, "AsyncClient", FakeAsyncClient):
-            result = await runner.DomainStateClient("test-ahrefs-token").fetch_ahrefs_domain_rating("example.com")
+            result = await runner.DomainStateClient(
+                "test-ahrefs-token",
+                request_pacer=request_pacer,
+            ).fetch_ahrefs_domain_rating("example.com")
 
         self.assertEqual(result.status, "done")
         self.assertEqual(result.domain_rating, 42)
         self.assertIn("target=example.com", observed["endpoint"])
         self.assertEqual(observed["headers"]["Authorization"], "Bearer test-ahrefs-token")
+        request_pacer.wait.assert_awaited_once()
+
+    async def test_ahrefs_429_exposes_retry_after_for_task_backoff(self) -> None:
+        class FakeResponse:
+            status_code = 429
+            is_success = False
+            text = "rate limited"
+            headers = {"retry-after": "12"}
+
+        class FakeAsyncClient:
+            def __init__(self, **_: Any) -> None:
+                pass
+
+            async def __aenter__(self) -> "FakeAsyncClient":
+                return self
+
+            async def __aexit__(self, *_: Any) -> None:
+                return None
+
+            async def get(self, *_: Any, **__: Any) -> FakeResponse:
+                return FakeResponse()
+
+        with patch.object(runner.httpx, "AsyncClient", FakeAsyncClient):
+            result = await runner.DomainStateClient(
+                "test-ahrefs-token",
+                request_pacer=AsyncMock(),
+            ).fetch_ahrefs_domain_rating("example.com")
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("429", result.error or "")
+        self.assertEqual(result.retry_after_seconds, 12)
 
     async def test_ahrefs_domain_rating_requires_api_key(self) -> None:
         with self.assertRaisesRegex(RuntimeError, "AHREF_API_KEY"):
@@ -991,6 +1039,41 @@ class DomainStateClientContractTests(unittest.IsolatedAsyncioTestCase):
         completed_result = store.complete_task.await_args.args[1]
         self.assertEqual(completed_result.rdap_status, "done")
         self.assertEqual(completed_result.domain_created_at, "2020-01-02T00:00:00Z")
+
+    async def test_dr_retry_honors_provider_retry_after(self) -> None:
+        task = runner.DomainStateTask(
+            normalized_domain="rate-limited.example",
+            attempts=1,
+            max_attempts=5,
+            generation=1,
+            lease_token="lease-token",
+            fetch_domain_rating=True,
+            fetch_rdap=False,
+        )
+        client = AsyncMock()
+        client.fetch.side_effect = [
+            runner.DomainStateResult(
+                "failed",
+                None,
+                None,
+                "Ahrefs HTTP 429",
+                retry_after_seconds=12,
+            ),
+            runner.DomainStateResult("done", 55.0, None),
+        ]
+        store = AsyncMock()
+        store.renew_lease.return_value = True
+        store.complete_task.return_value = True
+        sleep = AsyncMock()
+
+        with (
+            patch.object(runner.random, "uniform", return_value=2.0),
+            patch.object(runner.asyncio, "sleep", sleep),
+        ):
+            status = await runner.process_domain_state(task, client, store, max_retries=1)
+
+        self.assertEqual(status, "done")
+        sleep.assert_awaited_once_with(12.0)
 
 
 class DomainStateMigrationContractTests(unittest.TestCase):
@@ -3468,6 +3551,24 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counts["traffic_failed"], 1)
         self.assertEqual(counts["domain_claimed"], 2)
         self.assertEqual(counts["domain_failed"], 0)
+
+    def test_domain_state_batches_poll_again_after_one_second(self) -> None:
+        self.assertEqual(
+            runner.domain_state_next_delay_seconds(
+                {"claimed": 50},
+                batch_limit=50,
+                idle_interval_seconds=1,
+            ),
+            1,
+        )
+        self.assertEqual(
+            runner.domain_state_next_delay_seconds(
+                {"claimed": 49},
+                batch_limit=50,
+                idle_interval_seconds=1,
+            ),
+            1,
+        )
 
     async def test_activate_market_snapshot_id_cli_does_not_require_brightdata(self) -> None:
         config = type("ActivationConfig", (), {"poll_interval_seconds": 60})()

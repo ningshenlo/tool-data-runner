@@ -68,6 +68,8 @@ DEFAULT_CATEGORY_CLASSIFICATION_FALLBACK_MODEL = (
 D1_API_BASE = "https://api.cloudflare.com/client/v4"
 DOMAIN_STATE_SOURCE = "ahrefs"
 AHREFS_DOMAIN_RATING_URL = "https://api.ahrefs.com/v3/public/domain-rating-free"
+AHREFS_DEFAULT_REQUESTS_PER_MINUTE = 60
+AHREFS_MAX_REQUESTS_PER_MINUTE = 60
 IANA_RDAP_DNS = "https://data.iana.org/rdap/dns.json"
 RDAP_USER_AGENT = "traffic-runner-domain-whois/0.1"
 PRICING_EXTRACTOR_VERSION = "python-rule-pricing-v1"
@@ -213,6 +215,7 @@ class Config:
     cloudflare_d1_database_id: str
     cloudflare_api_token: str
     ahref_api_key: str
+    ahrefs_requests_per_minute: int
     brightdata_proxy_host: str
     brightdata_proxy_port: int
     brightdata_proxy_user: str
@@ -232,6 +235,7 @@ class Config:
     asset_limit: int
     domain_state_limit: int
     domain_state_max_age_days: int
+    domain_state_poll_interval_seconds: int
     pricing_monitor_enabled: bool
     pricing_limit: int
     pricing_manual_review_replay_limit: int
@@ -362,6 +366,7 @@ class DomainStateResult:
     error: str | None = None
     rdap_status: str | None = None
     rdap_error: str | None = None
+    retry_after_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -704,6 +709,16 @@ def load_config(require_brightdata: bool = True) -> Config:
         cloudflare_d1_database_id=os.environ["CLOUDFLARE_D1_DATABASE_ID"],
         cloudflare_api_token=os.environ["CLOUDFLARE_API_TOKEN"],
         ahref_api_key=(os.getenv("AHREF_API_KEY") or os.getenv("AHREFS_API_KEY", "")).strip(),
+        ahrefs_requests_per_minute=min(
+            AHREFS_MAX_REQUESTS_PER_MINUTE,
+            max(
+                1,
+                read_int_env(
+                    "RUNNER_AHREFS_REQUESTS_PER_MINUTE",
+                    AHREFS_DEFAULT_REQUESTS_PER_MINUTE,
+                ),
+            ),
+        ),
         brightdata_proxy_host=os.getenv("BRIGHTDATA_PROXY_HOST", "brd.superproxy.io"),
         brightdata_proxy_port=read_int_env("BRIGHTDATA_PROXY_PORT", 33335),
         brightdata_proxy_user=os.environ["BRIGHTDATA_PROXY_USER"] if require_brightdata else os.getenv("BRIGHTDATA_PROXY_USER", ""),
@@ -730,7 +745,12 @@ def load_config(require_brightdata: bool = True) -> Config:
         traffic_release_queue_limit=max(1, read_int_env("TRAFFIC_RELEASE_QUEUE_LIMIT", 5000)),
         asset_limit=read_int_env("RUNNER_ASSET_LIMIT", 5),
         domain_state_limit=read_int_env("RUNNER_DOMAIN_STATE_LIMIT", 50),
-        domain_state_max_age_days=read_int_env("RUNNER_DOMAIN_STATE_MAX_AGE_DAYS", 30),
+        domain_state_max_age_days=max(
+            1, read_int_env("RUNNER_DOMAIN_STATE_MAX_AGE_DAYS", 30)
+        ),
+        domain_state_poll_interval_seconds=max(
+            1, read_int_env("RUNNER_DOMAIN_POLL_INTERVAL_SECONDS", 1)
+        ),
         pricing_monitor_enabled=read_bool_env("PRICING_MONITOR_ENABLED", False),
         pricing_limit=read_int_env("RUNNER_PRICING_LIMIT", 20),
         pricing_manual_review_replay_limit=max(
@@ -4704,9 +4724,47 @@ def find_rdap_base_urls(domain: str, bootstrap: dict[str, Any]) -> list[str]:
     return best_urls
 
 
+class AsyncRequestPacer:
+    """Space request starts evenly so a concurrent batch cannot burst the provider."""
+
+    def __init__(self, requests_per_minute: int) -> None:
+        bounded_rate = min(
+            AHREFS_MAX_REQUESTS_PER_MINUTE,
+            max(1, int(requests_per_minute)),
+        )
+        self.requests_per_minute = bounded_rate
+        self.interval_seconds = 60.0 / bounded_rate
+        self._next_request_at = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            scheduled_at = max(now, self._next_request_at)
+            self._next_request_at = scheduled_at + self.interval_seconds
+            delay = scheduled_at - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+
+def parse_retry_after_seconds(value: str | None, default: float = 60.0) -> float:
+    if not value:
+        return default
+    try:
+        return max(1.0, float(value.strip()))
+    except (TypeError, ValueError):
+        return default
+
+
 class DomainStateClient:
-    def __init__(self, ahref_api_key: str) -> None:
+    def __init__(
+        self,
+        ahref_api_key: str,
+        requests_per_minute: int = AHREFS_DEFAULT_REQUESTS_PER_MINUTE,
+        request_pacer: Any | None = None,
+    ) -> None:
         self.ahref_api_key = ahref_api_key.strip()
+        self.request_pacer = request_pacer or AsyncRequestPacer(requests_per_minute)
 
     async def fetch(
         self,
@@ -4749,6 +4807,9 @@ class DomainStateClient:
             error=error,
             rdap_status=rdap_result.status if rdap_result is not None else None,
             rdap_error=rdap_result.error if rdap_result is not None else None,
+            retry_after_seconds=(
+                ahrefs_result.retry_after_seconds if ahrefs_result is not None else None
+            ),
         )
 
     async def fetch_ahrefs_domain_rating(self, domain: str) -> DomainStateResult:
@@ -4759,6 +4820,7 @@ class DomainStateClient:
             raise RuntimeError("AHREF_API_KEY is required for Ahrefs Domain Rating requests")
 
         endpoint = httpx.URL(AHREFS_DOMAIN_RATING_URL).copy_add_param("target", clean_domain)
+        await self.request_pacer.wait()
         try:
             async with httpx.AsyncClient(timeout=25.0) as client:
                 response = await client.get(
@@ -4773,6 +4835,16 @@ class DomainStateClient:
 
         if response.status_code == 404:
             return DomainStateResult(status="no_data", domain_rating=None, domain_created_at=None, error="ahrefs_not_found")
+        if response.status_code == 429:
+            return DomainStateResult(
+                status="failed",
+                domain_rating=None,
+                domain_created_at=None,
+                error=f"Ahrefs HTTP 429: {response.text[:300]}",
+                retry_after_seconds=parse_retry_after_seconds(
+                    response.headers.get("retry-after")
+                ),
+            )
         if not response.is_success:
             raise RuntimeError(f"Ahrefs HTTP {response.status_code}: {response.text[:300]}")
 
@@ -10733,6 +10805,7 @@ async def process_domain_state(
                 error=current_result.error,
                 rdap_status=rdap_status,
                 rdap_error=rdap_error,
+                retry_after_seconds=current_result.retry_after_seconds,
             )
         except Exception as error:
             if fetch_rdap:
@@ -10755,7 +10828,12 @@ async def process_domain_state(
         if result.status != "failed":
             break
         if attempt < max_retries:
-            await asyncio.sleep(random.uniform(1.0, 3.0))
+            await asyncio.sleep(
+                max(
+                    random.uniform(1.0, 3.0),
+                    float(result.retry_after_seconds or 0),
+                )
+            )
 
     if not await store.renew_lease(task):
         return "stale"
@@ -10817,7 +10895,15 @@ async def _run_domain_state_once(config: Config, d1: D1Client, limit: int | None
     concurrency = getattr(config, "domain_state_concurrency", config.concurrency)
     log_info("domain_state_runner.batch.start", limit=effective_limit, concurrency=concurrency)
     store = D1DomainStateStore(d1)
-    client = DomainStateClient(config.ahref_api_key)
+    requests_per_minute = getattr(
+        config,
+        "ahrefs_requests_per_minute",
+        AHREFS_DEFAULT_REQUESTS_PER_MINUTE,
+    )
+    client = DomainStateClient(
+        config.ahref_api_key,
+        requests_per_minute=requests_per_minute,
+    )
     credential_requeued = (
         await store.requeue_missing_credential_tasks(effective_limit)
         if config.ahref_api_key
@@ -12211,20 +12297,47 @@ async def run_pricing_loop(
         await asyncio.sleep(interval_seconds)
 
 
+def domain_state_next_delay_seconds(
+    counts: dict[str, int],
+    batch_limit: int,
+    idle_interval_seconds: int,
+) -> int:
+    """Poll continuously without the former fixed 15-minute batch pause."""
+    del counts, batch_limit
+    return max(1, int(idle_interval_seconds))
+
+
 async def run_domain_state_loop(config: Config, limit: int | None, interval_seconds: int) -> None:
-    log_info("domain_state_runner.loop.start", interval_seconds=interval_seconds)
+    effective_limit = limit or config.domain_state_limit
+    log_info(
+        "domain_state_runner.loop.start",
+        interval_seconds=interval_seconds,
+        batch_limit=effective_limit,
+        max_age_days=config.domain_state_max_age_days,
+        requests_per_minute=getattr(
+            config,
+            "ahrefs_requests_per_minute",
+            AHREFS_DEFAULT_REQUESTS_PER_MINUTE,
+        ),
+    )
     while True:
         started_at = time.monotonic()
+        next_delay = interval_seconds
         try:
-            counts = await run_domain_state_once(config, limit)
+            counts = await run_domain_state_once(config, effective_limit)
             log_info(
                 "domain_state_runner.batch.summary",
                 duration_ms=round((time.monotonic() - started_at) * 1000),
                 **counts,
             )
+            next_delay = domain_state_next_delay_seconds(
+                counts,
+                effective_limit,
+                interval_seconds,
+            )
         except Exception as error:
             log_error("domain_state_runner.batch.failed", error=str(error)[:500])
-        await asyncio.sleep(interval_seconds)
+        await asyncio.sleep(next_delay)
 
 
 async def run_taxonomy_once(config: Config) -> dict[str, int]:
@@ -12337,7 +12450,7 @@ async def run_periodic_facts_loop(
     interval_seconds: int,
 ) -> None:
     traffic_interval = interval_seconds or config.poll_interval_seconds
-    domain_state_interval = max(900, traffic_interval * 3)
+    domain_state_interval = getattr(config, "domain_state_poll_interval_seconds", 1)
     log_info(
         "periodic_facts_runner.loop.start",
         traffic_interval_seconds=traffic_interval,
@@ -12355,7 +12468,7 @@ async def run_all_loop(config: Config, limit: int | None, interval_seconds: int,
     shared_interval = interval_seconds or 300
     assets_interval = max(60, shared_interval // 2)
     traffic_interval = shared_interval
-    domain_state_interval = max(900, shared_interval * 3)
+    domain_state_interval = getattr(config, "domain_state_poll_interval_seconds", 1)
     pricing_interval = max(900, shared_interval * 3)
     log_info(
         "all_runner.loop.start",
@@ -12972,7 +13085,13 @@ def main() -> None:
 
     if args.domain_state:
         if args.loop:
-            asyncio.run(run_domain_state_loop(config, args.limit, interval_seconds))
+            asyncio.run(
+                run_domain_state_loop(
+                    config,
+                    args.limit,
+                    args.interval_seconds or config.domain_state_poll_interval_seconds,
+                )
+            )
             return True
 
         counts = asyncio.run(run_domain_state_once(config, args.limit))
