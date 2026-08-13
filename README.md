@@ -65,7 +65,7 @@ docker compose -f docker-compose.dokploy.yml up -d
 |---|---|---|
 | `periodic-facts-worker` | `--periodic-facts --loop` | Similarweb traffic + Ahrefs DR/RDAP |
 | `assets-worker` | `--assets --loop` | assets + enrichment readiness |
-| `pricing-monitor-worker` | `--pricing --loop` | pricing snapshots/extractions/Claims shadow |
+| `pricing-monitor-worker` | `--pricing --loop` | paused by default; pricing snapshots/extractions/Claims shadow when explicitly enabled |
 | `taxonomy-worker` | `--taxonomy --loop` | production primary taxonomy automation |
 
 The compose file is intended for a Dokploy Compose project and intentionally exposes
@@ -87,13 +87,20 @@ pages. Results between the evidence floor (`0.35`) and the auto-accept threshold
 remain `provisional`; lower-confidence leaves are `unresolved`. Existing verified
 manual primaries are immutable and always win.
 
-Production defaults process 20 tools every 5 minutes with concurrency 3. A
+Production defaults process batches of 50 tools with concurrency 3. Full batches
+continue immediately while work remains; the worker waits 5 minutes only after a
+partial or empty batch indicates that the current backlog is drained. A
 billing, quota, rate-limit, or authentication response trips a batch circuit
 breaker and backs taxonomy off for 6 hours. Set `TAXONOMY_AUTO_ENABLED=0` as the
 emergency kill switch. Genuine failed runs retry at most three times; succeeded,
 partial, and skipped results are not repeatedly charged. Failed-run budgets are
 scoped to the active primary model, so switching providers can recover previously
 exhausted tools without deleting their audit history.
+
+Pricing monitoring is paused by default. Compose scales `pricing-monitor-worker`
+to zero with `PRICING_MONITOR_REPLICAS=0`, and `PRICING_MONITOR_ENABLED=0` is a
+second kill switch that prevents D1/provider work even if a container is started
+manually. Re-enable pricing only by setting both values to `1`.
 
 Pricing deliberately leaves new results in `manual_review`. The legacy `--approve-pricing` switch is rejected so a refetch cannot bypass the audited Admin review.
 

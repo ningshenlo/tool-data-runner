@@ -833,6 +833,43 @@ class BrowserStructuredPayloadValidationTests(unittest.TestCase):
         )
 
 
+class WorkerControlTests(unittest.IsolatedAsyncioTestCase):
+    def test_taxonomy_full_batch_continues_without_poll_delay(self) -> None:
+        config = type(
+            "TaxonomyConfig",
+            (),
+            {
+                "taxonomy_limit": 50,
+                "taxonomy_interval_seconds": 300,
+                "taxonomy_provider_backoff_seconds": 21600,
+            },
+        )()
+
+        self.assertEqual(
+            runner.taxonomy_next_delay_seconds(config, {"selected": 50}),
+            0,
+        )
+        self.assertEqual(
+            runner.taxonomy_next_delay_seconds(config, {"selected": 49}),
+            300,
+        )
+        self.assertEqual(
+            runner.taxonomy_next_delay_seconds(
+                config,
+                {"selected": 50, "provider_blocked": 1},
+            ),
+            21600,
+        )
+
+    async def test_disabled_pricing_never_opens_d1_or_provider_work(self) -> None:
+        config = type("PricingConfig", (), {"pricing_monitor_enabled": False})()
+
+        with patch.object(runner, "D1Client", side_effect=AssertionError("D1 must stay idle")):
+            counts = await runner.run_pricing_once(config)
+
+        self.assertEqual(counts, {"disabled": 1})
+
+
 class DomainStateClientContractTests(unittest.IsolatedAsyncioTestCase):
     async def test_ahrefs_domain_rating_request_uses_bearer_token(self) -> None:
         observed: dict[str, Any] = {}

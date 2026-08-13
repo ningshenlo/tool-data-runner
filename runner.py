@@ -232,6 +232,7 @@ class Config:
     asset_limit: int
     domain_state_limit: int
     domain_state_max_age_days: int
+    pricing_monitor_enabled: bool
     pricing_limit: int
     pricing_manual_review_replay_limit: int
     pricing_timeout_seconds: int
@@ -730,6 +731,7 @@ def load_config(require_brightdata: bool = True) -> Config:
         asset_limit=read_int_env("RUNNER_ASSET_LIMIT", 5),
         domain_state_limit=read_int_env("RUNNER_DOMAIN_STATE_LIMIT", 50),
         domain_state_max_age_days=read_int_env("RUNNER_DOMAIN_STATE_MAX_AGE_DAYS", 30),
+        pricing_monitor_enabled=read_bool_env("PRICING_MONITOR_ENABLED", False),
         pricing_limit=read_int_env("RUNNER_PRICING_LIMIT", 20),
         pricing_manual_review_replay_limit=max(
             0,
@@ -737,7 +739,7 @@ def load_config(require_brightdata: bool = True) -> Config:
         ),
         pricing_timeout_seconds=read_int_env("RUNNER_PRICING_TIMEOUT_SECONDS", 20),
         taxonomy_auto_enabled=read_bool_env("TAXONOMY_AUTO_ENABLED", True),
-        taxonomy_limit=max(1, read_int_env("RUNNER_TAXONOMY_LIMIT", 20)),
+        taxonomy_limit=max(1, read_int_env("RUNNER_TAXONOMY_LIMIT", 50)),
         taxonomy_interval_seconds=max(
             300, read_int_env("RUNNER_TAXONOMY_INTERVAL_SECONDS", 300)
         ),
@@ -12108,6 +12110,9 @@ async def run_pricing_once(
     dry_run: bool = False,
     timeout_seconds: int | None = None,
 ) -> dict[str, int]:
+    if not getattr(config, "pricing_monitor_enabled", True):
+        log_info("pricing_runner.disabled", kill_switch="PRICING_MONITOR_ENABLED=0")
+        return {"disabled": 1}
     async with D1Client(config) as d1:
         if dry_run:
             return await _run_pricing_once(
@@ -12179,6 +12184,10 @@ async def run_pricing_loop(
     timeout_seconds: int | None,
 ) -> None:
     log_info("pricing_runner.loop.start", interval_seconds=interval_seconds)
+    if not getattr(config, "pricing_monitor_enabled", True):
+        log_info("pricing_runner.disabled", kill_switch="PRICING_MONITOR_ENABLED=0")
+        while True:
+            await asyncio.sleep(max(60, interval_seconds))
     while True:
         started_at = time.monotonic()
         try:
@@ -12245,6 +12254,15 @@ async def run_taxonomy_once(config: Config) -> dict[str, int]:
         )
 
 
+def taxonomy_next_delay_seconds(config: Config, counts: dict[str, int]) -> int:
+    """Poll only when drained; immediately continue while a full batch signals backlog."""
+    if int(counts.get("provider_blocked") or 0) > 0:
+        return int(config.taxonomy_provider_backoff_seconds)
+    if int(counts.get("selected") or 0) >= int(config.taxonomy_limit):
+        return 0
+    return int(config.taxonomy_interval_seconds)
+
+
 async def run_taxonomy_loop(config: Config) -> None:
     log_info(
         "taxonomy_runner.loop.start",
@@ -12272,8 +12290,14 @@ async def run_taxonomy_loop(config: Config) -> None:
                 duration_ms=round((time.monotonic() - started_at) * 1000),
                 **counts,
             )
-            if int(counts.get("provider_blocked") or 0) > 0:
-                delay = config.taxonomy_provider_backoff_seconds
+            delay = taxonomy_next_delay_seconds(config, counts)
+            if delay == 0:
+                log_info(
+                    "taxonomy_runner.backlog.continue",
+                    selected=counts.get("selected", 0),
+                    limit=config.taxonomy_limit,
+                )
+            elif int(counts.get("provider_blocked") or 0) > 0:
                 log_error(
                     "taxonomy_runner.provider_backoff",
                     delay_seconds=delay,
@@ -12346,8 +12370,19 @@ async def run_all_loop(config: Config, limit: int | None, interval_seconds: int,
         run_assets_loop(config, config.asset_limit, assets_interval),
         run_loop(config, limit or config.limit, traffic_interval),
         run_domain_state_loop(config, config.domain_state_limit, domain_state_interval),
-        run_pricing_loop(config, config.pricing_limit, pricing_interval, None, False, False, timeout_seconds),
     ]
+    if getattr(config, "pricing_monitor_enabled", True):
+        loops.append(
+            run_pricing_loop(
+                config,
+                config.pricing_limit,
+                pricing_interval,
+                None,
+                False,
+                False,
+                timeout_seconds,
+            )
+        )
     if config.taxonomy_auto_enabled:
         loops.append(run_taxonomy_loop(config))
     await asyncio.gather(*loops)
@@ -12546,6 +12581,8 @@ def apply_runtime_profile(config: Config, args: argparse.Namespace) -> Config:
     default_service, workloads = runtime_profile_for_args(args)
     if args.all and not getattr(config, "taxonomy_auto_enabled", False):
         workloads = tuple(workload for workload in workloads if workload != "taxonomy")
+    if args.all and not getattr(config, "pricing_monitor_enabled", True):
+        workloads = tuple(workload for workload in workloads if workload != "pricing")
     service_name = (os.getenv("RUNNER_SERVICE_NAME") or default_service).strip()
     if not hasattr(config, "__dataclass_fields__"):
         setattr(config, "runner_service_name", service_name)
