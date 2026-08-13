@@ -335,7 +335,7 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
                 stages.append(stage)
                 structured_domains.append(task.normalized_domain)
                 prompts[stage] = prompt
-                if stage == "shadow_profile_visible_text":
+                if stage == "shadow_profile_main_content":
                     return task.official_url, {
                         "entity_kind": "independent_product",
                         "entity_confidence": 0.95,
@@ -385,17 +385,17 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.primary_slug, "text-to-video")
         self.assertEqual(
             stages,
-            ["shadow_profile_visible_text", "shadow_l1_top2", "shadow_leaf"],
+            ["shadow_profile_main_content", "shadow_l1_top2", "shadow_leaf"],
         )
         self.assertEqual(content_urls, ["https://product.test/"])
         self.assertEqual(structured_domains, ["example.com", "example.com", "example.com"])
         self.assertIn("Generate videos", prompts["shadow_l1_top2"])
         self.assertIn("Generate videos", prompts["shadow_leaf"])
-        self.assertEqual(result.raw["profile_extraction_path"], "visible_text_primary")
-        self.assertEqual(result.raw["classification_transport"], "neutral_profile_only")
+        self.assertEqual(result.raw["profile_extraction_path"], "cleaned_main_content")
+        self.assertEqual(result.raw["classification_transport"], "cleaned_main_content_only")
         self.assertEqual(result.raw["capabilities_skipped"], "primary_only")
 
-    async def test_profile_uses_direct_page_only_when_content_fetch_fails(self):
+    async def test_profile_never_uses_direct_page_when_content_fetch_fails(self):
         calls: list[tuple[str, str]] = []
 
         class FakeBrowser:
@@ -409,33 +409,7 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
                 self, task, *, stage, prompt, json_schema, custom_ai, **kwargs
             ):
                 calls.append((stage, task.normalized_domain))
-                if stage == "shadow_profile_direct_fallback":
-                    return task.official_url, {
-                        "entity_kind": "independent_product",
-                        "entity_confidence": 0.95,
-                        "entity_reason": "Dedicated product",
-                        "entity_evidence": [{"quote": "Start for free"}],
-                        "primary_job": {
-                            "value": "Generate videos",
-                            "evidence": [{"quote": "Generate videos from text"}],
-                        },
-                        "primary_outputs": [],
-                        "capabilities_raw": [],
-                    }
-                if stage == "shadow_l1_top2":
-                    return task.official_url, {
-                        "l1_candidates": [
-                            {"slug": "video", "confidence": 0.9, "reason": "main market"}
-                        ]
-                    }
-                if stage == "shadow_leaf":
-                    return task.official_url, {
-                        "leaf_slug": "text-to-video",
-                        "confidence": 0.88,
-                        "reason": "primary job",
-                        "evidence": [{"quote": "Generate videos from text"}],
-                    }
-                raise AssertionError(f"unexpected stage: {stage}")
+                raise AssertionError(f"unexpected structured call: {stage}")
 
         result = await classify_tool_shadow(
             d1=object(),
@@ -455,16 +429,11 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
             include_capabilities=False,
         )
 
-        self.assertEqual(result.status, "succeeded")
-        self.assertEqual(result.raw["profile_extraction_path"], "direct_page_fallback")
-        self.assertEqual(
-            calls,
-            [
-                ("shadow_profile_direct_fallback", "fallback.test"),
-                ("shadow_l1_top2", "example.com"),
-                ("shadow_leaf", "example.com"),
-            ],
-        )
+        self.assertEqual(result.status, "failed")
+        self.assertIn("profile_extract_failed", result.error)
+        self.assertIn("content unavailable", result.error)
+        self.assertEqual(calls, [])
+        self.assertNotIn("profile_direct_fallback_raw", result.raw)
 
 
 class ProfileEvidenceTests(unittest.TestCase):

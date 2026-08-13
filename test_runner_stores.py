@@ -315,6 +315,45 @@ class PageAndNameQualityTests(unittest.TestCase):
 
 
 class CategoryPromptHelperTests(unittest.TestCase):
+    def test_homepage_main_content_excludes_navigation_footer_and_executable_markup(self) -> None:
+        html_body = """
+        <html><body>
+          <nav>Docs Pricing Login</nav>
+          <header>Brand shell</header>
+          <main>
+            <h1>Generate product videos</h1>
+            <section><p>Turn a script into a narrated video.</p></section>
+            <ul><li>Text to video</li><li>Voice generation</li></ul>
+            <script>ignoreSecretInstruction()</script>
+            <style>.hidden { display:none }</style>
+          </main>
+          <footer>Privacy Terms Careers</footer>
+        </body></html>
+        """
+
+        text = runner.extract_homepage_main_text(html_body, limit=10000)
+
+        self.assertIn("Generate product videos", text)
+        self.assertIn("Turn a script into a narrated video.", text)
+        self.assertIn("Text to video", text)
+        self.assertNotIn("Docs Pricing Login", text)
+        self.assertNotIn("Privacy Terms Careers", text)
+        self.assertNotIn("ignoreSecretInstruction", text)
+        self.assertNotIn("display:none", text)
+        self.assertNotIn("Brand shell", text)
+
+    def test_homepage_main_content_falls_back_to_cleaned_body(self) -> None:
+        text = runner.extract_homepage_main_text(
+            "<body><nav>Menu</nav><h1>AI spreadsheet assistant</h1>"
+            "<p>Build formulas from plain language.</p><footer>Terms</footer></body>",
+            limit=10000,
+        )
+
+        self.assertEqual(
+            text,
+            "AI spreadsheet assistant\nBuild formulas from plain language.",
+        )
+
     def test_deterministic_category_fallback_prefers_matching_taxonomy_leaf(self) -> None:
         result = runner.deterministic_fallback_category(
             "AI writing assistant for blog content generation and editing",
@@ -497,7 +536,12 @@ class AssetExtractionContractTests(unittest.IsolatedAsyncioTestCase):
             runner.CategoryCatalogEntry(slug="code-generation-understanding", parent_slug="coding-development"),
         ]
 
-        result = await client.fetch_homepage_categories(task, catalog)
+        result = await client.fetch_homepage_categories(
+            task,
+            catalog,
+            main_content="Generate and edit written content with an AI writing assistant.",
+            source_url="https://example.com",
+        )
 
         self.assertEqual((result.category_l1, result.category_l2), ("writing-text", "content-generation"))
         self.assertEqual(len(client.calls), 2)
@@ -508,7 +552,11 @@ class AssetExtractionContractTests(unittest.IsolatedAsyncioTestCase):
             "deepseek/deepseek-v4-flash",
         )
         self.assertEqual(client.calls[0]["custom_ai"][0]["authorization"], "Bearer deepseek-test-key")
+        self.assertEqual(client.calls[0]["custom_ai"][0]["thinking"], {"type": "disabled"})
         self.assertEqual(client.calls[0]["response_format"], {"type": "json_object"})
+        self.assertNotIn("url", client.calls[0])
+        self.assertIn("Cleaned homepage content", client.calls[0]["html"])
+        self.assertIn("CLEANED HOMEPAGE MAIN CONTENT", client.calls[0]["prompt"])
         self.assertIn("Required keys: category_l1", client.calls[0]["prompt"])
         self.assertIn("coding-development", client.calls[0]["prompt"])
         self.assertIn("content-generation", client.calls[1]["prompt"])
@@ -542,12 +590,17 @@ class AssetExtractionContractTests(unittest.IsolatedAsyncioTestCase):
                 )
 
         task = runner.AssetTask(1, "example", "example.com", "https://example.com", 1, 5, 1, "lease")
-        result = await RecordingClient().fetch_homepage_categories(task, [
-            runner.CategoryCatalogEntry(slug="writing-text"),
-            runner.CategoryCatalogEntry(slug="coding-development"),
-            runner.CategoryCatalogEntry(slug="content-generation", parent_slug="writing-text"),
-            runner.CategoryCatalogEntry(slug="code-generation-understanding", parent_slug="coding-development"),
-        ])
+        result = await RecordingClient().fetch_homepage_categories(
+            task,
+            [
+                runner.CategoryCatalogEntry(slug="writing-text"),
+                runner.CategoryCatalogEntry(slug="coding-development"),
+                runner.CategoryCatalogEntry(slug="content-generation", parent_slug="writing-text"),
+                runner.CategoryCatalogEntry(slug="code-generation-understanding", parent_slug="coding-development"),
+            ],
+            main_content="Write and edit long-form content.",
+            source_url="https://example.com",
+        )
 
         self.assertEqual(result.category_l1, "writing-text")
         self.assertEqual(result.category_l2, "")
@@ -606,6 +659,8 @@ class AssetExtractionContractTests(unittest.IsolatedAsyncioTestCase):
         categories = await client.fetch_homepage_categories(
             task,
             ["image-processing", "image-editing"],
+            main_content="Edit and transform images with AI.",
+            source_url="https://example.com",
         )
 
         self.assertEqual(core.description, "Example description")
@@ -674,6 +729,55 @@ class AssetExtractionContractTests(unittest.IsolatedAsyncioTestCase):
                 await client.call_quick_action("json", {"url": "https://example.com"})
 
         self.assertTrue(raised.exception.retryable)
+
+
+class BrowserStructuredTransportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_cleaned_text_tries_each_model_once_without_url_navigation(self) -> None:
+        class EmptyResultClient(runner.CloudflareBrowserRunAssetClient):
+            def __init__(self) -> None:
+                self.calls: list[dict[str, Any]] = []
+
+            async def call_quick_action(self, endpoint: str, body: dict[str, Any]) -> Any:
+                self.assert_json_endpoint(endpoint)
+                self.calls.append(body)
+                return {}
+
+            @staticmethod
+            def assert_json_endpoint(endpoint: str) -> None:
+                if endpoint != "json":
+                    raise AssertionError(f"unexpected endpoint: {endpoint}")
+
+        client = EmptyResultClient()
+        models = [
+            {
+                "model": "deepseek/deepseek-v4-flash",
+                "authorization": "Bearer deepseek-test-key",
+            },
+            {
+                "model": "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+                "authorization": "Bearer workers-test-key",
+            },
+        ]
+
+        with self.assertRaises(runner.AssetPipelineError):
+            await client.fetch_structured_text_data(
+                source_url="https://product.example/",
+                stage="shadow_profile_main_content",
+                prompt="CLEANED HOMEPAGE MAIN CONTENT:\nGenerate videos from text.",
+                json_schema={
+                    "type": "object",
+                    "properties": {"primary_job": {"type": "string"}},
+                    "required": ["primary_job"],
+                },
+                custom_ai=models,
+            )
+
+        self.assertEqual(
+            [call["custom_ai"][0]["model"] for call in client.calls],
+            [item["model"] for item in models],
+        )
+        self.assertTrue(all("url" not in call for call in client.calls))
+        self.assertTrue(all("html" in call for call in client.calls))
 
 
 class BrowserStructuredPayloadValidationTests(unittest.TestCase):
