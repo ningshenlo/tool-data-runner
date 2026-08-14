@@ -115,6 +115,43 @@ services:
       CLOUDFLARE_R2_BUCKET: ${CLOUDFLARE_R2_BUCKET:-sitesimgs}
       R2_PUBLIC_BASE_URL: ${R2_PUBLIC_BASE_URL:-https://img.sigpik.com}
 
+  sitemap-monitor-worker:
+    <<: *runner-base
+    deploy:
+      replicas: ${SITEMAP_MONITOR_REPLICAS:-0}
+    command:
+      - python
+      - -m
+      - sitemap_monitor
+      - --backend
+      - cloudflare
+      - --loop
+      - --require-enabled
+      - --interval-seconds
+      - ${SITEMAP_MONITOR_POLL_SECONDS:-30}
+      - --check-interval-seconds
+      - ${SITEMAP_MONITOR_CHECK_INTERVAL_SECONDS:-3600}
+      - --batch-size
+      - ${SITEMAP_MONITOR_BATCH_SIZE:-25}
+      - --max-attempts
+      - ${SITEMAP_MONITOR_MAX_ATTEMPTS:-5}
+      - --job-lease-seconds
+      - ${SITEMAP_MONITOR_JOB_LEASE_SECONDS:-900}
+    environment:
+      <<: *common-environment
+      RUNNER_SERVICE_NAME: sitemap-monitor-worker
+      RUNNER_INSTANCE_ID: ${SITEMAP_MONITOR_RUNNER_INSTANCE_ID:-sitemap-monitor-worker}
+      SITEMAP_MONITOR_ENABLED: ${SITEMAP_MONITOR_ENABLED:-0}
+      SITEMAP_MONITOR_SITES: ${SITEMAP_MONITOR_SITES:-}
+      SITEMAP_MONITOR_SITE_FILE: ${SITEMAP_MONITOR_SITE_FILE:-sitemap_monitor/observation-cohort-v1.txt}
+      SITEMAP_MONITOR_R2_BUCKET: ${SITEMAP_MONITOR_R2_BUCKET:-sitemap-monitor}
+      SITEMAP_MONITOR_SYNTHETIC_DNS_DOH_FALLBACK: ${SITEMAP_MONITOR_SYNTHETIC_DNS_DOH_FALLBACK:-0}
+      FOR_ALL_APP_R2_ACCESS_KEY_ID: ${FOR_ALL_APP_R2_ACCESS_KEY_ID}
+      FOR_ALL_APP_R2_SECRET_ACCESS_KEY: ${FOR_ALL_APP_R2_SECRET_ACCESS_KEY}
+      CLOUDFLARE_R2_ACCESS_KEY_ID: ${CLOUDFLARE_R2_ACCESS_KEY_ID:-}
+      CLOUDFLARE_R2_SECRET_ACCESS_KEY: ${CLOUDFLARE_R2_SECRET_ACCESS_KEY:-}
+      CLOUDFLARE_R2_BUCKET: ${CLOUDFLARE_R2_BUCKET:-sitesimgs}
+
   taxonomy-worker:
     <<: *runner-base
     command: ["python", "runner.py", "--taxonomy", "--loop"]

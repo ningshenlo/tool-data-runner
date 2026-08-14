@@ -2,6 +2,12 @@
 
 Python runner for scheduled SimilarWeb traffic backfill, homepage asset capture, and pricing task execution.
 
+The repository also contains the Phase 1 `sitemap_monitor` package. It discovers and
+recursively checks sitemap resources, uses HTTP validators, filters serialization-only
+changes with semantic fingerprints, establishes a no-alert first baseline, and writes
+deterministic state/diff objects without using an LLM. See
+[`sitemap_monitor/README.md`](sitemap_monitor/README.md) for its isolated CLI and scope.
+
 It uses the Cloudflare D1 `ainav` database as the task source and system of record. Traffic mode first verifies that Similarweb has published the target previous-month data through one configured probe domain. Only after that D1-backed release gate is available does it queue the catalog-wide traffic batch, fetch through the Bright Data proxy zone, store rows in `domain_traffic_snapshots` and `tool_traffic_monthly`, then update `traffic_tasks` and `tool_traffic_fetch_status`.
 
 Pricing mode consumes existing `pricing_tasks`, fetches public pricing pages with normal browser-like request headers, stores `pricing_snapshots` and `pricing_extractions`, and leaves results in `manual_review`. Reviewers approve the stored extraction in ainav Admin; the runner then materializes that exact JSON into the active catalog.
@@ -57,6 +63,21 @@ Fill `.env` with:
 
 ## Run
 
+Run the Sitemap Monitor Phase 1 CLI locally (isolated from the legacy `runner.py`
+workloads and from remote D1/R2):
+
+```bash
+python -m sitemap_monitor --site https://example.com --once
+python -m sitemap_monitor --site https://example.com --loop \
+  --interval-seconds 30 --check-interval-seconds 3600
+```
+
+The first successful scan only creates a baseline. A later scan emits a diff only
+when the normalized URL set changes. The loop polls the D1-backed due-site scheduler;
+it does not rescan every configured site on every loop. `sitemap_jobs` provides the
+idempotency key, bounded retry/DLQ state, expiring job lease, and fenced completion.
+Local state defaults to `.sitemap-monitor/`.
+
 Production is split into four isolated Dokploy services that share one Python image:
 
 ```bash
@@ -69,6 +90,13 @@ docker compose -f docker-compose.dokploy.yml up -d
 | `assets-worker` | `--assets --loop` | assets + enrichment readiness |
 | `pricing-monitor-worker` | `--pricing --loop` | paused by default; pricing snapshots/extractions/Claims shadow when explicitly enabled |
 | `taxonomy-worker` | `--taxonomy --loop` | production primary taxonomy automation |
+
+An additional `sitemap-monitor-worker` profile is defined with a safe-off default.
+Remote migrations `0060_sitemap_monitor_phase1.sql` and
+`0061_sitemap_comparability_gate.sql`, a private R2 bucket, and the first 38-site
+observation cohort have been prepared. Enable it explicitly with both
+`SITEMAP_MONITOR_ENABLED=1` and a non-zero `SITEMAP_MONITOR_REPLICAS`; the cohort is
+observation-only and does not publish Signals.
 
 The compose file is intended for a Dokploy Compose project and intentionally exposes
 no HTTP ports. Give every service a stable, unique `RUNNER_INSTANCE_ID`; the defaults

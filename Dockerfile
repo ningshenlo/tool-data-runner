@@ -11,5 +11,6 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY runner.py .
 COPY taxonomy_shadow.py .
 COPY pricing ./pricing
+COPY sitemap_monitor ./sitemap_monitor
 
 CMD ["python", "runner.py", "--all", "--loop", "--interval-seconds", "300"]
