@@ -269,6 +269,54 @@ class EntityDecisionTests(unittest.TestCase):
         self.assertFalse(decision["accepted"])
         self.assertTrue(decision["error_page_detected"])
 
+    def test_neutral_transport_page_can_never_be_accepted_as_non_product(self):
+        decision = parse_entity_decision(
+            {
+                "entity_kind": "non_product",
+                "entity_confidence": 1.0,
+                "entity_reason": "The webpage does not describe a product or service.",
+                "entity_evidence": [
+                    {
+                        "quote": (
+                            "This domain is for use in documentation examples "
+                            "without needing permission."
+                        )
+                    }
+                ],
+            },
+            source_url="https://www.cursor.com/",
+        )
+
+        self.assertEqual(decision["candidate_kind"], "non_product")
+        self.assertEqual(decision["kind"], "unresolved")
+        self.assertFalse(decision["accepted"])
+        self.assertTrue(decision["neutral_transport_detected"])
+
+    def test_ungrounded_entity_quote_fails_closed(self):
+        decision = parse_entity_decision(
+            {
+                "entity_kind": "non_product",
+                "entity_confidence": 0.8,
+                "entity_reason": "The webpage does not describe a product or service.",
+                "entity_evidence": [
+                    {
+                        "quote": (
+                            "This domain is for use in documentation examples "
+                            "without needing permission."
+                        )
+                    }
+                ],
+            },
+            source_url="https://www.kimi.com/products/kimi-work",
+            source_text="Kimi Work is your AI productivity assistant for professional tasks.",
+        )
+
+        self.assertEqual(decision["candidate_kind"], "non_product")
+        self.assertEqual(decision["kind"], "unresolved")
+        self.assertFalse(decision["accepted"])
+        self.assertEqual(decision["evidence"], [])
+        self.assertTrue(decision["ungrounded_evidence_detected"])
+
     def test_existing_auto_entity_can_be_corrected_by_new_prediction(self):
         predicted = {
             "kind": "unresolved",
@@ -307,7 +355,7 @@ class EntityDecisionTests(unittest.TestCase):
 class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_primary_only_never_calls_capability_stages(self):
         stages: list[str] = []
-        structured_domains: list[str] = []
+        structured_urls: list[str] = []
         prompts: dict[str, str] = {}
         content_urls: list[str] = []
 
@@ -322,10 +370,10 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
                     "<a href='/signup'>Start for free</a></body></html>"
                 )
 
-            async def fetch_structured_asset_data(
+            async def fetch_structured_text_data(
                 self,
-                task,
                 *,
+                source_url,
                 stage,
                 prompt,
                 json_schema,
@@ -333,10 +381,10 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
                 **kwargs,
             ):
                 stages.append(stage)
-                structured_domains.append(task.normalized_domain)
+                structured_urls.append(source_url)
                 prompts[stage] = prompt
                 if stage == "shadow_profile_main_content":
-                    return task.official_url, {
+                    return source_url, {
                         "entity_kind": "independent_product",
                         "entity_confidence": 0.95,
                         "entity_reason": "Dedicated product",
@@ -349,13 +397,13 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
                         "capabilities_raw": [],
                     }
                 if stage == "shadow_l1_top2":
-                    return "https://example.com/", {
+                    return source_url, {
                         "l1_candidates": [
                             {"slug": "video", "confidence": 0.9, "reason": "main market"}
                         ]
                     }
                 if stage == "shadow_leaf":
-                    return "https://example.com/", {
+                    return source_url, {
                         "leaf_slug": "text-to-video",
                         "confidence": 0.88,
                         "reason": "primary job",
@@ -388,12 +436,115 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
             ["shadow_profile_main_content", "shadow_l1_top2", "shadow_leaf"],
         )
         self.assertEqual(content_urls, ["https://product.test/"])
-        self.assertEqual(structured_domains, ["example.com", "example.com", "example.com"])
+        self.assertEqual(
+            structured_urls,
+            ["https://product.test/", "https://product.test/", "https://product.test/"],
+        )
         self.assertIn("Generate videos", prompts["shadow_l1_top2"])
         self.assertIn("Generate videos", prompts["shadow_leaf"])
         self.assertEqual(result.raw["profile_extraction_path"], "cleaned_main_content")
         self.assertEqual(result.raw["classification_transport"], "cleaned_main_content_only")
         self.assertEqual(result.raw["capabilities_skipped"], "primary_only")
+
+    async def test_cursor_kimi_example_domain_evidence_fails_closed(self):
+        stages: list[str] = []
+
+        class FakeBrowser:
+            def category_custom_ai(self):
+                return [{"model": "fake-model"}]
+
+            async def fetch_homepage_content(self, task):
+                return task.official_url, (
+                    "<html><body><h1>Cursor: AI coding agent</h1>"
+                    "<p>Build software faster with an intelligent coding assistant.</p>"
+                    "</body></html>"
+                )
+
+            async def fetch_structured_text_data(
+                self, *, source_url, stage, prompt, json_schema, custom_ai, **kwargs
+            ):
+                stages.append(stage)
+                return source_url, {
+                    "entity_kind": "non_product",
+                    "entity_confidence": 1.0,
+                    "entity_reason": "The webpage does not describe a product or service.",
+                    "entity_evidence": [
+                        {
+                            "quote": (
+                                "This domain is for use in documentation examples "
+                                "without needing permission."
+                            )
+                        }
+                    ],
+                    "primary_job": {"value": "", "evidence": []},
+                    "primary_outputs": [],
+                    "capabilities_raw": [],
+                }
+
+        result = await classify_tool_shadow(
+            d1=object(),
+            browser_client=FakeBrowser(),
+            task=AssetTask(
+                tool_id=35,
+                canonical_slug="cursor",
+                normalized_domain="cursor.com",
+                official_url="https://www.cursor.com/",
+                attempts=0,
+                max_attempts=1,
+                generation=0,
+                lease_token="test-shadow",
+            ),
+            catalog=_catalog(),
+            dry_run=True,
+            include_capabilities=False,
+        )
+
+        self.assertEqual(stages, ["shadow_profile_main_content"])
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.error, "entity_unresolved")
+        self.assertEqual(result.entity_kind, "unresolved")
+        decision = result.raw["entity_decision"]
+        self.assertEqual(decision["candidate_kind"], "non_product")
+        self.assertFalse(decision["accepted"])
+        self.assertTrue(decision["ungrounded_evidence_detected"])
+
+    async def test_missing_prompt_only_transport_never_falls_back_to_asset_navigation(self):
+        asset_calls: list[str] = []
+
+        class FakeBrowser:
+            def category_custom_ai(self):
+                return [{"model": "fake-model"}]
+
+            async def fetch_homepage_content(self, task):
+                return task.official_url, (
+                    "<html><body><h1>AI product</h1><p>Start for free today.</p></body></html>"
+                )
+
+            async def fetch_structured_asset_data(self, task, *, stage, **kwargs):
+                asset_calls.append(stage)
+                raise AssertionError("asset navigation must not be used for taxonomy classification")
+
+        result = await classify_tool_shadow(
+            d1=object(),
+            browser_client=FakeBrowser(),
+            task=AssetTask(
+                tool_id=126,
+                canonical_slug="no-transport",
+                normalized_domain="product.test",
+                official_url="https://product.test/",
+                attempts=0,
+                max_attempts=1,
+                generation=0,
+                lease_token="test-shadow",
+            ),
+            catalog=_catalog(),
+            dry_run=True,
+            include_capabilities=False,
+        )
+
+        self.assertEqual(asset_calls, [])
+        self.assertEqual(result.status, "failed")
+        self.assertIn("structured_text_transport_unavailable", result.error)
 
     async def test_profile_never_uses_direct_page_when_content_fetch_fails(self):
         calls: list[tuple[str, str]] = []
@@ -562,6 +713,30 @@ class ProfileEvidenceTests(unittest.TestCase):
         self.assertEqual(len(profile["capabilities_raw"] or []), 1)
         capability = (profile["capabilities_raw"] or [])[0]
         self.assertEqual(len(capability["evidence"]), 2)
+
+    def test_build_profile_drops_product_facts_not_grounded_in_source_text(self):
+        profile = build_product_profile(
+            {
+                "primary_job": {
+                    "value": "Placeholder documentation site",
+                    "evidence": [
+                        {
+                            "quote": (
+                                "This domain is for use in documentation examples "
+                                "without needing permission."
+                            )
+                        }
+                    ],
+                },
+                "primary_outputs": [],
+                "capabilities_raw": [],
+            },
+            source_url="https://www.cursor.com/",
+            source_text="Cursor: AI coding agent. Build software faster.",
+        )
+
+        self.assertIsNone(profile["primary_job"])
+        self.assertFalse(profile_has_signal(profile))
 
 
 class PrimaryTop2Tests(unittest.TestCase):

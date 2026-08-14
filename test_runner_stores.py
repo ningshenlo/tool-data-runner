@@ -761,7 +761,7 @@ class BrowserStructuredTransportTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(runner.AssetPipelineError):
             await client.fetch_structured_text_data(
-                source_url="https://product.example/",
+                source_url="https://www.cursor.com/",
                 stage="shadow_profile_main_content",
                 prompt="CLEANED HOMEPAGE MAIN CONTENT:\nGenerate videos from text.",
                 json_schema={
@@ -778,6 +778,17 @@ class BrowserStructuredTransportTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertTrue(all("url" not in call for call in client.calls))
         self.assertTrue(all("html" in call for call in client.calls))
+        self.assertTrue(
+            all("example.com" not in str(call.get("html") or "") for call in client.calls)
+        )
+        self.assertTrue(
+            all(
+                call.get("html", "").startswith(
+                    '<main data-classification-transport="prompt-only">'
+                )
+                for call in client.calls
+            )
+        )
 
 
 class BrowserStructuredPayloadValidationTests(unittest.TestCase):

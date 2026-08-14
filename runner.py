@@ -3238,15 +3238,16 @@ class CloudflareBrowserRunAssetClient:
         empty_object_means_empty_required_arrays: bool = False,
     ) -> tuple[str, dict[str, Any]]:
         """Classify supplied cleaned text without navigating to a model-side product URL."""
-        neutral_task = AssetTask(
+        parsed_source = urlsplit(source_url)
+        transport_task = AssetTask(
             tool_id=0,
             canonical_slug="cleaned-homepage-transport",
-            normalized_domain="example.com",
-            official_url="https://example.com/",
+            normalized_domain=parsed_source.hostname or "invalid.local",
+            official_url=source_url or "https://invalid.local/",
             attempts=0,
             max_attempts=1,
             generation=0,
-            lease_token="cleaned-homepage-transport",
+            lease_token="prompt-only-classification-transport",
         )
         log_info(
             "classification.cleaned_text.request",
@@ -3266,7 +3267,7 @@ class CloudflareBrowserRunAssetClient:
             ),
         )
         _, metadata = await self.fetch_structured_asset_data(
-            neutral_task,
+            transport_task,
             prompt=prompt,
             json_schema=json_schema,
             stage=stage,
@@ -3274,7 +3275,8 @@ class CloudflareBrowserRunAssetClient:
             allow_empty_required_arrays=allow_empty_required_arrays,
             empty_object_means_empty_required_arrays=empty_object_means_empty_required_arrays,
             inline_html=(
-                "<main>Cleaned homepage content is embedded in the classification prompt."
+                '<main data-classification-transport="prompt-only">'
+                "Cleaned homepage content is embedded only in the classification prompt."
                 "</main>"
             ),
             result_url=source_url,

@@ -46,6 +46,51 @@ class ClassificationAnomalyScoringTests(unittest.TestCase):
         )
         self.assertIsNone(candidate)
 
+    def test_official_source_block_page_is_detected(self):
+        candidate = build_anti_bot_anomaly_candidate(
+            {
+                "tool_id": 2,
+                "localization_text": "",
+                "feature_text": "",
+                "profile_text": "",
+                "latest_run_text": "",
+                "assignment_decision_status": "legacy",
+                "assignment_source": "legacy",
+                "category_classification_raw": None,
+                "current_primary_slug": "writing-text",
+                "source_text": '{"page_metadata":{"title":"Just a moment...","description":"Checking your browser before accessing the site"}}',
+            }
+        )
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate["score"], 75)
+        matches = candidate["evidence"]["matches"]
+        self.assertEqual(matches[0]["source"], "official_source")
+        self.assertEqual(matches[0]["provider"], "cloudflare")
+
+    def test_neutral_transport_page_pollution_is_high_priority(self):
+        candidate = build_anti_bot_anomaly_candidate(
+            {
+                "tool_id": 35,
+                "latest_run_text": (
+                    '{"entity_decision":{"kind":"non_product","evidence":['
+                    '{"quote":"This domain is for use in documentation examples without needing permission."}]}}'
+                ),
+                "assignment_decision_status": "legacy",
+                "assignment_source": "legacy",
+                "category_classification_raw": None,
+                "current_primary_slug": "coding-development",
+            }
+        )
+        self.assertIsNotNone(candidate)
+        assert candidate is not None
+        self.assertEqual(candidate["score"], 100)
+        self.assertEqual(candidate["severity"], "high")
+        self.assertEqual(
+            candidate["evidence"]["matches"][0]["code"],
+            "neutral_transport_example_domain",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

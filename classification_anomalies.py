@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from typing import Any
 
@@ -12,6 +13,11 @@ from anti_bot_signatures import detect_anti_bot_text
 ANTI_BOT_CLASSIFICATION_DETECTOR = "anti_bot_classification_pollution_v1"
 ANOMALY_SCAN_INTERVAL_HOURS = 6
 ANOMALY_SCAN_LIMIT = 500
+NEUTRAL_TRANSPORT_PLACEHOLDER_RE = re.compile(
+    r"\b(?:this\s+domain\s+is\s+for\s+use\s+in\s+documentation\s+examples?"
+    r"|example\s+domain\b|iana\s+example(?:\s+domain)?\b|avoid\s+use\s+in\s+operations)\b",
+    re.IGNORECASE,
+)
 
 
 ANOMALY_SCAN_SQL = """
@@ -125,13 +131,14 @@ WITH candidates AS (
 ), matched AS (
   SELECT *, lower(
     localization_text || ' ' || feature_text || ' ' || profile_text || ' ' ||
-    COALESCE(category_classification_raw, '') || ' ' || latest_run_text
+    COALESCE(category_classification_raw, '') || ' ' || latest_run_text || ' ' || source_text
   ) AS detection_text
   FROM candidates
 )
 SELECT *
 FROM matched
-WHERE
+WHERE tool_id > ?
+  AND (
   instr(detection_text, 'access denied') > 0
   OR instr(detection_text, 'access has been blocked') > 0
   OR instr(detection_text, 'just a moment') > 0
@@ -146,6 +153,11 @@ WHERE
   OR instr(detection_text, 'px-captcha') > 0
   OR instr(detection_text, 'request could not be satisfied') > 0
   OR instr(detection_text, 'sucuri website firewall') > 0
+  OR instr(detection_text, 'this domain is for use in documentation example') > 0
+  OR instr(detection_text, 'example domain') > 0
+  OR instr(detection_text, 'iana example') > 0
+  OR instr(detection_text, 'avoid use in operations') > 0
+  )
 ORDER BY tool_id
 LIMIT ?
 """
@@ -175,7 +187,7 @@ def _source_has_valid_product_metadata(source_text: str) -> tuple[bool, dict[str
     return len(combined) >= 40, selected
 
 
-def build_anti_bot_anomaly_candidate(row: dict[str, Any]) -> dict[str, Any] | None:
+def build_classification_pollution_matches(row: dict[str, Any]) -> list[dict[str, Any]]:
     evidence: list[dict[str, Any]] = []
     for source, key in (
         ("localization", "localization_text"),
@@ -183,34 +195,66 @@ def build_anti_bot_anomaly_candidate(row: dict[str, Any]) -> dict[str, Any] | No
         ("product_profile", "profile_text"),
         ("legacy_classification", "category_classification_raw"),
         ("classification_run", "latest_run_text"),
+        ("official_source", "source_text"),
     ):
         value = str(row.get(key) or "")
         detected = detect_anti_bot_text(value)
-        if not detected:
+        if detected:
+            evidence.append(
+                {
+                    "source": source,
+                    "state": detected.state,
+                    "provider": detected.provider,
+                    "code": detected.code,
+                    "evidence": detected.evidence,
+                    "confidence": detected.confidence,
+                    "matched_codes": list(detected.matched_codes),
+                }
+            )
             continue
-        evidence.append(
-            {
-                "source": source,
-                "state": detected.state,
-                "provider": detected.provider,
-                "code": detected.code,
-                "evidence": detected.evidence,
-                "confidence": detected.confidence,
-                "matched_codes": list(detected.matched_codes),
-            }
-        )
+        placeholder = NEUTRAL_TRANSPORT_PLACEHOLDER_RE.search(value)
+        if placeholder:
+            evidence.append(
+                {
+                    "source": source,
+                    "state": "invalid_page",
+                    "provider": "neutral_transport",
+                    "code": "neutral_transport_example_domain",
+                    "evidence": re.sub(r"\s+", " ", placeholder.group(0)).strip()[:240],
+                    "confidence": 0.99,
+                    "matched_codes": ["neutral_transport_example_domain"],
+                }
+            )
+    return evidence
+
+
+def build_anti_bot_anomaly_candidate(row: dict[str, Any]) -> dict[str, Any] | None:
+    evidence = build_classification_pollution_matches(row)
 
     if not evidence:
         return None
 
-    signals: list[dict[str, Any]] = [
-        {
-            "code": "anti_bot_product_fact_pollution",
-            "score": 55,
-            "reason": "Stored product or classification evidence contains a known WAF/challenge signature.",
-        }
-    ]
-    score = 55
+    neutral_transport_detected = any(
+        item.get("code") == "neutral_transport_example_domain" for item in evidence
+    )
+    if neutral_transport_detected:
+        score = 85
+        signals: list[dict[str, Any]] = [
+            {
+                "code": "neutral_transport_page_pollution",
+                "score": 85,
+                "reason": "Classification evidence came from the neutral example.com transport page instead of the product homepage.",
+            }
+        ]
+    else:
+        score = 55
+        signals = [
+            {
+                "code": "anti_bot_product_fact_pollution",
+                "score": 55,
+                "reason": "Stored product or classification evidence contains a known WAF/challenge signature.",
+            }
+        ]
 
     legacy_without_provenance = (
         str(row.get("assignment_decision_status") or "") == "legacy"
@@ -322,6 +366,25 @@ async def _claim_detector_scan(d1: Any, *, lease_owner: str) -> str | None:
     return lease_token if rows else None
 
 
+async def _load_detector_scan_cursor(d1: Any, lease_token: str) -> int:
+    rows = await d1.query(
+        """
+        SELECT last_result_json
+        FROM classification_anomaly_detector_state
+        WHERE detector_code = ? AND lease_token = ?
+        """,
+        [ANTI_BOT_CLASSIFICATION_DETECTOR, lease_token],
+        operation="classification_anomaly.load_cursor",
+    )
+    if not rows:
+        return 0
+    payload = _json_object(rows[0].get("last_result_json"))
+    try:
+        return max(0, int(payload.get("next_cursor_tool_id") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 async def scan_classification_anomalies(
     d1: Any,
     *,
@@ -335,9 +398,11 @@ async def scan_classification_anomalies(
         return counts
 
     try:
+        scan_cursor_tool_id = await _load_detector_scan_cursor(d1, lease_token)
+        page_limit = max(1, min(int(limit or ANOMALY_SCAN_LIMIT), 2000))
         rows = await d1.query(
             ANOMALY_SCAN_SQL,
-            [max(1, min(int(limit or ANOMALY_SCAN_LIMIT), 2000))],
+            [scan_cursor_tool_id, page_limit],
             operation="classification_anomaly.scan",
         )
         counts["scanned"] = len(rows)
@@ -398,6 +463,17 @@ async def scan_classification_anomalies(
         if statements:
             await d1.batch(statements, operation="classification_anomaly.upsert_candidates")
 
+        next_cursor_tool_id = (
+            max((int(row.get("tool_id") or 0) for row in rows), default=0)
+            if len(rows) >= page_limit
+            else 0
+        )
+        scan_result = {
+            **counts,
+            "scan_cursor_tool_id": scan_cursor_tool_id,
+            "next_cursor_tool_id": next_cursor_tool_id,
+            "wrapped": next_cursor_tool_id == 0,
+        }
         await d1.run(
             """
             UPDATE classification_anomaly_detector_state
@@ -405,14 +481,18 @@ async def scan_classification_anomalies(
                 lease_token = NULL,
                 lease_expires_at = NULL,
                 last_completed_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
-                next_scan_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+6 hours'),
+                next_scan_at = CASE
+                  WHEN ? > 0 THEN strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+5 minutes')
+                  ELSE strftime('%Y-%m-%dT%H:%M:%fZ', 'now', '+6 hours')
+                END,
                 last_result_json = ?,
                 last_error = NULL,
                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
             WHERE detector_code = ? AND lease_token = ?
             """,
             [
-                json.dumps(counts, separators=(",", ":")),
+                next_cursor_tool_id,
+                json.dumps(scan_result, separators=(",", ":")),
                 ANTI_BOT_CLASSIFICATION_DETECTOR,
                 lease_token,
             ],

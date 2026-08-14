@@ -270,6 +270,80 @@ class ClassificationAnomalyStoreTests(unittest.IsolatedAsyncioTestCase):
             "https://clean.example/janitorai",
         )
 
+    async def test_detector_cursor_advances_past_the_first_page_and_wraps(self):
+        self.connection.executescript(
+            """
+            INSERT INTO tools (
+              id, canonical_slug, normalized_domain, official_url, primary_category_id,
+              category_classification_status, category_classification_raw,
+              entity_kind, entity_kind_source, status, duplicate_of_tool_id
+            ) VALUES (
+              319, 'second-blocked', 'second.example', 'https://second.example/', 28,
+              'legacy', NULL, 'unresolved', 'auto', 'published', NULL
+            );
+            INSERT INTO tool_localizations (
+              tool_id, locale_code, name, tagline, short_description,
+              long_description, feature_highlights, translation_status
+            ) VALUES (
+              319, 'en', 'Second blocked product', 'Just a moment...',
+              'Checking your browser before accessing the site', '', '', 'published'
+            );
+            """
+        )
+
+        first = await scan_classification_anomalies(self.d1, limit=1, lease_owner="page-one")
+        self.assertEqual(first, {"scanned": 1, "candidates": 1, "skipped": 0})
+        first_result = json.loads(
+            self.connection.execute(
+                "SELECT last_result_json FROM classification_anomaly_detector_state"
+            ).fetchone()[0]
+        )
+        self.assertEqual(first_result["scan_cursor_tool_id"], 0)
+        self.assertEqual(first_result["next_cursor_tool_id"], 318)
+        self.assertFalse(first_result["wrapped"])
+        first_delay_minutes = self.connection.execute(
+            """
+            SELECT (julianday(next_scan_at) - julianday(last_completed_at)) * 24 * 60
+            FROM classification_anomaly_detector_state
+            """
+        ).fetchone()[0]
+        self.assertAlmostEqual(first_delay_minutes, 5, delta=0.1)
+
+        self.connection.execute(
+            "UPDATE classification_anomaly_detector_state SET next_scan_at = '2000-01-01T00:00:00.000Z'"
+        )
+        self.connection.commit()
+        second = await scan_classification_anomalies(self.d1, limit=1, lease_owner="page-two")
+        self.assertEqual(second, {"scanned": 1, "candidates": 1, "skipped": 0})
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT group_concat(tool_id, ',') FROM classification_anomaly_candidates ORDER BY tool_id"
+            ).fetchone()[0],
+            "318,319",
+        )
+
+        self.connection.execute(
+            "UPDATE classification_anomaly_detector_state SET next_scan_at = '2000-01-01T00:00:00.000Z'"
+        )
+        self.connection.commit()
+        wrapped = await scan_classification_anomalies(self.d1, limit=1, lease_owner="wrap")
+        self.assertEqual(wrapped, {"scanned": 0, "candidates": 0, "skipped": 0})
+        wrapped_result = json.loads(
+            self.connection.execute(
+                "SELECT last_result_json FROM classification_anomaly_detector_state"
+            ).fetchone()[0]
+        )
+        self.assertEqual(wrapped_result["scan_cursor_tool_id"], 319)
+        self.assertEqual(wrapped_result["next_cursor_tool_id"], 0)
+        self.assertTrue(wrapped_result["wrapped"])
+        wrapped_delay_minutes = self.connection.execute(
+            """
+            SELECT (julianday(next_scan_at) - julianday(last_completed_at)) * 24 * 60
+            FROM classification_anomaly_detector_state
+            """
+        ).fetchone()[0]
+        self.assertAlmostEqual(wrapped_delay_minutes, 360, delta=0.1)
+
 
 if __name__ == "__main__":
     unittest.main()

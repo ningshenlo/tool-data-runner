@@ -11,15 +11,16 @@ import asyncio
 import hashlib
 import json
 import re
-from dataclasses import dataclass, field, replace
+import unicodedata
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 from anti_bot_signatures import contains_anti_bot_text
 
-SHADOW_PROMPT_VERSION = "shadow-top2-v2-entity-gated-capability-optional-v2-2026-08-10"
-SHADOW_EXTRACTOR_VERSION = "cleaned-main-content-v1-2026-08-13"
-SHADOW_PIPELINE_VERSION = "p2a-shadow-v2-2026-08-09"
+SHADOW_PROMPT_VERSION = "shadow-top2-v3-entity-evidence-grounded-2026-08-14"
+SHADOW_EXTRACTOR_VERSION = "cleaned-main-content-v2-evidence-grounded-2026-08-14"
+SHADOW_PIPELINE_VERSION = "p2a-shadow-v3-2026-08-14"
 DEFAULT_TAXONOMY_VERSION = 1
 PROFILE_VERSION = 1
 MAX_CAPABILITIES = 8
@@ -45,6 +46,11 @@ ENTITY_ERROR_PAGE_RE = re.compile(
     r"invalid\s+ssl\s+certificate|error\s+code\s*52\d|access\s+denied|"
     r"security\s+block\s+page|request\s+blocked|site\s+can(?:not|'t)\s+be\s+reached|"
     r"temporarily\s+unavailable|origin\s+server\s+is\s+unreachable)",
+    re.I,
+)
+NEUTRAL_TRANSPORT_PAGE_RE = re.compile(
+    r"(?:\bexample\s+domain\b|\bthis\s+domain\s+is\s+for\s+use\s+in\s+documentation\s+examples\b|"
+    r"\bavoid\s+use\s+in\s+operations\b)",
     re.I,
 )
 PROVIDER_BLOCKED_RE = re.compile(
@@ -179,14 +185,35 @@ def catalog_from_rows(rows: list[dict[str, Any]]) -> TaxonomyCatalog:
     return TaxonomyCatalog(terms=terms)
 
 
-def normalize_evidence_item(item: Any, *, source_url: str = "") -> dict[str, Any] | None:
+def _normalized_grounding_text(value: Any) -> str:
+    text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def evidence_quote_is_grounded(quote: Any, source_text: str) -> bool:
+    """Require model evidence to be a verbatim, whitespace-normalized source span."""
+    normalized_quote = _normalized_grounding_text(quote)
+    normalized_source = _normalized_grounding_text(source_text)
+    return bool(normalized_quote and normalized_source and normalized_quote in normalized_source)
+
+
+def normalize_evidence_item(
+    item: Any,
+    *,
+    source_url: str = "",
+    source_text: str = "",
+) -> dict[str, Any] | None:
     if not isinstance(item, dict):
         quote = _clip(item, 280)
         if not quote:
             return None
+        if source_text and not evidence_quote_is_grounded(quote, source_text):
+            return None
         return {"source_url": source_url or "", "node_id": "", "quote": quote}
     quote = _clip(item.get("quote") or item.get("text") or item.get("snippet"), 280)
     if not quote:
+        return None
+    if source_text and not evidence_quote_is_grounded(quote, source_text):
         return None
     return {
         "source_url": _clip(item.get("source_url") or source_url, 500),
@@ -201,7 +228,12 @@ _EVIDENCE_SPLIT_RE = re.compile(
 _QUOTED_RE = re.compile(r"""['\"](.{8,280}?)['\"]""")
 
 
-def _split_value_and_evidence_from_text(raw_text: str, *, source_url: str = "") -> dict[str, Any] | None:
+def _split_value_and_evidence_from_text(
+    raw_text: str,
+    *,
+    source_url: str = "",
+    source_text: str = "",
+) -> dict[str, Any] | None:
     """Salvage model outputs that embed Evidence: 'quote' inside a plain string."""
     text = str(raw_text or "").strip()
     if not text:
@@ -218,11 +250,19 @@ def _split_value_and_evidence_from_text(raw_text: str, *, source_url: str = "") 
         # findall may return tuples if multi-group; normalize to str
         if isinstance(q, tuple):
             q = next((x for x in q if isinstance(x, str) and len(x) >= 8), "")
-        item = normalize_evidence_item({"quote": q}, source_url=source_url)
+        item = normalize_evidence_item(
+            {"quote": q},
+            source_url=source_url,
+            source_text=source_text,
+        )
         if item:
             evidence.append(item)
     if not evidence and len(parts) > 1:
-        item = normalize_evidence_item({"quote": _clip(parts[1].strip(), 280)}, source_url=source_url)
+        item = normalize_evidence_item(
+            {"quote": _clip(parts[1].strip(), 280)},
+            source_url=source_url,
+            source_text=source_text,
+        )
         if item:
             evidence.append(item)
     # If value_part still contains trailing "Evidence" noise, keep clipped head.
@@ -235,7 +275,12 @@ def _split_value_and_evidence_from_text(raw_text: str, *, source_url: str = "") 
     return {"value": value_part, "evidence": evidence}
 
 
-def normalize_evidenced_value(value: Any, *, source_url: str = "") -> dict[str, Any] | None:
+def normalize_evidenced_value(
+    value: Any,
+    *,
+    source_url: str = "",
+    source_text: str = "",
+) -> dict[str, Any] | None:
     """Normalize {value, evidence[]} — drop fields without evidence.
 
     Also salvages free-text forms like:
@@ -244,7 +289,11 @@ def normalize_evidenced_value(value: Any, *, source_url: str = "") -> dict[str, 
     if value is None:
         return None
     if isinstance(value, str):
-        return _split_value_and_evidence_from_text(value, source_url=source_url)
+        return _split_value_and_evidence_from_text(
+            value,
+            source_url=source_url,
+            source_text=source_text,
+        )
     if not isinstance(value, dict):
         return None
     text = _clip(value.get("value") or value.get("text"), 500)
@@ -253,12 +302,23 @@ def normalize_evidenced_value(value: Any, *, source_url: str = "") -> dict[str, 
         evidence_raw = [evidence_raw] if evidence_raw not in (None, "") else []
     evidence = [
         item
-        for item in (normalize_evidence_item(e, source_url=source_url) for e in evidence_raw)
+        for item in (
+            normalize_evidence_item(
+                e,
+                source_url=source_url,
+                source_text=source_text,
+            )
+            for e in evidence_raw
+        )
         if item
     ]
     # If structured evidence missing, try salvage from string value.
     if not evidence and text:
-        salvaged = _split_value_and_evidence_from_text(text, source_url=source_url)
+        salvaged = _split_value_and_evidence_from_text(
+            text,
+            source_url=source_url,
+            source_text=source_text,
+        )
         if salvaged:
             return salvaged
     if not text or not evidence:
@@ -267,7 +327,13 @@ def normalize_evidenced_value(value: Any, *, source_url: str = "") -> dict[str, 
     return {"value": text, "evidence": evidence[:5]}
 
 
-def normalize_evidenced_list(value: Any, *, source_url: str = "", limit: int = 8) -> list[dict[str, Any]]:
+def normalize_evidenced_list(
+    value: Any,
+    *,
+    source_url: str = "",
+    source_text: str = "",
+    limit: int = 8,
+) -> list[dict[str, Any]]:
     items: list[Any]
     if isinstance(value, str):
         # Split semi-structured multi-capability blobs.
@@ -283,7 +349,11 @@ def normalize_evidenced_list(value: Any, *, source_url: str = "", limit: int = 8
         return []
     out: list[dict[str, Any]] = []
     for item in items:
-        normalized = normalize_evidenced_value(item, source_url=source_url)
+        normalized = normalize_evidenced_value(
+            item,
+            source_url=source_url,
+            source_text=source_text,
+        )
         if normalized:
             out.append(normalized)
         if len(out) >= limit:
@@ -295,14 +365,31 @@ def build_product_profile(
     raw: dict[str, Any],
     *,
     source_url: str,
+    source_text: str = "",
     extracted_at: str | None = None,
 ) -> dict[str, Any]:
-    primary_job = normalize_evidenced_value(raw.get("primary_job"), source_url=source_url)
-    primary_outputs = normalize_evidenced_list(raw.get("primary_outputs"), source_url=source_url, limit=6)
-    capabilities_raw = normalize_evidenced_list(
-        raw.get("capabilities_raw"), source_url=source_url, limit=MAX_CAPABILITIES
+    primary_job = normalize_evidenced_value(
+        raw.get("primary_job"),
+        source_url=source_url,
+        source_text=source_text,
     )
-    entity_decision = parse_entity_decision(raw, source_url=source_url)
+    primary_outputs = normalize_evidenced_list(
+        raw.get("primary_outputs"),
+        source_url=source_url,
+        source_text=source_text,
+        limit=6,
+    )
+    capabilities_raw = normalize_evidenced_list(
+        raw.get("capabilities_raw"),
+        source_url=source_url,
+        source_text=source_text,
+        limit=MAX_CAPABILITIES,
+    )
+    entity_decision = parse_entity_decision(
+        raw,
+        source_url=source_url,
+        source_text=source_text,
+    )
     return {
         "primary_job": primary_job,
         "primary_outputs": primary_outputs or None,
@@ -631,7 +718,6 @@ def profile_extract_from_visible_text_prompt(source_url: str, visible_text: str)
 
 async def fetch_cleaned_text_structured(
     browser_client: Any,
-    neutral_task: Any,
     *,
     source_url: str,
     stage: str,
@@ -640,19 +726,12 @@ async def fetch_cleaned_text_structured(
     custom_ai: list[dict[str, Any]],
     **kwargs: Any,
 ) -> tuple[str, dict[str, Any]]:
-    """Use the cleaned-text transport while keeping older test clients compatible."""
+    """Use prompt-only structured transport and never navigate a neutral web page."""
     method = getattr(browser_client, "fetch_structured_text_data", None)
-    if callable(method):
-        return await method(
-            source_url=source_url,
-            stage=stage,
-            prompt=prompt,
-            json_schema=json_schema,
-            custom_ai=custom_ai,
-            **kwargs,
-        )
-    return await browser_client.fetch_structured_asset_data(
-        neutral_task,
+    if not callable(method):
+        raise RuntimeError("structured_text_transport_unavailable")
+    return await method(
+        source_url=source_url,
         stage=stage,
         prompt=prompt,
         json_schema=json_schema,
@@ -675,6 +754,7 @@ def parse_entity_decision(
     raw: dict[str, Any],
     *,
     source_url: str = "",
+    source_text: str = "",
 ) -> dict[str, Any]:
     """Parse a fail-closed, evidence-backed automatic entity decision."""
     candidate_kind = str(raw.get("entity_kind") or "").strip().lower().replace("-", "_")
@@ -687,7 +767,11 @@ def parse_entity_decision(
     evidence = [
         item
         for item in (
-            normalize_evidence_item(value, source_url=source_url)
+            normalize_evidence_item(
+                value,
+                source_url=source_url,
+                source_text=source_text,
+            )
             for value in evidence_raw
         )
         if item
@@ -698,9 +782,11 @@ def parse_entity_decision(
             *(str(item.get("quote") or "") for item in evidence),
         ]
     )
+    neutral_transport_detected = bool(NEUTRAL_TRANSPORT_PAGE_RE.search(error_page_text))
     error_page_detected = bool(
         ENTITY_ERROR_PAGE_RE.search(error_page_text)
         or contains_anti_bot_text(error_page_text)
+        or neutral_transport_detected
     )
     accepted = (
         candidate_kind != "unresolved"
@@ -717,6 +803,8 @@ def parse_entity_decision(
         "accepted": accepted,
         "source": "auto",
         "error_page_detected": error_page_detected,
+        "neutral_transport_detected": neutral_transport_detected,
+        "ungrounded_evidence_detected": bool(source_text and evidence_raw and not evidence),
     }
 
 
@@ -1405,13 +1493,6 @@ async def classify_tool_shadow(
     else:
         task_obj = task
 
-    neutral_task_obj = replace(
-        task_obj,
-        canonical_slug=f"{task_obj.canonical_slug}-shadow-transport",
-        normalized_domain="example.com",
-        official_url="https://example.com/",
-    )
-
     custom_ai = browser_client.category_custom_ai()
     model_chain = [item.get("model") for item in custom_ai if isinstance(item, dict)]
     provider = "browser_rendering_cleaned_text_custom_ai"
@@ -1427,6 +1508,7 @@ async def classify_tool_shadow(
     source_url = str(getattr(task_obj, "official_url", "") or "")
     profile_raw: dict[str, Any] = {}
     profile: dict[str, Any] | None = None
+    profile_source_text = ""
     profile_extract_error = ""
     try:
         from runner import classify_page_state, extract_homepage_main_text
@@ -1462,9 +1544,9 @@ async def classify_tool_shadow(
             )
             if not main_content.strip():
                 raise RuntimeError("homepage content contained no usable main content")
+            profile_source_text = main_content
             _, profile_raw = await fetch_cleaned_text_structured(
                 browser_client,
-                neutral_task_obj,
                 source_url=content_url,
                 stage="shadow_profile_main_content",
                 prompt=profile_extract_from_main_content_prompt(content_url, main_content),
@@ -1479,6 +1561,7 @@ async def classify_tool_shadow(
         profile = build_product_profile(
             profile_raw if isinstance(profile_raw, dict) else {},
             source_url=source_url,
+            source_text=profile_source_text,
         )
     except Exception as error:
         profile_extract_error = str(error)[:300]
@@ -1581,7 +1664,6 @@ async def classify_tool_shadow(
     try:
         _, l1_raw = await fetch_cleaned_text_structured(
             browser_client,
-            neutral_task_obj,
             source_url=source_url,
             stage="shadow_l1_top2",
             prompt=top2_l1_prompt(roots, catalog, profile),
@@ -1642,7 +1724,6 @@ async def classify_tool_shadow(
         try:
             _, leaf_raw = await fetch_cleaned_text_structured(
                 browser_client,
-                neutral_task_obj,
                 source_url=source_url,
                 stage="shadow_leaf",
                 prompt=leaf_adjudication_prompt(
@@ -1689,7 +1770,6 @@ async def classify_tool_shadow(
         for chunk_index, capability_chunk in enumerate(capability_chunks, start=1):
             _, chunk_raw = await fetch_cleaned_text_structured(
                 browser_client,
-                neutral_task_obj,
                 source_url=source_url,
                 stage=f"shadow_capabilities_{chunk_index}_of_{len(capability_chunks)}",
                 prompt=(
@@ -1715,7 +1795,6 @@ async def classify_tool_shadow(
             if not accepted and retry_terms and profile.get("capabilities_raw"):
                 _, retry_raw = await fetch_cleaned_text_structured(
                     browser_client,
-                    neutral_task_obj,
                     source_url=source_url,
                     stage=f"shadow_capabilities_evidence_retry_{chunk_index}",
                     prompt=(
