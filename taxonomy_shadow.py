@@ -15,6 +15,8 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from typing import Any
 
+from anti_bot_signatures import contains_anti_bot_text
+
 SHADOW_PROMPT_VERSION = "shadow-top2-v2-entity-gated-capability-optional-v2-2026-08-10"
 SHADOW_EXTRACTOR_VERSION = "cleaned-main-content-v1-2026-08-13"
 SHADOW_PIPELINE_VERSION = "p2a-shadow-v2-2026-08-09"
@@ -696,7 +698,10 @@ def parse_entity_decision(
             *(str(item.get("quote") or "") for item in evidence),
         ]
     )
-    error_page_detected = bool(ENTITY_ERROR_PAGE_RE.search(error_page_text))
+    error_page_detected = bool(
+        ENTITY_ERROR_PAGE_RE.search(error_page_text)
+        or contains_anti_bot_text(error_page_text)
+    )
     accepted = (
         candidate_kind != "unresolved"
         and confidence >= MIN_ENTITY_CONFIDENCE_AUTO
@@ -1424,34 +1429,57 @@ async def classify_tool_shadow(
     profile: dict[str, Any] | None = None
     profile_extract_error = ""
     try:
-        from runner import extract_homepage_main_text
+        from runner import classify_page_state, extract_homepage_main_text
 
         content_url, html_body = await browser_client.fetch_homepage_content(task_obj)
-        main_content = extract_homepage_main_text(
-            html_body,
-            limit=int(getattr(browser_client, "category_main_content_max_chars", 10000)),
-        )
-        if not main_content.strip():
-            raise RuntimeError("homepage content contained no usable main content")
         source_url = content_url
-        _, profile_raw = await fetch_cleaned_text_structured(
-            browser_client,
-            neutral_task_obj,
-            source_url=content_url,
-            stage="shadow_profile_main_content",
-            prompt=profile_extract_from_main_content_prompt(content_url, main_content),
-            json_schema=profile_extract_schema(),
-            custom_ai=custom_ai,
-        )
+        page_assessment = classify_page_state(html_body)
+        raw_bundle["page_quality"] = {
+            "state": page_assessment.state,
+            "reason": page_assessment.reason,
+            "evidence": page_assessment.evidence,
+        }
+        if not page_assessment.is_valid:
+            profile_raw = {
+                "entity_kind": "unresolved",
+                "entity_confidence": 0.0,
+                "entity_reason": f"page quality gate: {page_assessment.state}",
+                "entity_evidence": [
+                    {
+                        "quote": page_assessment.evidence or page_assessment.reason,
+                        "source_url": content_url,
+                    }
+                ],
+                "primary_job": {"value": "", "evidence": []},
+                "primary_outputs": [],
+                "capabilities_raw": [],
+            }
+            raw_bundle["profile_extraction_path"] = "page_quality_gate"
+        else:
+            main_content = extract_homepage_main_text(
+                html_body,
+                limit=int(getattr(browser_client, "category_main_content_max_chars", 10000)),
+            )
+            if not main_content.strip():
+                raise RuntimeError("homepage content contained no usable main content")
+            _, profile_raw = await fetch_cleaned_text_structured(
+                browser_client,
+                neutral_task_obj,
+                source_url=content_url,
+                stage="shadow_profile_main_content",
+                prompt=profile_extract_from_main_content_prompt(content_url, main_content),
+                json_schema=profile_extract_schema(),
+                custom_ai=custom_ai,
+            )
+            raw_bundle["profile_extraction_path"] = "cleaned_main_content"
+            raw_bundle["profile_main_content_chars"] = len(main_content)
+            raw_bundle["profile_main_content_sha256"] = hashlib.sha256(
+                main_content.encode("utf-8")
+            ).hexdigest()[:16]
         profile = build_product_profile(
             profile_raw if isinstance(profile_raw, dict) else {},
             source_url=source_url,
         )
-        raw_bundle["profile_extraction_path"] = "cleaned_main_content"
-        raw_bundle["profile_main_content_chars"] = len(main_content)
-        raw_bundle["profile_main_content_sha256"] = hashlib.sha256(
-            main_content.encode("utf-8")
-        ).hexdigest()[:16]
     except Exception as error:
         profile_extract_error = str(error)[:300]
         raw_bundle["profile_main_content_error"] = profile_extract_error
@@ -1848,8 +1876,10 @@ async def run_shadow_taxonomy(
         AssetTask,
         CloudflareBrowserRunAssetClient,
         D1Client,
+        log_debug,
         log_error,
         log_info,
+        taxonomy_batch_has_activity,
     )
 
     batch_limit = int(limit or getattr(config, "asset_limit", 10) or 10)
@@ -1863,6 +1893,13 @@ async def run_shadow_taxonomy(
         "legacy_mutated": 0,
         "provider_blocked": 0,
         "deferred": 0,
+        "anomaly_scanned": 0,
+        "anomaly_candidates": 0,
+        "anomaly_scan_failed": 0,
+        "reclassification_selected": 0,
+        "reclassification_succeeded": 0,
+        "reclassification_needs_manual": 0,
+        "reclassification_failed": 0,
     }
 
     async with D1Client(config) as d1:
@@ -1878,9 +1915,47 @@ async def run_shadow_taxonomy(
             for item in custom_ai
             if isinstance(item, dict) and item.get("model")
         ]
-        rows = await load_shadow_tasks(
+        queued_rows: list[dict[str, Any]] = []
+        if tool_ids is None and not dry_run:
+            try:
+                from classification_anomalies import (
+                    load_queued_reclassification_tasks,
+                    scan_classification_anomalies,
+                )
+
+                anomaly_counts = await scan_classification_anomalies(d1)
+                counts["anomaly_scanned"] = int(anomaly_counts.get("scanned") or 0)
+                counts["anomaly_candidates"] = int(anomaly_counts.get("candidates") or 0)
+            except Exception as error:
+                counts["anomaly_scan_failed"] = 1
+                log_error(
+                    "classification_anomaly.scan_failed",
+                    error=str(error)[:500],
+                )
+
+            try:
+                from classification_anomalies import load_queued_reclassification_tasks
+
+                queued_rows = await load_queued_reclassification_tasks(
+                    d1,
+                    limit=batch_limit,
+                )
+            except Exception as error:
+                log_error(
+                    "classification_reprocess.queue_unavailable",
+                    error=str(error)[:500],
+                )
+                queued_rows = []
+
+        queued_tool_ids = {
+            int(row.get("tool_id") or 0)
+            for row in queued_rows
+            if int(row.get("tool_id") or 0) > 0
+        }
+        normal_limit = max(0, batch_limit - len(queued_rows))
+        normal_rows = await load_shadow_tasks(
             d1,
-            limit=batch_limit,
+            limit=max(1, normal_limit) if normal_limit > 0 else 0,
             tool_ids=tool_ids,
             after_tool_id=after_tool_id,
             allow_unresolved_entity=allow_unresolved_entity or bool(tool_ids),
@@ -1889,10 +1964,20 @@ async def run_shadow_taxonomy(
             # preserving old failed runs as immutable audit history.
             retry_model_name=(model_chain[0] if model_chain else ""),
         )
+        rows = [*queued_rows]
+        rows.extend(
+            row
+            for row in normal_rows
+            if int(row.get("tool_id") or 0) not in queued_tool_ids
+        )
+        rows = rows[:batch_limit]
         counts["selected"] = len(rows)
-        log_info(
+        counts["reclassification_selected"] = len(queued_rows)
+        batch_logger = log_info if rows else log_debug
+        batch_logger(
             "shadow_taxonomy.start",
             selected=len(rows),
+            reclassification_selected=len(queued_rows),
             dry_run=dry_run,
             taxonomy_version=catalog.taxonomy_version,
             prompt_version=SHADOW_PROMPT_VERSION,
@@ -1913,9 +1998,26 @@ async def run_shadow_taxonomy(
                     counts["deferred"] += 1
                     return
                 tool_id = int(row.get("tool_id") or 0)
+                reclassification_request_id = int(
+                    row.get("reclassification_request_id") or 0
+                )
+                reclassification_lease_token = ""
+                if reclassification_request_id > 0:
+                    from classification_anomalies import claim_reclassification_request
+
+                    claimed = await claim_reclassification_request(
+                        d1,
+                        reclassification_request_id,
+                        lease_owner="taxonomy-worker",
+                    )
+                    if not claimed:
+                        counts["deferred"] += 1
+                        return
+                    reclassification_lease_token = claimed
                 entity_kind = str(row.get("entity_kind") or "unresolved")
                 if (
                     tool_ids is None
+                    and reclassification_request_id <= 0
                     and entity_kind != "independent_product"
                     and not allow_unresolved_entity
                 ):
@@ -1948,6 +2050,24 @@ async def run_shadow_taxonomy(
                     )
                 except Exception as error:
                     counts["failed"] += 1
+                    if reclassification_request_id > 0 and reclassification_lease_token:
+                        try:
+                            from classification_anomalies import fail_reclassification_request
+
+                            request_status = await fail_reclassification_request(
+                                d1,
+                                request_id=reclassification_request_id,
+                                lease_token=reclassification_lease_token,
+                                error=str(error),
+                            )
+                            if request_status == "failed":
+                                counts["reclassification_failed"] += 1
+                        except Exception as request_error:
+                            log_error(
+                                "classification_reprocess.fail_record_error",
+                                request_id=reclassification_request_id,
+                                error=str(request_error)[:300],
+                            )
                     if PROVIDER_BLOCKED_RE.search(str(error)):
                         counts["provider_blocked"] = 1
                         provider_blocked.set()
@@ -1972,6 +2092,40 @@ async def run_shadow_taxonomy(
                 if item.error and "legacy_mutated" in item.error:
                     counts["legacy_mutated"] += 1
 
+                if reclassification_request_id > 0 and reclassification_lease_token:
+                    try:
+                        if item.status == "failed":
+                            from classification_anomalies import fail_reclassification_request
+
+                            request_status = await fail_reclassification_request(
+                                d1,
+                                request_id=reclassification_request_id,
+                                lease_token=reclassification_lease_token,
+                                error=item.error or "classification_failed",
+                            )
+                        else:
+                            from classification_anomalies import complete_reclassification_request
+
+                            request_status = await complete_reclassification_request(
+                                d1,
+                                request_id=reclassification_request_id,
+                                lease_token=reclassification_lease_token,
+                                result=item,
+                                auto_accept_threshold=auto_accept_threshold,
+                            )
+                        if request_status == "succeeded":
+                            counts["reclassification_succeeded"] += 1
+                        elif request_status == "needs_manual":
+                            counts["reclassification_needs_manual"] += 1
+                        elif request_status == "failed":
+                            counts["reclassification_failed"] += 1
+                    except Exception as request_error:
+                        log_error(
+                            "classification_reprocess.complete_error",
+                            request_id=reclassification_request_id,
+                            error=str(request_error)[:300],
+                        )
+
                 log_info(
                     "shadow_taxonomy.item",
                     tool_id=tool_id,
@@ -1982,11 +2136,13 @@ async def run_shadow_taxonomy(
                     confidence=round(item.primary_confidence, 3),
                     capabilities=",".join(item.capability_slugs),
                     run_id=item.run_id,
+                    reclassification_request_id=reclassification_request_id or None,
                     error=(item.error or "")[:200],
                     dry_run=dry_run,
                 )
 
         await asyncio.gather(*(process_row(row) for row in rows))
 
-    log_info("shadow_taxonomy.summary", **counts)
+    summary_logger = log_info if taxonomy_batch_has_activity(counts) else log_debug
+    summary_logger("shadow_taxonomy.summary", **counts)
     return counts

@@ -435,6 +435,51 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [])
         self.assertNotIn("profile_direct_fallback_raw", result.raw)
 
+    async def test_antibot_page_is_gated_before_any_model_call(self):
+        calls: list[str] = []
+
+        class FakeBrowser:
+            def category_custom_ai(self):
+                return [{"model": "fake-model"}]
+
+            async def fetch_homepage_content(self, task):
+                return (
+                    "https://blocked.test/",
+                    "<html><title>Just a moment...</title><body>"
+                    "Access has been blocked by the firewall."
+                    "</body></html>",
+                )
+
+            async def fetch_structured_asset_data(
+                self, task, *, stage, prompt, json_schema, custom_ai, **kwargs
+            ):
+                calls.append(stage)
+                raise AssertionError(f"unexpected structured call: {stage}")
+
+        result = await classify_tool_shadow(
+            d1=object(),
+            browser_client=FakeBrowser(),
+            task=AssetTask(
+                tool_id=125,
+                canonical_slug="blocked",
+                normalized_domain="blocked.test",
+                official_url="https://blocked.test/",
+                attempts=0,
+                max_attempts=1,
+                generation=0,
+                lease_token="test-shadow",
+            ),
+            catalog=_catalog(),
+            dry_run=True,
+            include_capabilities=False,
+        )
+
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.error, "entity_unresolved")
+        self.assertEqual(result.raw["profile_extraction_path"], "page_quality_gate")
+        self.assertEqual(result.raw["page_quality"]["state"], "access_denied")
+        self.assertEqual(calls, [])
+
 
 class ProfileEvidenceTests(unittest.TestCase):
     def test_rejects_bare_string_without_evidence(self):

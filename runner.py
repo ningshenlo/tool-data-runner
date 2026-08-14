@@ -25,6 +25,7 @@ from urllib.parse import quote, urljoin, urlsplit
 import httpx
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from dotenv import load_dotenv
+from anti_bot_signatures import detect_anti_bot_page
 from pricing.bundle import PricingSnapshotBundle, build_pricing_snapshot_bundle
 from pricing.claim_states import ClaimState, assert_claim_invariants
 from pricing.feature_flags import assert_safe_pricing_claim_flags
@@ -1874,6 +1875,18 @@ def classify_page_state(
     raw_lower = (html_body or "").lower()
     visible = page_visible_text(html_body)
     visible_lower = visible.lower()
+
+    anti_bot = detect_anti_bot_page(
+        html_body,
+        page_title=title,
+        http_status=http_status,
+    )
+    if anti_bot:
+        return PageQualityAssessment(
+            anti_bot.state,
+            f"anti_bot_signature:{anti_bot.provider}:{anti_bot.code}",
+            anti_bot.evidence,
+        )
 
     if http_status in {401, 403}:
         return PageQualityAssessment("access_denied", f"http_{http_status}", title)
@@ -12376,10 +12389,42 @@ def taxonomy_next_delay_seconds(config: Config, counts: dict[str, int]) -> int:
     return int(config.taxonomy_interval_seconds)
 
 
+def taxonomy_batch_has_activity(counts: dict[str, int]) -> bool:
+    """Return whether a taxonomy pass produced operator-relevant activity."""
+    activity_fields = (
+        "selected",
+        "succeeded",
+        "partial",
+        "failed",
+        "skipped",
+        "legacy_mutated",
+        "provider_blocked",
+        "deferred",
+        "anomaly_candidates",
+        "anomaly_scan_failed",
+        "reclassification_selected",
+        "reclassification_succeeded",
+        "reclassification_needs_manual",
+        "reclassification_failed",
+    )
+    return any(int(counts.get(field) or 0) > 0 for field in activity_fields)
+
+
+def taxonomy_idle_heartbeat_due(
+    last_emitted_at: float | None,
+    now: float,
+    interval_seconds: int,
+) -> bool:
+    """Emit the first idle heartbeat, then no more than once per interval."""
+    return last_emitted_at is None or now - last_emitted_at >= max(1, interval_seconds)
+
+
 async def run_taxonomy_loop(config: Config) -> None:
+    idle_heartbeat_seconds = max(3600, int(config.taxonomy_interval_seconds))
     log_info(
         "taxonomy_runner.loop.start",
         interval_seconds=config.taxonomy_interval_seconds,
+        idle_heartbeat_seconds=idle_heartbeat_seconds,
         limit=config.taxonomy_limit,
         concurrency=config.taxonomy_concurrency,
         auto_accept_confidence=config.taxonomy_auto_accept_confidence,
@@ -12393,17 +12438,45 @@ async def run_taxonomy_loop(config: Config) -> None:
     # isolated taxonomy worker should begin immediately.
     if len(tuple(getattr(config, "runner_workloads", ()) or ())) > 1:
         await asyncio.sleep(10)
+    consecutive_idle_batches = 0
+    last_idle_log_at: float | None = None
     while True:
         delay = config.taxonomy_interval_seconds
         started_at = time.monotonic()
         try:
             counts = await run_taxonomy_once(config)
-            log_info(
-                "taxonomy_runner.batch.summary",
-                duration_ms=round((time.monotonic() - started_at) * 1000),
-                **counts,
-            )
+            duration_ms = round((time.monotonic() - started_at) * 1000)
             delay = taxonomy_next_delay_seconds(config, counts)
+            if taxonomy_batch_has_activity(counts):
+                consecutive_idle_batches = 0
+                last_idle_log_at = None
+                log_info(
+                    "taxonomy_runner.batch.summary",
+                    duration_ms=duration_ms,
+                    **counts,
+                )
+            else:
+                consecutive_idle_batches += 1
+                now = time.monotonic()
+                if taxonomy_idle_heartbeat_due(
+                    last_idle_log_at,
+                    now,
+                    idle_heartbeat_seconds,
+                ):
+                    log_info(
+                        "taxonomy_runner.idle",
+                        duration_ms=duration_ms,
+                        consecutive_empty_batches=consecutive_idle_batches,
+                        next_poll_seconds=delay,
+                    )
+                    last_idle_log_at = now
+                else:
+                    log_debug(
+                        "taxonomy_runner.batch.idle",
+                        duration_ms=duration_ms,
+                        consecutive_empty_batches=consecutive_idle_batches,
+                        next_poll_seconds=delay,
+                    )
             if delay == 0:
                 log_info(
                     "taxonomy_runner.backlog.continue",
@@ -12420,6 +12493,8 @@ async def run_taxonomy_loop(config: Config) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            consecutive_idle_batches = 0
+            last_idle_log_at = None
             # Startup/telemetry failures are usually transient. Retrying soon
             # prevents a single D1 collision from hiding taxonomy for the full
             # normal 15-minute cadence.
