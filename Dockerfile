@@ -10,6 +10,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY runner.py .
 COPY taxonomy_shadow.py .
+COPY anti_bot_signatures.py .
+COPY classification_anomalies.py .
 COPY pricing ./pricing
 COPY sitemap_monitor ./sitemap_monitor
 
