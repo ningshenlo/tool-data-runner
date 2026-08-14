@@ -861,6 +861,33 @@ class WorkerControlTests(unittest.IsolatedAsyncioTestCase):
             21600,
         )
 
+    def test_taxonomy_idle_detection_ignores_scan_only_bookkeeping(self) -> None:
+        self.assertFalse(
+            runner.taxonomy_batch_has_activity(
+                {
+                    "selected": 0,
+                    "failed": 0,
+                    "anomaly_scanned": 500,
+                    "anomaly_candidates": 0,
+                }
+            )
+        )
+        self.assertTrue(
+            runner.taxonomy_batch_has_activity(
+                {"selected": 0, "anomaly_candidates": 1}
+            )
+        )
+        self.assertTrue(
+            runner.taxonomy_batch_has_activity(
+                {"selected": 0, "anomaly_scan_failed": 1}
+            )
+        )
+
+    def test_taxonomy_idle_heartbeat_is_rate_limited(self) -> None:
+        self.assertTrue(runner.taxonomy_idle_heartbeat_due(None, 100.0, 3600))
+        self.assertFalse(runner.taxonomy_idle_heartbeat_due(100.0, 3699.0, 3600))
+        self.assertTrue(runner.taxonomy_idle_heartbeat_due(100.0, 3700.0, 3600))
+
     async def test_disabled_pricing_never_opens_d1_or_provider_work(self) -> None:
         config = type("PricingConfig", (), {"pricing_monitor_enabled": False})()
 
