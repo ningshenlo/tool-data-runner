@@ -18,7 +18,7 @@ from typing import Any
 
 from anti_bot_signatures import contains_anti_bot_text
 
-SHADOW_PROMPT_VERSION = "shadow-top2-v3-entity-evidence-grounded-2026-08-14"
+SHADOW_PROMPT_VERSION = "shadow-top2-v4-trusted-models-2026-08-15"
 SHADOW_EXTRACTOR_VERSION = "cleaned-main-content-v2-evidence-grounded-2026-08-14"
 SHADOW_PIPELINE_VERSION = "p2a-shadow-v3-2026-08-14"
 DEFAULT_TAXONOMY_VERSION = 1
@@ -1096,9 +1096,32 @@ async def load_shadow_tasks(
         return await d1.query(sql, [*cleaned, limit])
 
     auto_non_product_predicate = """(
-      t.entity_kind = 'non_product'
-      AND t.entity_kind_source = 'auto'
-      AND t.status = 'published'
+      t.status = 'published'
+      AND COALESCE(t.entity_kind_source, '') <> 'manual'
+      AND (
+        (
+          t.entity_kind = 'non_product'
+          AND t.entity_kind_source = 'auto'
+        )
+        OR EXISTS (
+          SELECT 1 FROM classification_runs unsafe_incident_run
+          WHERE unsafe_incident_run.tool_id = t.id
+            AND json_extract(
+              unsafe_incident_run.raw_output,
+              '$.auto_non_product_recheck'
+            ) = 1
+            AND instr(
+              COALESCE(
+                json_extract(
+                  unsafe_incident_run.raw_output,
+                  '$.model_policy.downstream_models'
+                ),
+                ''
+              ),
+              'workers-ai/'
+            ) > 0
+        )
+      )
     )"""
     entity_predicates = ["t.entity_kind = 'independent_product'"]
     if allow_unresolved_entity:
@@ -1123,18 +1146,47 @@ async def load_shadow_tasks(
           ELSE 1
         END, t.id ASC"""
 
-    current_prompt_clause = ""
+    classification_history_clause = ""
     if skip_current_prompt:
         failed_model_clause = (
             "AND failed_run.model_name = ?" if retry_model_name else ""
         )
-        current_prompt_clause = """
-          AND NOT EXISTS (
-            SELECT 1 FROM classification_runs current_run
-            WHERE current_run.tool_id = t.id
-              AND current_run.prompt_version = ?
-              AND current_run.run_status IN ('succeeded', 'partial', 'skipped')
+        prior_terminal_clause = """
+          NOT EXISTS (
+            SELECT 1 FROM classification_runs terminal_run
+            WHERE terminal_run.tool_id = t.id
+              AND terminal_run.prompt_version LIKE 'shadow-%'
+              AND terminal_run.run_status IN ('succeeded', 'partial', 'skipped')
           )
+        """
+        if include_auto_non_product_recheck:
+            # Incident rows deliberately run once under the corrected prompt. Ordinary
+            # backlog rows run automatically only when they have never reached a
+            # terminal Shadow result; a prompt edit must not trigger a catalog-wide
+            # paid reclassification wave.
+            classification_history_clause = f"""
+              AND (
+                (
+                  {auto_non_product_predicate}
+                  AND NOT EXISTS (
+                    SELECT 1 FROM classification_runs current_run
+                    WHERE current_run.tool_id = t.id
+                      AND current_run.prompt_version = ?
+                      AND current_run.run_status IN ('succeeded', 'partial', 'skipped')
+                  )
+                )
+                OR
+                (
+                  NOT {auto_non_product_predicate}
+                  AND {prior_terminal_clause}
+                )
+              )
+            """
+        else:
+            classification_history_clause = f"""
+              AND {prior_terminal_clause}
+            """
+        classification_history_clause += """
           AND (
             SELECT COUNT(*) FROM classification_runs failed_run
             WHERE failed_run.tool_id = t.id
@@ -1161,13 +1213,15 @@ async def load_shadow_tasks(
           AND trim(coalesce(t.normalized_domain, '')) <> ''
           AND t.id > ?
           AND {entity_clause}
-          {current_prompt_clause}
+          {classification_history_clause}
         ORDER BY {order_by_sql}
         LIMIT ?
     """
     params: list[Any] = [int(after_tool_id or 0)]
     if skip_current_prompt:
-        params.extend([SHADOW_PROMPT_VERSION, SHADOW_PROMPT_VERSION])
+        if include_auto_non_product_recheck:
+            params.append(SHADOW_PROMPT_VERSION)
+        params.append(SHADOW_PROMPT_VERSION)
         if retry_model_name:
             params.append(retry_model_name)
     params.append(limit)
@@ -1475,6 +1529,19 @@ class ShadowResult:
     raw: dict[str, Any] = field(default_factory=dict)
 
 
+def trusted_taxonomy_custom_ai(custom_ai: Any) -> list[dict[str, Any]]:
+    """Return only explicitly configured non-Workers-AI taxonomy providers."""
+    if not isinstance(custom_ai, list):
+        return []
+    return [
+        item
+        for item in custom_ai
+        if isinstance(item, dict)
+        and str(item.get("model") or "").strip()
+        and not str(item.get("model") or "").startswith("workers-ai/")
+    ]
+
+
 async def classify_tool_shadow(
     *,
     d1: Any,
@@ -1520,19 +1587,13 @@ async def classify_tool_shadow(
     else:
         task_obj = task
 
-    custom_ai = browser_client.category_custom_ai()
+    configured_custom_ai = browser_client.category_custom_ai()
+    # Entity and taxonomy decisions are catalog-critical. Workers AI remains useful
+    # elsewhere in the asset pipeline, but is intentionally excluded from every
+    # Shadow taxonomy stage (including provider fallback).
+    custom_ai = trusted_taxonomy_custom_ai(configured_custom_ai)
     model_chain = [item.get("model") for item in custom_ai if isinstance(item, dict)]
     downstream_custom_ai = custom_ai
-    if auto_non_product_recheck:
-        # DeepSeek is reserved for the single evidence-heavy profile/entity pass.
-        # Constrained taxonomy adjudication uses the configured non-DeepSeek model
-        # and must not silently multiply paid DeepSeek calls.
-        downstream_custom_ai = [
-            item
-            for item in custom_ai
-            if isinstance(item, dict)
-            and not str(item.get("model") or "").startswith("deepseek/")
-        ]
     provider = "browser_rendering_cleaned_text_custom_ai"
     raw_bundle: dict[str, Any] = {
         "pipeline": SHADOW_PIPELINE_VERSION,
@@ -1553,9 +1614,33 @@ async def classify_tool_shadow(
                 for item in downstream_custom_ai
                 if isinstance(item, dict) and item.get("model")
             ],
-            "deepseek_profile_only": auto_non_product_recheck,
+            "workers_ai_allowed": False,
+            "deepseek_profile_only": False,
+            "excluded_models": [
+                str(item.get("model") or "")
+                for item in configured_custom_ai
+                if isinstance(item, dict)
+                and str(item.get("model") or "").startswith("workers-ai/")
+            ],
         },
     }
+
+    if not custom_ai:
+        result.error = "trusted_taxonomy_model_unavailable"
+        raw_bundle["error"] = result.error
+        if not dry_run:
+            result.run_id = await insert_classification_run(
+                d1,
+                tool_id=tool_id,
+                taxonomy_version=catalog.taxonomy_version,
+                run_status="failed",
+                provider=provider,
+                raw_output=raw_bundle,
+                error=result.error,
+            )
+            result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
+        result.raw = raw_bundle
+        return result
 
     source_url = str(getattr(task_obj, "official_url", "") or "")
     profile_raw: dict[str, Any] = {}
@@ -1717,26 +1802,6 @@ async def classify_tool_shadow(
                 error=result.error,
             )
             result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
-        return result
-
-    if auto_non_product_recheck and not downstream_custom_ai:
-        result.status = "partial"
-        result.error = "auto_non_product_recheck_downstream_model_unavailable"
-        raw_bundle["error"] = result.error
-        if not dry_run:
-            await upsert_product_profile(d1, tool_id, profile)
-            result.run_id = await insert_classification_run(
-                d1,
-                tool_id=tool_id,
-                taxonomy_version=catalog.taxonomy_version,
-                run_status=result.status,
-                provider=provider,
-                model_name=(model_chain[0] if model_chain else ""),
-                raw_output=raw_bundle,
-                error=result.error,
-            )
-            result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
-        result.raw = raw_bundle
         return result
 
     roots = catalog.primary_roots()
@@ -2074,7 +2139,7 @@ async def run_shadow_taxonomy(
             return counts
 
         browser_client = CloudflareBrowserRunAssetClient(config)
-        custom_ai = browser_client.category_custom_ai()
+        custom_ai = trusted_taxonomy_custom_ai(browser_client.category_custom_ai())
         model_chain = [
             str(item.get("model") or "")
             for item in custom_ai

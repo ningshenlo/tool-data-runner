@@ -63,9 +63,10 @@ ASSET_DEAD_LETTER_REVIVE_HOURS = 24
 PUBLISHED_CATEGORY_BACKFILL_VERSION = "published-legacy-v1"
 # Primary model via Browser Rendering custom_ai (AI Gateway provider form).
 DEFAULT_CATEGORY_CLASSIFICATION_MODEL = "deepseek/deepseek-v4-flash"
-DEFAULT_CATEGORY_CLASSIFICATION_FALLBACK_MODEL = (
-    "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"
-)
+# Taxonomy L1/leaf decisions must never silently fall back to Workers AI.
+# Operators may configure another paid provider explicitly (for example,
+# ``openai/gpt-5.6-luna``) after evaluation.
+DEFAULT_CATEGORY_CLASSIFICATION_FALLBACK_MODEL = ""
 D1_API_BASE = "https://api.cloudflare.com/client/v4"
 DOMAIN_STATE_SOURCE = "ahrefs"
 AHREFS_DOMAIN_RATING_URL = "https://api.ahrefs.com/v3/public/domain-rating-free"
@@ -1163,6 +1164,11 @@ def category_model_auth_token(model: str, config_or_client: Any) -> str:
         if deepseek_key is None:
             deepseek_key = getattr(config_or_client, "category_classification_deepseek_api_key", "")
         return str(deepseek_key or "").strip()
+    if model_id.startswith("openai/"):
+        openai_key = getattr(config_or_client, "category_openai_api_key", None)
+        if openai_key is None:
+            openai_key = getattr(config_or_client, "openai_api_key", "")
+        return str(openai_key or "").strip()
     token = getattr(config_or_client, "category_api_token", None)
     if token is None:
         token = getattr(config_or_client, "category_classification_api_token", "")
@@ -3181,6 +3187,7 @@ class CloudflareBrowserRunAssetClient:
         self.timeout_seconds = config.browser_rendering_timeout_seconds
         self.category_api_token = config.category_classification_api_token
         self.category_deepseek_api_key = config.category_classification_deepseek_api_key
+        self.category_openai_api_key = getattr(config, "openai_api_key", "")
         self.category_model = normalize_category_model_id(config.category_classification_model)
         self.category_fallback_model = normalize_category_model_id(
             config.category_classification_fallback_model
@@ -3333,12 +3340,25 @@ class CloudflareBrowserRunAssetClient:
         )
         configs: list[dict[str, Any]] = []
         for model in models:
+            if model.startswith("workers-ai/"):
+                log_info(
+                    "assets.category_custom_ai.exclude_untrusted_model",
+                    model=model,
+                    provider="workers-ai",
+                )
+                continue
             token = category_model_auth_token(model, self)
             if not token:
                 log_info(
                     "assets.category_custom_ai.skip_missing_token",
                     model=model,
-                    provider="deepseek" if model.startswith("deepseek/") else "workers-ai",
+                    provider=(
+                        "deepseek"
+                        if model.startswith("deepseek/")
+                        else "openai"
+                        if model.startswith("openai/")
+                        else "workers-ai"
+                    ),
                 )
                 continue
             item: dict[str, Any] = {

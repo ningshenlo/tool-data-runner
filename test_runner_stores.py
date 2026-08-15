@@ -6,6 +6,7 @@ import sqlite3
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
@@ -473,6 +474,33 @@ class CategoryPromptHelperTests(unittest.TestCase):
         self.assertEqual(workers_format["json_schema"]["schema"], schema)
         self.assertEqual(workers_format["json_schema"]["name"], "category_l1")
 
+    def test_category_model_auth_uses_openai_key_for_luna(self) -> None:
+        config = SimpleNamespace(
+            category_openai_api_key="openai-test-key",
+            category_api_token="workers-ai-token",
+        )
+
+        self.assertEqual(
+            runner.category_model_auth_token("openai/gpt-5.6-luna", config),
+            "openai-test-key",
+        )
+
+    def test_category_custom_ai_excludes_workers_ai_even_when_configured(self) -> None:
+        client = SimpleNamespace(
+            category_model="deepseek/deepseek-v4-flash",
+            category_fallback_model="workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+            category_deepseek_api_key="deepseek-test-key",
+            category_api_token="workers-ai-token",
+            category_deepseek_max_output_tokens=1024,
+        )
+
+        configs = runner.CloudflareBrowserRunAssetClient.category_custom_ai(client)
+
+        self.assertEqual(
+            [item["model"] for item in configs],
+            ["deepseek/deepseek-v4-flash"],
+        )
+
     def test_augment_prompt_for_json_object_lists_required_keys(self) -> None:
         schema = {
             "type": "object",
@@ -565,10 +593,7 @@ class AssetExtractionContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(raw["prompt_version"], runner.CATEGORY_CLASSIFICATION_PROMPT_VERSION)
         self.assertEqual(
             raw["model_chain"],
-            [
-                "deepseek/deepseek-v4-flash",
-                "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-            ],
+            ["deepseek/deepseek-v4-flash"],
         )
 
     async def test_category_l2_outside_selected_parent_is_rejected(self) -> None:

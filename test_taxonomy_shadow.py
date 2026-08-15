@@ -154,7 +154,7 @@ class ShadowTaskSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("$.taxonomy_evidence", sql)
         self.assertIn("source.verification_status = 'verified'", sql)
 
-    async def test_batch_query_skips_tools_already_run_by_current_prompt(self):
+    async def test_standard_backlog_skips_any_prior_terminal_shadow_run(self):
         observed: dict[str, object] = {}
 
         class FakeD1:
@@ -172,13 +172,13 @@ class ShadowTaskSourceTests(unittest.IsolatedAsyncioTestCase):
 
         sql = str(observed["sql"])
         self.assertIn("NOT EXISTS", sql)
-        self.assertIn("current_run.prompt_version = ?", sql)
-        self.assertIn("current_run.run_status IN ('succeeded', 'partial', 'skipped')", sql)
+        self.assertIn("terminal_run.prompt_version LIKE 'shadow-%'", sql)
+        self.assertIn("terminal_run.run_status IN ('succeeded', 'partial', 'skipped')", sql)
         self.assertIn("failed_run.run_status = 'failed'", sql)
         self.assertIn("entity_kind_source", sql)
         self.assertEqual(
             observed["params"],
-            [500, SHADOW_PROMPT_VERSION, SHADOW_PROMPT_VERSION, 100],
+            [500, SHADOW_PROMPT_VERSION, 100],
         )
 
     async def test_batch_query_scopes_failure_budget_to_active_primary_model(self):
@@ -202,7 +202,6 @@ class ShadowTaskSourceTests(unittest.IsolatedAsyncioTestCase):
             observed["params"],
             [
                 0,
-                SHADOW_PROMPT_VERSION,
                 SHADOW_PROMPT_VERSION,
                 "deepseek/deepseek-v4-flash",
                 20,
@@ -238,7 +237,8 @@ class ShadowTaskSourceTests(unittest.IsolatedAsyncioTestCase):
               tool_id INTEGER,
               prompt_version TEXT,
               run_status TEXT,
-              model_name TEXT
+              model_name TEXT,
+              raw_output TEXT
             );
             INSERT INTO tools VALUES
               (1, 'product', 'product.test', 'https://product.test/',
@@ -256,7 +256,11 @@ class ShadowTaskSourceTests(unittest.IsolatedAsyncioTestCase):
               (7, 'no-domain', '', 'https://no-domain.test/',
                'non_product', 'auto', 'published', NULL),
               (8, 'pending-incident', 'pending.test', 'https://pending.test/',
-               'non_product', 'auto', 'pending_review', NULL);
+               'non_product', 'auto', 'pending_review', NULL),
+              (9, 'old-terminal', 'old-terminal.test', 'https://old-terminal.test/',
+               'independent_product', 'auto', 'published', NULL),
+              (10, 'unsafe-incident', 'unsafe-incident.test', 'https://unsafe-incident.test/',
+               'independent_product', 'auto', 'published', NULL);
             """
         )
         connection.execute(
@@ -266,6 +270,27 @@ class ShadowTaskSourceTests(unittest.IsolatedAsyncioTestCase):
             VALUES (1, 5, ?, 'partial', 'test-model')
             """,
             [SHADOW_PROMPT_VERSION],
+        )
+        connection.execute(
+            """
+            INSERT INTO classification_runs
+              (id, tool_id, prompt_version, run_status, model_name)
+            VALUES (2, 9, 'shadow-older-prompt', 'succeeded', 'test-model')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO classification_runs
+              (id, tool_id, prompt_version, run_status, model_name, raw_output)
+            VALUES (
+              3,
+              10,
+              'shadow-unsafe-workers-ai',
+              'succeeded',
+              'deepseek/deepseek-v4-flash',
+              '{"auto_non_product_recheck":1,"model_policy":{"downstream_models":["workers-ai/test"]}}'
+            )
+            """
         )
 
         class SqliteD1:
@@ -286,10 +311,15 @@ class ShadowTaskSourceTests(unittest.IsolatedAsyncioTestCase):
         connection.close()
 
         self.assertEqual([row["tool_id"] for row in default_rows], [1, 2])
-        self.assertEqual([row["tool_id"] for row in incident_rows], [3, 1, 2])
+        self.assertEqual([row["tool_id"] for row in incident_rows], [3, 10, 1, 2])
         self.assertEqual(
             [row["selection_reason"] for row in incident_rows],
-            ["auto_non_product_recheck", "standard", "standard"],
+            [
+                "auto_non_product_recheck",
+                "auto_non_product_recheck",
+                "standard",
+                "standard",
+            ],
         )
 
 
@@ -750,7 +780,7 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "partial")
         self.assertEqual(result.run_id, 901)
 
-    async def test_auto_non_product_recheck_uses_deepseek_only_for_profile(self):
+    async def test_taxonomy_excludes_workers_ai_and_uses_deepseek_for_all_stages(self):
         stage_models: dict[str, list[str]] = {}
 
         class FakeBrowser:
@@ -822,43 +852,31 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(
             stage_models["shadow_profile_main_content"],
-            ["deepseek/deepseek-v4-flash", workers_model],
+            ["deepseek/deepseek-v4-flash"],
         )
-        self.assertEqual(stage_models["shadow_l1_top2"], [workers_model])
-        self.assertEqual(stage_models["shadow_leaf"], [workers_model])
-        self.assertTrue(result.raw["model_policy"]["deepseek_profile_only"])
+        self.assertEqual(stage_models["shadow_l1_top2"], ["deepseek/deepseek-v4-flash"])
+        self.assertEqual(stage_models["shadow_leaf"], ["deepseek/deepseek-v4-flash"])
+        self.assertFalse(result.raw["model_policy"]["workers_ai_allowed"])
+        self.assertFalse(result.raw["model_policy"]["deepseek_profile_only"])
+        self.assertEqual(result.raw["model_policy"]["excluded_models"], [workers_model])
 
-    async def test_auto_non_product_recheck_never_reuses_deepseek_downstream(self):
+    async def test_taxonomy_never_falls_back_to_workers_ai(self):
         stages: list[str] = []
 
         class FakeBrowser:
             def category_custom_ai(self):
-                return [{"model": "deepseek/deepseek-v4-flash"}]
+                return [
+                    {"model": "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"}
+                ]
 
             async def fetch_homepage_content(self, task):
-                return task.official_url, (
-                    "<html><body><h1>Generate videos from text</h1>"
-                    "<a href='/signup'>Start for free</a></body></html>"
-                )
+                raise AssertionError("homepage fetch must not start without a trusted model")
 
             async def fetch_structured_text_data(
                 self, *, source_url, stage, prompt, json_schema, custom_ai, **kwargs
             ):
                 stages.append(stage)
-                if stage != "shadow_profile_main_content":
-                    raise AssertionError(f"unexpected stage: {stage}")
-                return source_url, {
-                    "entity_kind": "independent_product",
-                    "entity_confidence": 0.95,
-                    "entity_reason": "Dedicated product",
-                    "entity_evidence": [{"quote": "Start for free"}],
-                    "primary_job": {
-                        "value": "Generate videos",
-                        "evidence": [{"quote": "Generate videos from text"}],
-                    },
-                    "primary_outputs": [],
-                    "capabilities_raw": [],
-                }
+                raise AssertionError(f"unexpected stage: {stage}")
 
         result = await classify_tool_shadow(
             d1=object(),
@@ -880,12 +898,10 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
             include_capabilities=False,
         )
 
-        self.assertEqual(stages, ["shadow_profile_main_content"])
-        self.assertEqual(result.status, "partial")
-        self.assertEqual(
-            result.error,
-            "auto_non_product_recheck_downstream_model_unavailable",
-        )
+        self.assertEqual(stages, [])
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(result.error, "trusted_taxonomy_model_unavailable")
+        self.assertFalse(result.raw["model_policy"]["workers_ai_allowed"])
 
     async def test_antibot_page_is_gated_before_any_model_call(self):
         calls: list[str] = []
