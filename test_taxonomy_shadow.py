@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import unittest
+from unittest.mock import AsyncMock, patch
 
 from runner import AssetTask
 
@@ -206,6 +207,89 @@ class ShadowTaskSourceTests(unittest.IsolatedAsyncioTestCase):
                 "deepseek/deepseek-v4-flash",
                 20,
             ],
+        )
+
+    async def test_auto_non_product_recheck_is_explicit_prioritized_and_manual_safe(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE tools (
+              id INTEGER PRIMARY KEY,
+              canonical_slug TEXT,
+              normalized_domain TEXT,
+              official_url TEXT,
+              entity_kind TEXT,
+              entity_kind_source TEXT,
+              status TEXT,
+              duplicate_of_tool_id INTEGER
+            );
+            CREATE TABLE tool_sources (
+              id INTEGER PRIMARY KEY,
+              tool_id INTEGER,
+              source_url TEXT,
+              source_type TEXT,
+              verification_status TEXT,
+              confidence_score REAL,
+              raw_payload TEXT
+            );
+            CREATE TABLE classification_runs (
+              id INTEGER PRIMARY KEY,
+              tool_id INTEGER,
+              prompt_version TEXT,
+              run_status TEXT,
+              model_name TEXT
+            );
+            INSERT INTO tools VALUES
+              (1, 'product', 'product.test', 'https://product.test/',
+               'independent_product', 'auto', 'published', NULL),
+              (2, 'unknown', 'unknown.test', 'https://unknown.test/',
+               'unresolved', 'auto', 'published', NULL),
+              (3, 'incident', 'incident.test', 'https://incident.test/',
+               'non_product', 'auto', 'published', NULL),
+              (4, 'manual-reject', 'manual.test', 'https://manual.test/',
+               'non_product', 'manual', 'published', NULL),
+              (5, 'already-rechecked', 'done.test', 'https://done.test/',
+               'non_product', 'auto', 'published', NULL),
+              (6, 'duplicate', 'duplicate.test', 'https://duplicate.test/',
+               'non_product', 'auto', 'published', 3),
+              (7, 'no-domain', '', 'https://no-domain.test/',
+               'non_product', 'auto', 'published', NULL),
+              (8, 'pending-incident', 'pending.test', 'https://pending.test/',
+               'non_product', 'auto', 'pending_review', NULL);
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO classification_runs
+              (id, tool_id, prompt_version, run_status, model_name)
+            VALUES (1, 5, ?, 'partial', 'test-model')
+            """,
+            [SHADOW_PROMPT_VERSION],
+        )
+
+        class SqliteD1:
+            async def query(self, sql, params):
+                return [dict(row) for row in connection.execute(sql, params).fetchall()]
+
+        default_rows = await load_shadow_tasks(
+            SqliteD1(),
+            limit=20,
+            allow_unresolved_entity=True,
+        )
+        incident_rows = await load_shadow_tasks(
+            SqliteD1(),
+            limit=20,
+            allow_unresolved_entity=True,
+            include_auto_non_product_recheck=True,
+        )
+        connection.close()
+
+        self.assertEqual([row["tool_id"] for row in default_rows], [1, 2])
+        self.assertEqual([row["tool_id"] for row in incident_rows], [3, 1, 2])
+        self.assertEqual(
+            [row["selection_reason"] for row in incident_rows],
+            ["auto_non_product_recheck", "standard", "standard"],
         )
 
 
@@ -585,6 +669,223 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("content unavailable", result.error)
         self.assertEqual(calls, [])
         self.assertNotIn("profile_direct_fallback_raw", result.raw)
+
+    async def test_auto_non_product_fetch_failure_demotes_once_without_retry_status(self):
+        class FakeBrowser:
+            def category_custom_ai(self):
+                return [{"model": "fake-model"}]
+
+            async def fetch_homepage_content(self, task):
+                raise RuntimeError("network connection closed")
+
+        result = await classify_tool_shadow(
+            d1=object(),
+            browser_client=FakeBrowser(),
+            task=AssetTask(
+                tool_id=127,
+                canonical_slug="stale-auto-reject",
+                normalized_domain="stale.test",
+                official_url="https://stale.test/",
+                attempts=0,
+                max_attempts=1,
+                generation=0,
+                lease_token="test-shadow",
+            ),
+            catalog=_catalog(),
+            dry_run=True,
+            existing_entity_kind="non_product",
+            existing_entity_source="auto",
+            include_capabilities=False,
+        )
+
+        self.assertEqual(result.entity_kind, "unresolved")
+        self.assertEqual(result.status, "partial")
+        self.assertIn("profile_extract_failed", result.error)
+        self.assertTrue(result.raw["auto_non_product_recheck"])
+        self.assertTrue(result.raw["auto_non_product_safely_demoted"])
+
+    async def test_auto_non_product_safe_demotion_is_persisted_as_partial(self):
+        class FakeBrowser:
+            def category_custom_ai(self):
+                return [{"model": "fake-model"}]
+
+            async def fetch_homepage_content(self, task):
+                raise RuntimeError("network connection closed")
+
+        before = {"primary_category_id": 10}
+        d1 = object()
+        update_entity = AsyncMock()
+        insert_run = AsyncMock(return_value=901)
+        with (
+            patch(
+                "taxonomy_shadow.snapshot_legacy_category_state",
+                new=AsyncMock(side_effect=[before, before]),
+            ),
+            patch("taxonomy_shadow.update_tool_entity_kind", new=update_entity),
+            patch("taxonomy_shadow.upsert_product_profile", new=AsyncMock()),
+            patch("taxonomy_shadow.insert_classification_run", new=insert_run),
+        ):
+            result = await classify_tool_shadow(
+                d1=d1,
+                browser_client=FakeBrowser(),
+                task=AssetTask(
+                    tool_id=128,
+                    canonical_slug="persist-demotion",
+                    normalized_domain="persist.test",
+                    official_url="https://persist.test/",
+                    attempts=0,
+                    max_attempts=1,
+                    generation=0,
+                    lease_token="test-shadow",
+                ),
+                catalog=_catalog(),
+                dry_run=False,
+                existing_entity_kind="non_product",
+                existing_entity_source="auto",
+                include_capabilities=False,
+            )
+
+        update_entity.assert_awaited_once_with(d1, 128, "unresolved")
+        self.assertEqual(insert_run.await_args.kwargs["run_status"], "partial")
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(result.run_id, 901)
+
+    async def test_auto_non_product_recheck_uses_deepseek_only_for_profile(self):
+        stage_models: dict[str, list[str]] = {}
+
+        class FakeBrowser:
+            def category_custom_ai(self):
+                return [
+                    {"model": "deepseek/deepseek-v4-flash"},
+                    {"model": "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"},
+                ]
+
+            async def fetch_homepage_content(self, task):
+                return task.official_url, (
+                    "<html><body><h1>Generate videos from text</h1>"
+                    "<a href='/signup'>Start for free</a></body></html>"
+                )
+
+            async def fetch_structured_text_data(
+                self, *, source_url, stage, prompt, json_schema, custom_ai, **kwargs
+            ):
+                stage_models[stage] = [item["model"] for item in custom_ai]
+                if stage == "shadow_profile_main_content":
+                    return source_url, {
+                        "entity_kind": "independent_product",
+                        "entity_confidence": 0.95,
+                        "entity_reason": "Dedicated product",
+                        "entity_evidence": [{"quote": "Start for free"}],
+                        "primary_job": {
+                            "value": "Generate videos",
+                            "evidence": [{"quote": "Generate videos from text"}],
+                        },
+                        "primary_outputs": [],
+                        "capabilities_raw": [],
+                    }
+                if stage == "shadow_l1_top2":
+                    return source_url, {
+                        "l1_candidates": [
+                            {"slug": "video", "confidence": 0.9, "reason": "market"}
+                        ]
+                    }
+                if stage == "shadow_leaf":
+                    return source_url, {
+                        "leaf_slug": "text-to-video",
+                        "confidence": 0.88,
+                        "reason": "primary job",
+                        "evidence": [{"quote": "Generate videos from text"}],
+                    }
+                raise AssertionError(f"unexpected stage: {stage}")
+
+        result = await classify_tool_shadow(
+            d1=object(),
+            browser_client=FakeBrowser(),
+            task=AssetTask(
+                tool_id=129,
+                canonical_slug="cost-guard",
+                normalized_domain="cost.test",
+                official_url="https://cost.test/",
+                attempts=0,
+                max_attempts=1,
+                generation=0,
+                lease_token="test-shadow",
+            ),
+            catalog=_catalog(),
+            dry_run=True,
+            existing_entity_kind="non_product",
+            existing_entity_source="auto",
+            include_capabilities=False,
+        )
+
+        workers_model = "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(
+            stage_models["shadow_profile_main_content"],
+            ["deepseek/deepseek-v4-flash", workers_model],
+        )
+        self.assertEqual(stage_models["shadow_l1_top2"], [workers_model])
+        self.assertEqual(stage_models["shadow_leaf"], [workers_model])
+        self.assertTrue(result.raw["model_policy"]["deepseek_profile_only"])
+
+    async def test_auto_non_product_recheck_never_reuses_deepseek_downstream(self):
+        stages: list[str] = []
+
+        class FakeBrowser:
+            def category_custom_ai(self):
+                return [{"model": "deepseek/deepseek-v4-flash"}]
+
+            async def fetch_homepage_content(self, task):
+                return task.official_url, (
+                    "<html><body><h1>Generate videos from text</h1>"
+                    "<a href='/signup'>Start for free</a></body></html>"
+                )
+
+            async def fetch_structured_text_data(
+                self, *, source_url, stage, prompt, json_schema, custom_ai, **kwargs
+            ):
+                stages.append(stage)
+                if stage != "shadow_profile_main_content":
+                    raise AssertionError(f"unexpected stage: {stage}")
+                return source_url, {
+                    "entity_kind": "independent_product",
+                    "entity_confidence": 0.95,
+                    "entity_reason": "Dedicated product",
+                    "entity_evidence": [{"quote": "Start for free"}],
+                    "primary_job": {
+                        "value": "Generate videos",
+                        "evidence": [{"quote": "Generate videos from text"}],
+                    },
+                    "primary_outputs": [],
+                    "capabilities_raw": [],
+                }
+
+        result = await classify_tool_shadow(
+            d1=object(),
+            browser_client=FakeBrowser(),
+            task=AssetTask(
+                tool_id=130,
+                canonical_slug="no-fallback",
+                normalized_domain="no-fallback.test",
+                official_url="https://no-fallback.test/",
+                attempts=0,
+                max_attempts=1,
+                generation=0,
+                lease_token="test-shadow",
+            ),
+            catalog=_catalog(),
+            dry_run=True,
+            existing_entity_kind="non_product",
+            existing_entity_source="auto",
+            include_capabilities=False,
+        )
+
+        self.assertEqual(stages, ["shadow_profile_main_content"])
+        self.assertEqual(result.status, "partial")
+        self.assertEqual(
+            result.error,
+            "auto_non_product_recheck_downstream_model_unavailable",
+        )
 
     async def test_antibot_page_is_gated_before_any_model_call(self):
         calls: list[str] = []

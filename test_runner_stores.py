@@ -845,6 +845,44 @@ class BrowserStructuredPayloadValidationTests(unittest.TestCase):
 
 
 class WorkerControlTests(unittest.IsolatedAsyncioTestCase):
+    async def test_taxonomy_worker_wires_auto_non_product_recheck_kill_switch(self) -> None:
+        config = type(
+            "TaxonomyConfig",
+            (),
+            {
+                "taxonomy_auto_enabled": True,
+                "taxonomy_recheck_auto_non_product": True,
+                "taxonomy_limit": 50,
+                "taxonomy_concurrency": 3,
+                "taxonomy_auto_accept_confidence": 0.5,
+            },
+        )()
+        classifier = AsyncMock(return_value={"selected": 0})
+
+        class FakeD1Context:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        async def run_operation(_config, _d1, workload, operation):
+            self.assertEqual(workload, "taxonomy")
+            return await operation()
+
+        with (
+            patch.object(runner, "D1Client", return_value=FakeD1Context()),
+            patch.object(runner, "run_with_telemetry", side_effect=run_operation),
+            patch("taxonomy_shadow.run_shadow_taxonomy", new=classifier),
+        ):
+            await runner.run_taxonomy_once(config)
+
+        classifier.assert_awaited_once()
+        self.assertTrue(
+            classifier.await_args.kwargs["include_auto_non_product_recheck"]
+        )
+        self.assertFalse(classifier.await_args.kwargs["include_capabilities"])
+
     def test_taxonomy_full_batch_continues_without_poll_delay(self) -> None:
         config = type(
             "TaxonomyConfig",
@@ -870,6 +908,13 @@ class WorkerControlTests(unittest.IsolatedAsyncioTestCase):
                 {"selected": 50, "provider_blocked": 1},
             ),
             21600,
+        )
+        self.assertEqual(
+            runner.taxonomy_next_delay_seconds(
+                config,
+                {"selected": 50, "auto_non_product_recheck_selected": 50},
+            ),
+            300,
         )
 
     def test_taxonomy_idle_detection_ignores_scan_only_bookkeeping(self) -> None:

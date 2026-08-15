@@ -242,6 +242,7 @@ class Config:
     pricing_manual_review_replay_limit: int
     pricing_timeout_seconds: int
     taxonomy_auto_enabled: bool
+    taxonomy_recheck_auto_non_product: bool
     taxonomy_limit: int
     taxonomy_interval_seconds: int
     taxonomy_concurrency: int
@@ -760,6 +761,9 @@ def load_config(require_brightdata: bool = True) -> Config:
         ),
         pricing_timeout_seconds=read_int_env("RUNNER_PRICING_TIMEOUT_SECONDS", 20),
         taxonomy_auto_enabled=read_bool_env("TAXONOMY_AUTO_ENABLED", True),
+        taxonomy_recheck_auto_non_product=read_bool_env(
+            "TAXONOMY_RECHECK_AUTO_NON_PRODUCT", True
+        ),
         taxonomy_limit=max(1, read_int_env("RUNNER_TAXONOMY_LIMIT", 50)),
         taxonomy_interval_seconds=max(
             300, read_int_env("RUNNER_TAXONOMY_INTERVAL_SECONDS", 300)
@@ -12368,6 +12372,9 @@ async def run_taxonomy_once(config: Config) -> dict[str, int]:
             config,
             config.taxonomy_limit,
             allow_unresolved_entity=True,
+            include_auto_non_product_recheck=getattr(
+                config, "taxonomy_recheck_auto_non_product", True
+            ),
             include_capabilities=False,
             concurrency=config.taxonomy_concurrency,
             auto_accept_threshold=config.taxonomy_auto_accept_confidence,
@@ -12386,6 +12393,10 @@ def taxonomy_next_delay_seconds(config: Config, counts: dict[str, int]) -> int:
     """Poll only when drained; immediately continue while a full batch signals backlog."""
     if int(counts.get("provider_blocked") or 0) > 0:
         return int(config.taxonomy_provider_backoff_seconds)
+    if int(counts.get("auto_non_product_recheck_selected") or 0) > 0:
+        # Incident repair is intentionally paced so operators can inspect each
+        # batch and trip the kill switch before another provider-cost burst.
+        return int(config.taxonomy_interval_seconds)
     if int(counts.get("selected") or 0) >= int(config.taxonomy_limit):
         return 0
     return int(config.taxonomy_interval_seconds)
@@ -12408,6 +12419,12 @@ def taxonomy_batch_has_activity(counts: dict[str, int]) -> bool:
         "reclassification_succeeded",
         "reclassification_needs_manual",
         "reclassification_failed",
+        "auto_non_product_recheck_selected",
+        "auto_non_product_recheck_succeeded",
+        "auto_non_product_recheck_partial",
+        "auto_non_product_recheck_failed",
+        "auto_non_product_recheck_skipped",
+        "auto_non_product_recheck_deferred",
     )
     return any(int(counts.get(field) or 0) > 0 for field in activity_fields)
 
@@ -12430,6 +12447,9 @@ async def run_taxonomy_loop(config: Config) -> None:
         limit=config.taxonomy_limit,
         concurrency=config.taxonomy_concurrency,
         auto_accept_confidence=config.taxonomy_auto_accept_confidence,
+        recheck_auto_non_product=getattr(
+            config, "taxonomy_recheck_auto_non_product", True
+        ),
         primary_only=True,
     )
     if not config.taxonomy_auto_enabled:

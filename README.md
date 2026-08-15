@@ -127,6 +127,21 @@ partial, and skipped results are not repeatedly charged. Failed-run budgets are
 scoped to the active primary model, so switching providers can recover previously
 exhausted tools without deleting their audit history.
 
+The taxonomy worker also rechecks stale `non_product` labels on published tools when
+they were written automatically and have no terminal run for the current prompt.
+These incident rows are drained before ordinary backlog; manual entity decisions and
+pending catalog records are never selected by this incident cohort.
+If a blocked or unreachable page cannot provide fresh evidence, the stale automatic
+label is safely demoted to `unresolved` and recorded as `partial`, preventing repeated
+provider charges. Incident batches are paced by the normal taxonomy interval even when
+full, leaving an operator window between batches. Set
+`TAXONOMY_RECHECK_AUTO_NON_PRODUCT=0` to disable this cohort.
+
+For this incident cohort, DeepSeek is used only for the evidence-heavy entity/profile
+pass. L1 and leaf adjudication use the configured non-DeepSeek fallback model. If that
+model is unavailable, the item stops as `partial` instead of silently issuing more
+DeepSeek requests. Anti-bot pages rejected by the pre-model quality gate use no model.
+
 Pricing monitoring is paused by default. Compose scales `pricing-monitor-worker`
 to zero with `PRICING_MONITOR_REPLICAS=0`, and `PRICING_MONITOR_ENABLED=0` is a
 second kill switch that prevents D1/provider work even if a container is started

@@ -1045,6 +1045,7 @@ async def load_shadow_tasks(
     tool_ids: list[int] | None = None,
     after_tool_id: int = 0,
     allow_unresolved_entity: bool = False,
+    include_auto_non_product_recheck: bool = False,
     skip_current_prompt: bool = True,
     retry_model_name: str = "",
 ) -> list[dict[str, Any]]:
@@ -1052,6 +1053,7 @@ async def load_shadow_tasks(
 
     Default: active catalog tools with entity_kind = independent_product.
     Explicit tool_ids always selected (for smoke), regardless of entity_kind.
+    Incident rechecks may include auto-labeled non-products, but never manual labels.
     """
     if limit <= 0:
         return []
@@ -1083,7 +1085,8 @@ async def load_shadow_tasks(
               {evidence_url_sql} AS taxonomy_evidence_url,
               t.entity_kind,
               t.entity_kind_source,
-              t.status
+              t.status,
+              'explicit' AS selection_reason
             FROM tools t
             WHERE t.id IN ({placeholders})
               AND t.duplicate_of_tool_id IS NULL
@@ -1092,15 +1095,33 @@ async def load_shadow_tasks(
         """
         return await d1.query(sql, [*cleaned, limit])
 
-    entity_clause = "t.entity_kind = 'independent_product'"
+    auto_non_product_predicate = """(
+      t.entity_kind = 'non_product'
+      AND t.entity_kind_source = 'auto'
+      AND t.status = 'published'
+    )"""
+    entity_predicates = ["t.entity_kind = 'independent_product'"]
     if allow_unresolved_entity:
-        entity_clause = """(
-          t.entity_kind = 'independent_product'
-          OR (
-            t.entity_kind = 'unresolved'
-            AND COALESCE(t.entity_kind_source, '') <> 'manual'
-          )
-        )"""
+        entity_predicates.append("""(
+          t.entity_kind = 'unresolved'
+          AND COALESCE(t.entity_kind_source, '') <> 'manual'
+        )""")
+    if include_auto_non_product_recheck:
+        entity_predicates.append(auto_non_product_predicate)
+    entity_clause = "(" + " OR ".join(entity_predicates) + ")"
+
+    selection_reason_sql = "'standard' AS selection_reason"
+    order_by_sql = "t.id ASC"
+    if include_auto_non_product_recheck:
+        selection_reason_sql = f"""CASE
+          WHEN {auto_non_product_predicate} THEN 'auto_non_product_recheck'
+          ELSE 'standard'
+        END AS selection_reason"""
+        # Drain the known bad cohort before spending provider calls on ordinary backlog.
+        order_by_sql = f"""CASE
+          WHEN {auto_non_product_predicate} THEN 0
+          ELSE 1
+        END, t.id ASC"""
 
     current_prompt_clause = ""
     if skip_current_prompt:
@@ -1132,7 +1153,8 @@ async def load_shadow_tasks(
           {evidence_url_sql} AS taxonomy_evidence_url,
           t.entity_kind,
           t.entity_kind_source,
-          t.status
+          t.status,
+          {selection_reason_sql}
         FROM tools t
         WHERE t.status IN ('pending_enrich', 'pending_review', 'published')
           AND t.duplicate_of_tool_id IS NULL
@@ -1140,7 +1162,7 @@ async def load_shadow_tasks(
           AND t.id > ?
           AND {entity_clause}
           {current_prompt_clause}
-        ORDER BY t.id ASC
+        ORDER BY {order_by_sql}
         LIMIT ?
     """
     params: list[Any] = [int(after_tool_id or 0)]
@@ -1472,6 +1494,11 @@ async def classify_tool_shadow(
         result.error = "invalid_tool_id"
         return result
 
+    auto_non_product_recheck = (
+        str(existing_entity_kind or "").strip().lower() == "non_product"
+        and str(existing_entity_source or "").strip().lower() == "auto"
+    )
+
     if not dry_run:
         result.legacy_before = await snapshot_legacy_category_state(d1, tool_id)
 
@@ -1495,6 +1522,17 @@ async def classify_tool_shadow(
 
     custom_ai = browser_client.category_custom_ai()
     model_chain = [item.get("model") for item in custom_ai if isinstance(item, dict)]
+    downstream_custom_ai = custom_ai
+    if auto_non_product_recheck:
+        # DeepSeek is reserved for the single evidence-heavy profile/entity pass.
+        # Constrained taxonomy adjudication uses the configured non-DeepSeek model
+        # and must not silently multiply paid DeepSeek calls.
+        downstream_custom_ai = [
+            item
+            for item in custom_ai
+            if isinstance(item, dict)
+            and not str(item.get("model") or "").startswith("deepseek/")
+        ]
     provider = "browser_rendering_cleaned_text_custom_ai"
     raw_bundle: dict[str, Any] = {
         "pipeline": SHADOW_PIPELINE_VERSION,
@@ -1503,6 +1541,20 @@ async def classify_tool_shadow(
         "model_chain": model_chain,
         "taxonomy_version": catalog.taxonomy_version,
         "taxonomy_evidence_url": str(getattr(task_obj, "official_url", "") or ""),
+        "auto_non_product_recheck": auto_non_product_recheck,
+        "model_policy": {
+            "profile_models": [
+                str(item.get("model") or "")
+                for item in custom_ai
+                if isinstance(item, dict) and item.get("model")
+            ],
+            "downstream_models": [
+                str(item.get("model") or "")
+                for item in downstream_custom_ai
+                if isinstance(item, dict) and item.get("model")
+            ],
+            "deepseek_profile_only": auto_non_product_recheck,
+        },
     }
 
     source_url = str(getattr(task_obj, "official_url", "") or "")
@@ -1592,8 +1644,15 @@ async def classify_tool_shadow(
     if profile_extract_error and not profile_has_signal(profile) and not bool(
         entity_decision.get("accepted")
     ):
-        result.status = "failed"
+        # The important correction for a known bad auto label is to stop asserting
+        # non_product. If evidence acquisition fails, persist unresolved once and do
+        # not charge up to three identical retries for the same blocked/unreachable site.
+        safely_demoted_auto_non_product = (
+            auto_non_product_recheck and result.entity_kind == "unresolved"
+        )
+        result.status = "partial" if safely_demoted_auto_non_product else "failed"
         result.error = f"profile_extract_failed: {profile_extract_error}"
+        raw_bundle["auto_non_product_safely_demoted"] = safely_demoted_auto_non_product
         raw_bundle["error"] = result.error
         if not dry_run:
             await upsert_product_profile(d1, tool_id, profile)
@@ -1660,6 +1719,26 @@ async def classify_tool_shadow(
             result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
         return result
 
+    if auto_non_product_recheck and not downstream_custom_ai:
+        result.status = "partial"
+        result.error = "auto_non_product_recheck_downstream_model_unavailable"
+        raw_bundle["error"] = result.error
+        if not dry_run:
+            await upsert_product_profile(d1, tool_id, profile)
+            result.run_id = await insert_classification_run(
+                d1,
+                tool_id=tool_id,
+                taxonomy_version=catalog.taxonomy_version,
+                run_status=result.status,
+                provider=provider,
+                model_name=(model_chain[0] if model_chain else ""),
+                raw_output=raw_bundle,
+                error=result.error,
+            )
+            result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
+        result.raw = raw_bundle
+        return result
+
     roots = catalog.primary_roots()
     try:
         _, l1_raw = await fetch_cleaned_text_structured(
@@ -1668,7 +1747,7 @@ async def classify_tool_shadow(
             stage="shadow_l1_top2",
             prompt=top2_l1_prompt(roots, catalog, profile),
             json_schema=top2_l1_schema(),
-            custom_ai=custom_ai,
+            custom_ai=downstream_custom_ai,
         )
     except Exception as error:
         result.error = f"l1_top2_failed: {str(error)[:300]}"
@@ -1733,7 +1812,7 @@ async def classify_tool_shadow(
                     profile,
                 ),
                 json_schema=leaf_adjudication_schema(),
-                custom_ai=custom_ai,
+                custom_ai=downstream_custom_ai,
             )
             leaf_decision = parse_leaf_decision(
                 leaf_raw if isinstance(leaf_raw, dict) else {},
@@ -1778,7 +1857,7 @@ async def classify_tool_shadow(
                     + capabilities_prompt(capability_chunk, catalog, profile)
                 ),
                 json_schema=capabilities_schema(),
-                custom_ai=custom_ai,
+                custom_ai=downstream_custom_ai,
                 allow_empty_required_arrays=True,
                 empty_object_means_empty_required_arrays=True,
             )
@@ -1805,7 +1884,7 @@ async def classify_tool_shadow(
                         + capabilities_prompt(retry_terms, catalog, profile)
                     ),
                     json_schema=capabilities_schema(),
-                    custom_ai=custom_ai,
+                    custom_ai=downstream_custom_ai,
                     allow_empty_required_arrays=True,
                     empty_object_means_empty_required_arrays=True,
                 )
@@ -1945,6 +2024,7 @@ async def run_shadow_taxonomy(
     dry_run: bool = False,
     tool_ids: list[int] | None = None,
     allow_unresolved_entity: bool = False,
+    include_auto_non_product_recheck: bool = False,
     after_tool_id: int = 0,
     include_capabilities: bool = True,
     concurrency: int = 1,
@@ -1979,6 +2059,12 @@ async def run_shadow_taxonomy(
         "reclassification_succeeded": 0,
         "reclassification_needs_manual": 0,
         "reclassification_failed": 0,
+        "auto_non_product_recheck_selected": 0,
+        "auto_non_product_recheck_succeeded": 0,
+        "auto_non_product_recheck_partial": 0,
+        "auto_non_product_recheck_failed": 0,
+        "auto_non_product_recheck_skipped": 0,
+        "auto_non_product_recheck_deferred": 0,
     }
 
     async with D1Client(config) as d1:
@@ -2038,6 +2124,9 @@ async def run_shadow_taxonomy(
             tool_ids=tool_ids,
             after_tool_id=after_tool_id,
             allow_unresolved_entity=allow_unresolved_entity or bool(tool_ids),
+            include_auto_non_product_recheck=(
+                include_auto_non_product_recheck and tool_ids is None
+            ),
             skip_current_prompt=not bool(tool_ids),
             # A provider/model change starts a fresh bounded retry budget while
             # preserving old failed runs as immutable audit history.
@@ -2052,11 +2141,19 @@ async def run_shadow_taxonomy(
         rows = rows[:batch_limit]
         counts["selected"] = len(rows)
         counts["reclassification_selected"] = len(queued_rows)
+        counts["auto_non_product_recheck_selected"] = sum(
+            1
+            for row in rows
+            if str(row.get("selection_reason") or "") == "auto_non_product_recheck"
+        )
         batch_logger = log_info if rows else log_debug
         batch_logger(
             "shadow_taxonomy.start",
             selected=len(rows),
             reclassification_selected=len(queued_rows),
+            auto_non_product_recheck_selected=counts[
+                "auto_non_product_recheck_selected"
+            ],
             dry_run=dry_run,
             taxonomy_version=catalog.taxonomy_version,
             prompt_version=SHADOW_PROMPT_VERSION,
@@ -2073,8 +2170,14 @@ async def run_shadow_taxonomy(
 
         async def process_row(row: dict[str, Any]) -> None:
             async with semaphore:
+                selection_reason = str(row.get("selection_reason") or "standard")
+                is_auto_non_product_recheck = (
+                    selection_reason == "auto_non_product_recheck"
+                )
                 if provider_blocked.is_set():
                     counts["deferred"] += 1
+                    if is_auto_non_product_recheck:
+                        counts["auto_non_product_recheck_deferred"] += 1
                     return
                 tool_id = int(row.get("tool_id") or 0)
                 reclassification_request_id = int(
@@ -2099,8 +2202,11 @@ async def run_shadow_taxonomy(
                     and reclassification_request_id <= 0
                     and entity_kind != "independent_product"
                     and not allow_unresolved_entity
+                    and not is_auto_non_product_recheck
                 ):
                     counts["skipped"] += 1
+                    if is_auto_non_product_recheck:
+                        counts["auto_non_product_recheck_skipped"] += 1
                     return
 
                 task = AssetTask(
@@ -2129,6 +2235,8 @@ async def run_shadow_taxonomy(
                     )
                 except Exception as error:
                     counts["failed"] += 1
+                    if is_auto_non_product_recheck:
+                        counts["auto_non_product_recheck_failed"] += 1
                     if reclassification_request_id > 0 and reclassification_lease_token:
                         try:
                             from classification_anomalies import fail_reclassification_request
@@ -2159,12 +2267,20 @@ async def run_shadow_taxonomy(
 
                 if item.status == "succeeded":
                     counts["succeeded"] += 1
+                    if is_auto_non_product_recheck:
+                        counts["auto_non_product_recheck_succeeded"] += 1
                 elif item.status == "partial":
                     counts["partial"] += 1
+                    if is_auto_non_product_recheck:
+                        counts["auto_non_product_recheck_partial"] += 1
                 elif item.status == "skipped":
                     counts["skipped"] += 1
+                    if is_auto_non_product_recheck:
+                        counts["auto_non_product_recheck_skipped"] += 1
                 else:
                     counts["failed"] += 1
+                    if is_auto_non_product_recheck:
+                        counts["auto_non_product_recheck_failed"] += 1
                 if item.error and PROVIDER_BLOCKED_RE.search(item.error):
                     counts["provider_blocked"] = 1
                     provider_blocked.set()
@@ -2216,6 +2332,7 @@ async def run_shadow_taxonomy(
                     capabilities=",".join(item.capability_slugs),
                     run_id=item.run_id,
                     reclassification_request_id=reclassification_request_id or None,
+                    selection_reason=selection_reason,
                     error=(item.error or "")[:200],
                     dry_run=dry_run,
                 )
