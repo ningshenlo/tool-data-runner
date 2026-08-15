@@ -574,6 +574,7 @@ def build_rollback_plan(
                         "before_state": {
                             "profile_version": tool.get("profile_version"),
                             "extracted_at": tool.get("profile_extracted_at"),
+                            "updated_at": tool.get("profile_updated_at"),
                             "profile_hash": _stable_hash(
                                 _json_object(tool.get("profile_json"))
                             ),

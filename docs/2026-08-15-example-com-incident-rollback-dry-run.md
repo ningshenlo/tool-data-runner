@@ -62,3 +62,57 @@ as blockers and must be resolved before applying a matching plan.
 Any future apply command must reload the same current-state fields and require an
 exact `rollback_plan_hash` match. It should execute no more than 50 tools per
 batch and verify the hard invariants after each batch.
+
+## Production apply result
+
+Applied on 2026-08-15 as incident `INC-2026-08-EXAMPLE-COM` after D1 migration
+`0065_taxonomy_incident_rollback_audit.sql` created the immutable incident,
+member, invalidation and batch ledgers.
+
+- Frozen source candidates: **1,371**
+- Confirmed incident members: **1,369**
+- Excluded as real page evidence: Clone My Voice (#3551) and Macaron/MidReal
+  (#3782)
+- Locked rollback plan hash:
+  `db26bed84ed44426daa83731b232a71726524f15f6ca4ef999b91e64509a3dba`
+- Restored from a previous clean automatic decision: **7**
+- Reset from polluted `non_product` to `unresolved`: **1,209**
+- Already repaired by a later clean run: **141**
+- No current entity effect / audit-only: **12** (two still required polluted
+  profile invalidation)
+- Invalidated historical run effects: **1,369**
+- Entity current-state effects: **1,216**
+- Polluted materialized profiles removed after full audit copy: **1,218**
+- Preserved legacy mappings: **1,366** tools
+- D1 atomic batches: **55**, covering **1,369** members, failed batches: **0**
+- Paid model calls and reclassification requests created by this apply: **0**
+
+Final production verification returned zero entity mismatches, zero remaining
+materialized polluted profiles, zero missing historical runs, zero invalid
+profile audit documents and zero active reclassification requests. The incident
+closed at `2026-08-15T05:40:24.452Z`.
+
+`taxonomy_incident_apply.py` is resumable. Before the first write it requires a
+fresh whole-plan hash match. Once frozen, a resume verifies the incident and
+every member's plan-item hash instead, because successfully applied canary rows
+are expected to change the live projection. Every pending member also guards
+against current-state drift, active reprocess requests, manual entity decisions
+and classification runs created after the incident freeze. The immutable
+`classification_runs` rows are never updated or deleted.
+
+## D1 recovery coordinates
+
+- Immediately before migration/apply:
+  `0000400c-00039f49-000050c8-8a222ff88b52a5d96755d7be113d7377`
+- Immediately after verified completion:
+  `0000400c-0003b462-000050c8-a501ef1fd250a8f8c33de558f55cfcb4`
+
+Time Travel restore is an emergency database-wide action, not a normal rollback
+step. If it is ever required, first re-check the bookmark and production state;
+the Wrangler form is:
+
+```powershell
+npx wrangler d1 time-travel restore ainav `
+  --config wrangler.toml `
+  --bookmark <approved-bookmark>
+```
