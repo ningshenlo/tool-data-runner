@@ -763,7 +763,7 @@ def load_config(require_brightdata: bool = True) -> Config:
         pricing_timeout_seconds=read_int_env("RUNNER_PRICING_TIMEOUT_SECONDS", 20),
         taxonomy_auto_enabled=read_bool_env("TAXONOMY_AUTO_ENABLED", True),
         taxonomy_recheck_auto_non_product=read_bool_env(
-            "TAXONOMY_RECHECK_AUTO_NON_PRODUCT", True
+            "TAXONOMY_RECHECK_AUTO_NON_PRODUCT", False
         ),
         taxonomy_limit=max(1, read_int_env("RUNNER_TAXONOMY_LIMIT", 50)),
         taxonomy_interval_seconds=max(
