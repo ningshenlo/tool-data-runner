@@ -113,6 +113,7 @@ def load_frozen_cohort(path: Path) -> tuple[dict[str, Any], list[IncidentMember]
             records_by_tool[tool_id] = record
 
     members: list[IncidentMember] = []
+    excluded_non_incident: list[dict[str, Any]] = []
     seen: set[int] = set()
     for row in entity_rows:
         if not isinstance(row, dict):
@@ -122,12 +123,28 @@ def load_frozen_cohort(path: Path) -> tuple[dict[str, Any], list[IncidentMember]
             raise RuntimeError(f"invalid or duplicate incident tool_id: {tool_id}")
         seen.add(tool_id)
         record = records_by_tool.get(tool_id) or {}
-        run_id = int(record.get("latest_run_id") or 0) or None
         matches = record.get("matches") if isinstance(record.get("matches"), list) else []
+        neutral_matches = [
+            match
+            for match in matches
+            if isinstance(match, dict)
+            and str(match.get("provider") or "") == "neutral_transport"
+        ]
+        if not neutral_matches:
+            excluded_non_incident.append(
+                {
+                    "tool_id": tool_id,
+                    "tool_name": str(row.get("tool_name") or ""),
+                    "canonical_slug": str(row.get("canonical_slug") or ""),
+                    "reason": "no_neutral_transport_evidence",
+                }
+            )
+            continue
+        run_id = int(record.get("latest_run_id") or 0) or None
         reasons = sorted(
             {
                 f"{match.get('provider')}:{match.get('code')}"
-                for match in matches
+                for match in neutral_matches
                 if isinstance(match, dict) and (match.get("provider") or match.get("code"))
             }
         )
@@ -142,17 +159,20 @@ def load_frozen_cohort(path: Path) -> tuple[dict[str, Any], list[IncidentMember]
             )
         )
 
-    expected = int((payload.get("summary") or {}).get("cohort_total") or 0)
-    if expected and len(members) != expected:
+    source_total = int((payload.get("summary") or {}).get("cohort_total") or 0)
+    if source_total and len(seen) != source_total:
         raise RuntimeError(
-            f"incident manifest cohort mismatch: summary={expected}, members={len(members)}"
+            f"source manifest cohort mismatch: summary={source_total}, rows={len(seen)}"
         )
     members.sort(key=lambda member: member.tool_id)
     metadata = {
         "source_path": str(path.resolve()),
         "captured_at": str(payload.get("generated_at") or ""),
         "prompt_version": str(payload.get("prompt_version") or ""),
+        "source_cohort_total": len(seen),
         "cohort_total": len(members),
+        "excluded_non_incident_count": len(excluded_non_incident),
+        "excluded_non_incident": excluded_non_incident,
         "member_fingerprint": _stable_hash(
             [
                 [member.tool_id, member.incident_run_id, member.matched_reason]
@@ -738,6 +758,7 @@ def render_markdown(report: dict[str, Any]) -> str:
             f"Generated: `{report['generated_at']}`",
             f"Mode: `{report['mode']}`",
             f"Frozen cohort fingerprint: `{report['manifest']['member_fingerprint']}`",
+            f"Source candidate set: **{report['manifest']['source_cohort_total']}**; confirmed incident members: **{report['manifest']['cohort_total']}**; excluded non-incident records: **{report['manifest']['excluded_non_incident_count']}**",
             f"Rollback plan hash: `{report['rollback_plan_hash']}`",
             f"Apply ready: **{str(report['apply_ready']).lower()}**",
             "",
@@ -775,6 +796,15 @@ async def run(args: argparse.Namespace) -> tuple[Path, Path, dict[str, Any]]:
         raise RuntimeError(
             f"cohort safety check failed: expected {args.expected_count}, got {len(members)}"
         )
+    if (
+        args.expected_source_count
+        and int(manifest.get("source_cohort_total") or 0) != args.expected_source_count
+    ):
+        raise RuntimeError(
+            "source cohort safety check failed: "
+            f"expected {args.expected_source_count}, "
+            f"got {manifest.get('source_cohort_total')}"
+        )
     if args.expected_prompt and manifest["prompt_version"] != args.expected_prompt:
         raise RuntimeError(
             "incident prompt mismatch: "
@@ -809,7 +839,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--incident-id", default=DEFAULT_INCIDENT_ID)
-    parser.add_argument("--expected-count", type=int, default=1371)
+    parser.add_argument("--expected-count", type=int, default=1369)
+    parser.add_argument("--expected-source-count", type=int, default=1371)
     parser.add_argument("--expected-prompt", default=DEFAULT_INCIDENT_PROMPT)
     parser.add_argument("--chunk-size", type=int, default=40)
     parser.add_argument("--output-dir", default="logs")

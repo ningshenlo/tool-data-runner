@@ -36,7 +36,7 @@ def run_row(
 
 
 class IncidentManifestTests(unittest.TestCase):
-    def test_frozen_manifest_keeps_repaired_members_and_captured_run(self):
+    def test_frozen_manifest_excludes_records_without_neutral_transport_evidence(self):
         payload = {
             "generated_at": "2026-08-14T09:13:04Z",
             "prompt_version": "v2",
@@ -57,9 +57,34 @@ class IncidentManifestTests(unittest.TestCase):
             path = Path(directory) / "manifest.json"
             path.write_text(json.dumps(payload), encoding="utf-8")
             metadata, members = load_frozen_cohort(path)
-        self.assertEqual(metadata["cohort_total"], 2)
+        self.assertEqual(metadata["source_cohort_total"], 2)
+        self.assertEqual(metadata["cohort_total"], 1)
+        self.assertEqual(metadata["excluded_non_incident_count"], 1)
         self.assertEqual(members[0].incident_run_id, 101)
-        self.assertEqual(members[1].provenance_tier, "missing_run_pointer")
+
+    def test_confirmed_member_without_captured_run_pointer_stays_ambiguous(self):
+        payload = {
+            "generated_at": "2026-08-14T09:13:04Z",
+            "prompt_version": "v2",
+            "summary": {"cohort_total": 1},
+            "entity_decisions": [
+                {"tool_id": 1, "tool_name": "A", "canonical_slug": "a"},
+            ],
+            "records": [
+                {
+                    "tool_id": 1,
+                    "matches": [
+                        {"provider": "neutral_transport", "code": "example_domain"}
+                    ],
+                }
+            ],
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "manifest.json"
+            path.write_text(json.dumps(payload), encoding="utf-8")
+            _, members = load_frozen_cohort(path)
+        self.assertEqual(len(members), 1)
+        self.assertEqual(members[0].provenance_tier, "missing_run_pointer")
 
 
 class RuntimeFreezeContractTests(unittest.TestCase):

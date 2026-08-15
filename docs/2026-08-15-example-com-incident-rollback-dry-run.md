@@ -3,10 +3,14 @@
 ## Purpose
 
 `taxonomy_incident_rollback.py` creates a read-only rollback plan for the frozen
-1,371-tool `example.com` classification incident. It does not write D1, enqueue
+1,369-tool confirmed `example.com` classification incident. It does not write D1, enqueue
 reclassification, fetch websites, or call a model.
 
-The frozen cohort comes from the original 2026-08-14 anomaly dry-run JSON. This
+The frozen cohort comes from the original 2026-08-14 anomaly dry-run JSON. That
+source candidate set contained 1,371 `non_product` records, but only 1,369 had
+confirmed `neutral_transport` evidence. Clone My Voice (#3551) and Macaron
+(#3782) had real blog/sunset-page evidence and are excluded from this incident;
+they require separate entity/page-role review. This
 is intentional: a live `WHERE entity_kind = 'non_product'` query would drop tools
 already repaired by later clean V4 runs and would make the incident population
 change over time.
@@ -16,7 +20,8 @@ change over time.
 ```powershell
 python taxonomy_incident_rollback.py `
   --manifest logs/non-product-classification-dry-run-20260814T091304Z.json `
-  --expected-count 1371
+  --expected-count 1369 `
+  --expected-source-count 1371
 ```
 
 The command writes a JSON audit artifact and a compact Markdown summary under

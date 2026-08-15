@@ -17,11 +17,11 @@
 
 这套设计最初是准确率优先：先选 L1，再只在对应子树中选叶子，避免模型跨父级乱选。但在全量批处理中，它造成了调用次数增加、重复输入和额外 token 消耗。下一阶段应把实体、画像、L1、L2 和原始能力合并为一次结构化输出，并由程序执行严格校验；只有少量能力歧义再触发第二次调用。
 
-### 1.1 关于 1,371 条 `non_product` 的重要背景修订
+### 1.1 关于 1,371 条候选记录的重要背景修订
 
-这 1,371 条不是正常业务数据中自然形成的一批“疑似非产品”，也不能直接用来推断实体 schema 把大量真实产品挡掉。它们属于一个根因已经确认的事故批次：分类请求使用的中性传输页 `example.com` 被错误当成产品证据，导致真实产品被批量污染为 `non_product`。
+原始选择集合有 1,371 条，但其中 1,369 条存在确定的 `neutral_transport/example.com` 污染证据；另外两条没有该签名。Clone My Voice（#3551）实际依据官网博客页被判为非产品，Macaron（#3782）实际依据 MidReal 停服公告被判为非产品。后两条可能仍有 page role、canonical 或 successor 关系问题，但不属于 `example.com` 事故，不能借事故 rollback 自动修改。
 
-因此该批次的第一处理动作不是付费重算，而是按 incident cohort 做确定性回滚：保留旧运行和输入页面审计、标记其结论已被事故失效、撤销由污染运行写入的自动 `non_product` 断言，并恢复 prior manual/verified 状态；没有可信 prior 状态时回到 `unresolved`。已有 legacy 主分类继续作为业务可用的确定性映射，只将新证据状态标成 `needs_revalidation`。只有高流量、没有任何有效主分类、高风险异常、管理员指定或官网证据实质变化的记录才立即重取证据并调用模型。
+因此 1,369 条确认事故记录的第一处理动作不是付费重算，而是按 incident cohort 做确定性回滚：保留旧运行和输入页面审计、标记其结论已被事故失效、撤销由污染运行写入的自动 `non_product` 断言，并恢复 prior manual/verified 状态；没有可信 prior 状态时回到 `unresolved`。已有 legacy 主分类继续作为业务可用的确定性映射，只将新证据状态标成 `needs_revalidation`。只有高流量、没有任何有效主分类、高风险异常、管理员指定或官网证据实质变化的记录才立即重取证据并调用模型。
 
 这里不能物理删除 `classification_run`，也不能只处理 taxonomy assignment：不少错误记录在实体门禁后即结束，污染主体实际是 `tools.entity_kind=non_product`，并没有该次运行产生的 leaf assignment。正确实现应以 incident/run invalidation 记录保留不可变审计，同时只撤销该运行对当前派生状态的影响。
 
@@ -232,7 +232,7 @@ Shadow 流程不应修改 legacy 的 `tools.primary_category_id` 和 `tool_categ
 | V4 产生的新有效主分类 | 8 | 与当前 succeeded 数一致 |
 | V4 中 Workers AI 参与次数 | 0 | 已完全排除 |
 | 历史上曾让 Workers AI 参与事故分类的工具 | 59 | 已纳入新版本重跑条件 |
-| 当前事故选择集合 | 1,371 | 动态集合，实体被修正后会变化 |
+| 原始事故候选集合 | 1,371 | 其中 1,369 条确认 neutral transport 污染，2 条排除并转人工审核 |
 | 当前尚无 V4 终态的事故记录 | 1,347 | failed 不算终态，仍受最多 3 次预算约束 |
 | 管理员重分类队列 | 0 | 查询时 queued/running/needs_manual/succeeded 均为 0 |
 
@@ -356,7 +356,7 @@ Workers AI 已从分类模型链和默认 fallback 中移除。即使环境变�
 
 ### P0-2：把 `example.com` 事故作为独立 cohort 收口
 
-先暂停该 cohort 的默认付费重分类，再执行可重复、可 dry-run 的批量回滚：
+先暂停 1,369 条确认事故 cohort 的默认付费重分类，再执行可重复、可 dry-run 的批量回滚：
 
 - 通过污染输入、事故标记和 run provenance 锁定 cohort，不能仅按当前 `entity_kind` 反查；
 - 旧 run 永久保留，在独立 invalidation 记录中写入 incident ID、原因、操作者和时间；
