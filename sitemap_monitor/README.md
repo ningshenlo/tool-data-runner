@@ -19,7 +19,10 @@
 - Comparability Gate 输出 `comparable`、`partial`、`resource_set_changed`、`possible_migration`、`fetch_incomplete` 或 `baseline_invalid`；
 - 同时保存 raw/normalized resource set hash，识别常见动态 sitemap 分片 family；
 - 抓取状态与 semantic baseline 分离；不完整扫描会留档，但不能替换最后一个有效语义基线；
-- 成功后设置正常检查周期，失败采用有界指数退避，耗尽后进入 `dead`/DLQ 状态并安排未来重试；
+- 成功站点默认每 6 小时检查；只有 DNS、超时、429、5xx 等瞬态故障在同一 job 内指数退避重试；
+- 404、非法 XML 等确定性失败一次即进入 `dead`，站点按连续失败轮次采用 24 小时、72 小时、7 天冷却；
+- 每 6 小时归档被 schedule version 替代的旧任务，并分批清理 7 天前的失败/unchanged run、30 天前的非信号扫描与无引用终态 job；
+- 进程内每小时才重新确认一次站点配置，D1 upsert 在配置无变化时不写入，避免 30 秒轮询造成写放大；
 - 任务执行期间续租，旧 Worker 的迟到完成不能推进站点 schedule；
 - 本地 SQLite + 文件对象存储，schema 和对象 key 分别兼容 D1/R2 adapter；
 - 可选 Cloudflare backend：D1 只保存 metadata/run，R2 保存 state/diff；默认仍为 local。
@@ -39,12 +42,17 @@ Polling，这些属于后续阶段。
 python -m sitemap_monitor --site https://example.com --once
 python -m sitemap_monitor --site https://example.com --sitemap https://example.com/custom.xml --json
 python -m sitemap_monitor --site https://example.com --loop \
-  --interval-seconds 30 --check-interval-seconds 3600
+  --interval-seconds 30 --check-interval-seconds 21600
 ```
 
 `--once` 现在表示“运行一个 scheduler tick”。新站点会立即建立 baseline；尚未到
 `next_check_at` 的已有站点不会被重复扫描。`--interval-seconds` 是 scheduler poll
 频率，`--check-interval-seconds` 才是成功后的站点检查周期。
+
+维护参数默认值为：每 6 小时维护一次、失败与 unchanged run 保留 7 天、普通扫描
+和无引用终态 job 保留 30 天，每轮每类最多处理 500 条。`baseline`、`changed`、
+当前 semantic baseline，以及 `resource_set_changed` / `possible_migration` 审计扫描
+不会被这套常规清理策略删除。
 
 默认状态目录为 `.sitemap-monitor/`：
 
@@ -95,11 +103,15 @@ python -m sitemap_monitor \
 - `CLOUDFLARE_ACCOUNT_ID`
 - `CLOUDFLARE_D1_DATABASE_ID`
 - `CLOUDFLARE_API_TOKEN`
-- `CLOUDFLARE_R2_ACCESS_KEY_ID`
-- `CLOUDFLARE_R2_SECRET_ACCESS_KEY`
+- `FOR_ALL_APP_R2_ACCESS_KEY_ID`
+- `FOR_ALL_APP_R2_SECRET_ACCESS_KEY`
 - `SITEMAP_MONITOR_R2_BUCKET`（未设置时回退 `CLOUDFLARE_R2_BUCKET`）
 - `SITEMAP_MONITOR_SITES`（逗号分隔，可替代重复的 `--site`）
 - `SITEMAP_MONITOR_SITE_FILE`（每行一个站点，支持空行和 `#` 注释；首批观察默认使用固定 cohort 文件）
+- `SITEMAP_MONITOR_CHECK_INTERVAL_SECONDS`（成功站点默认 `21600`，即 6 小时）
+- `SITEMAP_MONITOR_MAINTENANCE_INTERVAL_SECONDS`（默认 `21600`）
+- `SITEMAP_MONITOR_RUN_DETAIL_RETENTION_DAYS`（默认 `7`）
+- `SITEMAP_MONITOR_SCAN_DETAIL_RETENTION_DAYS` / `SITEMAP_MONITOR_JOB_RETENTION_DAYS`（默认 `30`）
 - `SITEMAP_MONITOR_SYNTHETIC_DNS_DOH_FALLBACK`（默认 `0`；仅在本机 DNS 被可信网络代理映射为合成地址时临时设为 `1`，通过固定 Cloudflare DoH 二次验证公网 A/AAAA；生产通常保持关闭）
 
 ## Observation cohort

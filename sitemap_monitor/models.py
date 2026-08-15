@@ -157,6 +157,7 @@ class DueSite:
 @dataclass(frozen=True, slots=True)
 class SitemapJob:
     attempts: int
+    base_error_streak: int
     check_interval_sec: int
     homepage_url: str
     idempotency_key: str
@@ -167,6 +168,25 @@ class SitemapJob:
     scheduled_for: int
     site_id: str
     status: JobStatus
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceResult:
+    expired_jobs: int = 0
+    pruned_jobs: int = 0
+    pruned_runs: int = 0
+    pruned_scans: int = 0
+
+    @property
+    def changed(self) -> bool:
+        return any(
+            (
+                self.expired_jobs,
+                self.pruned_jobs,
+                self.pruned_runs,
+                self.pruned_scans,
+            )
+        )
 
 
 @dataclass(frozen=True, slots=True)

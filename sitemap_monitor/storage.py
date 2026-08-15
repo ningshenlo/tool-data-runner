@@ -17,6 +17,7 @@ from .models import (
     CheckOutcome,
     ComparabilityResult,
     DueSite,
+    MaintenanceResult,
     ResourceState,
     SitemapJob,
     SiteScanSnapshot,
@@ -179,6 +180,16 @@ class SchedulerStore(MetadataStore, Protocol):
         site_id: str,
     ) -> tuple[StoredSiteScan | None, StoredSiteScan | None]: ...
 
+    async def perform_maintenance(
+        self,
+        *,
+        job_cutoff_ms: int,
+        limit: int,
+        now_ms: int,
+        run_cutoff_ms: int,
+        scan_cutoff_ms: int,
+    ) -> MaintenanceResult: ...
+
 def _safe_object_key(key: str) -> str:
     normalized = key.replace("\\", "/").strip()
     if not normalized or normalized.startswith("/") or ".." in normalized.split("/"):
@@ -281,7 +292,7 @@ class SqliteMetadataStore:
         check_interval_sec: int | None = None,
     ) -> None:
         domain = (urlsplit(homepage_url).hostname or "").lower()
-        interval = check_interval_sec or 3_600
+        interval = check_interval_sec or 21_600
         if interval <= 0:
             raise ValueError("check_interval_sec must be positive.")
         with self.connection:
@@ -329,6 +340,12 @@ class SqliteMetadataStore:
                         ELSE dispatch_lease_expires_at
                     END,
                     updated_at = excluded.updated_at
+                WHERE sitemap_sites.homepage_url <> excluded.homepage_url
+                   OR (
+                        ? IS NOT NULL
+                        AND sitemap_sites.check_interval_sec
+                            <> excluded.check_interval_sec
+                   )
                 """,
                 (
                     site_id,
@@ -344,6 +361,7 @@ class SqliteMetadataStore:
                     check_interval_sec,
                     check_interval_sec,
                     check_interval_sec,
+                    check_interval_sec,
                 ),
             )
 
@@ -351,6 +369,7 @@ class SqliteMetadataStore:
     def _job_from_row(row: sqlite3.Row) -> SitemapJob:
         return SitemapJob(
             attempts=int(row["attempts"]),
+            base_error_streak=int(row["base_error_streak"]),
             check_interval_sec=int(row["check_interval_sec"]),
             homepage_url=str(row["homepage_url"]),
             idempotency_key=str(row["idempotency_key"]),
@@ -665,6 +684,116 @@ class SqliteMetadataStore:
         )
         return baseline, previous
 
+    async def perform_maintenance(
+        self,
+        *,
+        job_cutoff_ms: int,
+        limit: int,
+        now_ms: int,
+        run_cutoff_ms: int,
+        scan_cutoff_ms: int,
+    ) -> MaintenanceResult:
+        if limit <= 0:
+            raise ValueError("Maintenance limit must be positive.")
+        if any(
+            cutoff < 0 or cutoff > now_ms
+            for cutoff in (job_cutoff_ms, run_cutoff_ms, scan_cutoff_ms)
+        ):
+            raise ValueError("Maintenance cutoffs must be between zero and now.")
+        with self.connection:
+            expired_jobs = self.connection.execute(
+                """
+                UPDATE sitemap_jobs
+                SET status = 'dead', finished_at = ?, dead_letter_at = ?,
+                    last_error = 'superseded_schedule', lease_owner = NULL,
+                    lease_token = NULL, lease_expires_at = NULL, updated_at = ?
+                WHERE id IN (
+                    SELECT job.id
+                    FROM sitemap_jobs job
+                    JOIN sitemap_sites site ON site.id = job.site_id
+                    WHERE job.status IN ('pending', 'retry', 'running')
+                      AND (
+                        site.status <> 'active'
+                        OR site.schedule_version <> job.schedule_version
+                        OR job.scheduled_for < site.next_check_at
+                      )
+                    ORDER BY job.updated_at, job.id
+                    LIMIT ?
+                )
+                RETURNING id
+                """,
+                (now_ms, now_ms, now_ms, limit),
+            ).fetchall()
+            pruned_runs = self.connection.execute(
+                """
+                DELETE FROM sitemap_runs
+                WHERE id IN (
+                    SELECT id
+                    FROM sitemap_runs
+                    WHERE created_at < ?
+                      AND result IN ('failed', 'not_modified', 'semantic_unchanged')
+                    ORDER BY created_at, id
+                    LIMIT ?
+                )
+                RETURNING id
+                """,
+                (run_cutoff_ms, limit),
+            ).fetchall()
+            pruned_scans = self.connection.execute(
+                """
+                DELETE FROM sitemap_site_scans
+                WHERE id IN (
+                    SELECT scan.id
+                    FROM sitemap_site_scans scan
+                    WHERE scan.created_at < ?
+                      AND scan.comparability_status NOT IN (
+                        'resource_set_changed', 'possible_migration'
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM sitemap_sites site
+                        WHERE site.semantic_baseline_scan_id = scan.id
+                      )
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM sitemap_runs run
+                        WHERE run.site_scan_id = scan.id
+                          AND run.result IN ('baseline', 'changed')
+                      )
+                    ORDER BY scan.created_at, scan.id
+                    LIMIT ?
+                )
+                RETURNING id
+                """,
+                (scan_cutoff_ms, limit),
+            ).fetchall()
+            pruned_jobs = self.connection.execute(
+                """
+                DELETE FROM sitemap_jobs
+                WHERE id IN (
+                    SELECT job.id
+                    FROM sitemap_jobs job
+                    WHERE job.updated_at < ?
+                      AND job.status IN ('succeeded', 'dead')
+                      AND NOT EXISTS (
+                        SELECT 1
+                        FROM sitemap_site_scans scan
+                        WHERE scan.job_id = job.id
+                      )
+                    ORDER BY job.updated_at, job.id
+                    LIMIT ?
+                )
+                RETURNING id
+                """,
+                (job_cutoff_ms, limit),
+            ).fetchall()
+        return MaintenanceResult(
+            expired_jobs=len(expired_jobs),
+            pruned_jobs=len(pruned_jobs),
+            pruned_runs=len(pruned_runs),
+            pruned_scans=len(pruned_scans),
+        )
+
     async def finish_job_success(
         self,
         job: SitemapJob,
@@ -776,7 +905,7 @@ class SqliteMetadataStore:
                         error_streak = MAX(
                             error_streak,
                             COALESCE((
-                                SELECT base_error_streak + attempts
+                                SELECT base_error_streak + 1
                                 FROM sitemap_jobs WHERE id = ?
                             ), error_streak)
                         ),
@@ -799,19 +928,11 @@ class SqliteMetadataStore:
                     """
                     UPDATE sitemap_sites
                     SET last_attempt_at = ?,
-                        error_streak = MAX(
-                            error_streak,
-                            COALESCE((
-                                SELECT base_error_streak + attempts
-                                FROM sitemap_jobs WHERE id = ?
-                            ), error_streak)
-                        ),
                         dispatch_lease_expires_at = ?, updated_at = ?
                     WHERE id = ? AND schedule_version = ?
                     """,
                     (
                         finished_at_ms,
-                        job.job_id,
                         available_at_ms,
                         finished_at_ms,
                         job.site_id,

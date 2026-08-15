@@ -77,12 +77,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--check-interval-seconds",
         type=int,
-        default=3600,
+        default=21_600,
         help="successful per-site check cadence in seconds (minimum 60)",
     )
     parser.add_argument("--batch-size", type=int, default=25)
     parser.add_argument("--max-attempts", type=int, default=5)
     parser.add_argument("--job-lease-seconds", type=int, default=900)
+    parser.add_argument("--maintenance-interval-seconds", type=int, default=21_600)
+    parser.add_argument("--run-detail-retention-days", type=int, default=7)
+    parser.add_argument("--scan-detail-retention-days", type=int, default=30)
+    parser.add_argument("--job-retention-days", type=int, default=30)
+    parser.add_argument("--maintenance-batch-size", type=int, default=500)
     parser.add_argument("--json", action="store_true", help="emit one JSON result per site")
     args = parser.parse_args(argv)
     if args.interval_seconds < 5:
@@ -95,6 +100,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--max-attempts must be positive")
     if args.job_lease_seconds < 30:
         parser.error("--job-lease-seconds must be at least 30")
+    if args.maintenance_interval_seconds < 300:
+        parser.error("--maintenance-interval-seconds must be at least 300")
+    if min(
+        args.run_detail_retention_days,
+        args.scan_detail_retention_days,
+        args.job_retention_days,
+        args.maintenance_batch_size,
+    ) <= 0:
+        parser.error("retention days and maintenance batch size must be positive")
     return args
 
 
@@ -206,13 +220,26 @@ async def run(args: argparse.Namespace) -> None:
         lease_owner=lease_owner,
         policy=SchedulerPolicy(
             check_interval_sec=args.check_interval_seconds,
+            job_retention_sec=args.job_retention_days * 86_400,
             job_lease_sec=args.job_lease_seconds,
+            maintenance_batch_size=args.maintenance_batch_size,
+            maintenance_interval_sec=args.maintenance_interval_seconds,
             max_attempts=args.max_attempts,
+            run_detail_retention_sec=args.run_detail_retention_days * 86_400,
+            scan_detail_retention_sec=args.scan_detail_retention_days * 86_400,
         ),
     )
     try:
         while True:
             tick = await scheduler.run_once(sites)
+            if tick.maintenance.changed and not args.json:
+                print(
+                    "sitemap maintenance: "
+                    f"expired_jobs={tick.maintenance.expired_jobs} "
+                    f"pruned_jobs={tick.maintenance.pruned_jobs} "
+                    f"pruned_runs={tick.maintenance.pruned_runs} "
+                    f"pruned_scans={tick.maintenance.pruned_scans}"
+                )
             for execution in tick.executions:
                 if execution.result is not None:
                     _print_result(

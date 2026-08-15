@@ -6,7 +6,7 @@ CREATE TABLE IF NOT EXISTS sitemap_sites (
     homepage_url TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active'
         CHECK (status IN ('active', 'paused', 'blocked')),
-    check_interval_sec INTEGER NOT NULL DEFAULT 3600 CHECK (check_interval_sec > 0),
+    check_interval_sec INTEGER NOT NULL DEFAULT 21600 CHECK (check_interval_sec > 0),
     schedule_version INTEGER NOT NULL DEFAULT 1 CHECK (schedule_version > 0),
     next_check_at INTEGER NOT NULL,
     last_attempt_at INTEGER,

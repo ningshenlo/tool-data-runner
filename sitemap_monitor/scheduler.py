@@ -12,7 +12,13 @@ from .comparability import (
     build_site_scan_snapshot,
 )
 from .engine import SitemapMonitor
-from .models import ComparabilityResult, SiteScanResult, SitemapJob, SiteScanSnapshot
+from .models import (
+    ComparabilityResult,
+    MaintenanceResult,
+    SiteScanResult,
+    SitemapJob,
+    SiteScanSnapshot,
+)
 from .normalize import normalize_sitemap_url
 from .storage import SchedulerStore, site_id_for, stable_id
 
@@ -23,13 +29,21 @@ def _now_ms() -> int:
 
 @dataclass(frozen=True, slots=True)
 class SchedulerPolicy:
-    check_interval_sec: int = 3_600
+    check_interval_sec: int = 21_600
     dispatch_lease_sec: int = 300
     job_lease_sec: int = 900
     max_attempts: int = 5
     retry_base_sec: int = 60
     retry_max_sec: int = 3_600
-    failure_reschedule_max_sec: int = 21_600
+    failure_cooldown_initial_sec: int = 86_400
+    failure_cooldown_extended_sec: int = 259_200
+    failure_cooldown_max_sec: int = 604_800
+    maintenance_interval_sec: int = 21_600
+    run_detail_retention_sec: int = 604_800
+    scan_detail_retention_sec: int = 2_592_000
+    job_retention_sec: int = 2_592_000
+    maintenance_batch_size: int = 500
+    registration_refresh_sec: int = 3_600
     jitter_ratio: float = 0.10
 
     def __post_init__(self) -> None:
@@ -40,12 +54,26 @@ class SchedulerPolicy:
             self.max_attempts,
             self.retry_base_sec,
             self.retry_max_sec,
-            self.failure_reschedule_max_sec,
+            self.failure_cooldown_initial_sec,
+            self.failure_cooldown_extended_sec,
+            self.failure_cooldown_max_sec,
+            self.maintenance_interval_sec,
+            self.run_detail_retention_sec,
+            self.scan_detail_retention_sec,
+            self.job_retention_sec,
+            self.maintenance_batch_size,
+            self.registration_refresh_sec,
         )
         if any(value <= 0 for value in integer_values):
             raise ValueError("Scheduler intervals, leases, and attempts must be positive.")
         if self.retry_base_sec > self.retry_max_sec:
             raise ValueError("retry_base_sec cannot exceed retry_max_sec.")
+        if not (
+            self.failure_cooldown_initial_sec
+            <= self.failure_cooldown_extended_sec
+            <= self.failure_cooldown_max_sec
+        ):
+            raise ValueError("Failure cooldowns must be monotonically increasing.")
         if not 0 <= self.jitter_ratio <= 0.5:
             raise ValueError("jitter_ratio must be between 0 and 0.5.")
 
@@ -66,6 +94,7 @@ class SchedulerTick:
     executions: tuple[JobExecution, ...]
     jobs_created: int
     jobs_claimed: int
+    maintenance: MaintenanceResult
 
 
 class SitemapScheduler:
@@ -100,6 +129,8 @@ class SitemapScheduler:
         self.policy = policy or SchedulerPolicy()
         self.comparability_policy = comparability_policy or ComparabilityPolicy()
         self.store = store
+        self._last_maintenance_at_ms: int | None = None
+        self._registered_sites: dict[str, tuple[str, int, int]] = {}
 
     def _jittered_delay_ms(self, key: str, seconds: int) -> int:
         base_ms = seconds * 1_000
@@ -130,10 +161,13 @@ class SitemapScheduler:
         job: SitemapJob,
         finished_at_ms: int,
     ) -> int:
-        seconds = min(
-            max(self._site_interval(job), self.policy.retry_max_sec),
-            self.policy.failure_reschedule_max_sec,
-        )
+        next_error_streak = job.base_error_streak + 1
+        if next_error_streak <= 1:
+            seconds = self.policy.failure_cooldown_initial_sec
+        elif next_error_streak == 2:
+            seconds = self.policy.failure_cooldown_extended_sec
+        else:
+            seconds = self.policy.failure_cooldown_max_sec
         return finished_at_ms + self._jittered_delay_ms(
             f"dead:{job.job_id}",
             seconds,
@@ -151,14 +185,52 @@ class SitemapScheduler:
                 max_length=self.monitor.limits.max_url_length,
             )
             site_id = site_id_for(normalized)
+            previous = self._registered_sites.get(site_id)
+            if (
+                previous is not None
+                and previous[:2] == (normalized, self.policy.check_interval_sec)
+                and now_ms - previous[2]
+                    < self.policy.registration_refresh_sec * 1_000
+            ):
+                registered.append(site_id)
+                continue
             await self.store.ensure_site(
                 site_id,
                 normalized,
                 now_ms,
                 check_interval_sec=self.policy.check_interval_sec,
             )
+            self._registered_sites[site_id] = (
+                normalized,
+                self.policy.check_interval_sec,
+                now_ms,
+            )
             registered.append(site_id)
         return tuple(registered)
+
+    async def perform_maintenance(self) -> MaintenanceResult:
+        now_ms = self.clock_ms()
+        if (
+            self._last_maintenance_at_ms is not None
+            and now_ms - self._last_maintenance_at_ms
+            < self.policy.maintenance_interval_sec * 1_000
+        ):
+            return MaintenanceResult()
+        result = await self.store.perform_maintenance(
+            job_cutoff_ms=max(
+                0, now_ms - self.policy.job_retention_sec * 1_000
+            ),
+            limit=self.policy.maintenance_batch_size,
+            now_ms=now_ms,
+            run_cutoff_ms=max(
+                0, now_ms - self.policy.run_detail_retention_sec * 1_000
+            ),
+            scan_cutoff_ms=max(
+                0, now_ms - self.policy.scan_detail_retention_sec * 1_000
+            ),
+        )
+        self._last_maintenance_at_ms = now_ms
+        return result
 
     async def enqueue_due(self) -> tuple[int, int]:
         now_ms = self.clock_ms()
@@ -223,6 +295,29 @@ class SitemapScheduler:
             return "no_usable_sitemap"
         return "no_usable_sitemap:" + ",".join(codes)
 
+    @staticmethod
+    def _is_transient_error_code(code: str) -> bool:
+        if code in {"dns_error", "request_error", "timeout"}:
+            return True
+        if not code.startswith("http_"):
+            return False
+        try:
+            status = int(code.removeprefix("http_"))
+        except ValueError:
+            return False
+        return status in {408, 425, 429} or 500 <= status <= 599
+
+    @classmethod
+    def _scan_is_retryable(cls, result: SiteScanResult | None) -> bool:
+        if result is None:
+            return True
+        error_codes = {
+            outcome.error_code
+            for outcome in result.outcomes
+            if outcome.result == "failed" and outcome.error_code
+        }
+        return any(cls._is_transient_error_code(code) for code in error_codes)
+
     async def _execute(self, job: SitemapJob) -> JobExecution:
         result: SiteScanResult | None = None
         site_scan: SiteScanSnapshot | None = None
@@ -261,7 +356,10 @@ class SitemapScheduler:
                 status="succeeded" if applied else "stale",
             )
 
-        dead = job.attempts >= job.max_attempts
+        dead = (
+            job.attempts >= job.max_attempts
+            or not self._scan_is_retryable(result)
+        )
         available_at_ms = finished_at_ms + self._retry_delay_ms(job)
         applied = await self.store.finish_job_failure(
             job,
@@ -300,6 +398,7 @@ class SitemapScheduler:
 
     async def run_once(self, sites: Iterable[str]) -> SchedulerTick:
         await self.register_sites(sites)
+        maintenance = await self.perform_maintenance()
         due_sites, jobs_created = await self.enqueue_due()
         jobs_claimed, executions = await self.process_available()
         return SchedulerTick(
@@ -307,4 +406,5 @@ class SitemapScheduler:
             executions=executions,
             jobs_created=jobs_created,
             jobs_claimed=jobs_claimed,
+            maintenance=maintenance,
         )

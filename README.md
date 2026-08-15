@@ -69,7 +69,7 @@ workloads and from remote D1/R2):
 ```bash
 python -m sitemap_monitor --site https://example.com --once
 python -m sitemap_monitor --site https://example.com --loop \
-  --interval-seconds 30 --check-interval-seconds 3600
+  --interval-seconds 30 --check-interval-seconds 21600
 ```
 
 The first successful scan only creates a baseline. A later scan emits a diff only
@@ -77,6 +77,13 @@ when the normalized URL set changes. The loop polls the D1-backed due-site sched
 it does not rescan every configured site on every loop. `sitemap_jobs` provides the
 idempotency key, bounded retry/DLQ state, expiring job lease, and fenced completion.
 Local state defaults to `.sitemap-monitor/`.
+
+Production defaults to a six-hour successful-site cadence. Only transient network,
+429, and 5xx failures retry within one job; deterministic failures such as 404 and
+unsafe XML enter the dead-letter ledger after one attempt and schedule the site on a
+24-hour, 72-hour, then seven-day cooldown. Six-hour maintenance expires superseded
+jobs and prunes bounded batches of low-value run/scan history while retaining
+baselines, changed runs, migration/resource-set audits, and current semantic state.
 
 Production is split into four isolated Dokploy services that share one Python image:
 

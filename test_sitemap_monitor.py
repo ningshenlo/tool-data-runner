@@ -718,6 +718,27 @@ class SchedulerStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(job)
         return due[0], job
 
+    async def test_unchanged_site_registration_does_not_write(self) -> None:
+        changes_before = self.store.connection.total_changes
+        updated_before = self.store.connection.execute(
+            "SELECT updated_at FROM sitemap_sites WHERE id = ?",
+            (self.site_id,),
+        ).fetchone()[0]
+
+        await self.store.ensure_site(
+            self.site_id,
+            self.homepage,
+            99_999,
+            check_interval_sec=3_600,
+        )
+
+        updated_after = self.store.connection.execute(
+            "SELECT updated_at FROM sitemap_sites WHERE id = ?",
+            (self.site_id,),
+        ).fetchone()[0]
+        self.assertEqual(self.store.connection.total_changes, changes_before)
+        self.assertEqual(updated_after, updated_before)
+
     async def test_due_claim_job_idempotency_and_fenced_completion(self) -> None:
         due, first_job = await self._new_job()
         duplicate = await self.store.ensure_job(due, max_attempts=5, now_ms=1_001)
@@ -847,7 +868,7 @@ class SchedulerStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job["status"], "dead")
         self.assertEqual(job["dead_letter_at"], 2_100)
         self.assertEqual(site["next_check_at"], 10_000)
-        self.assertEqual(site["error_streak"], 2)
+        self.assertEqual(site["error_streak"], 1)
 
     async def test_schedule_version_fences_completion_after_interval_change(self) -> None:
         due, original = await self._new_job()
@@ -900,6 +921,92 @@ class SchedulerStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotEqual(replacement.job_id, original.job_id)
 
+    async def test_maintenance_expires_superseded_jobs(self) -> None:
+        _, original = await self._new_job()
+        await self.store.ensure_site(
+            self.site_id,
+            self.homepage,
+            1_500,
+            check_interval_sec=7_200,
+        )
+
+        result = await self.store.perform_maintenance(
+            job_cutoff_ms=0,
+            limit=100,
+            now_ms=2_000,
+            run_cutoff_ms=0,
+            scan_cutoff_ms=0,
+        )
+
+        job = self.store.connection.execute(
+            "SELECT status, last_error FROM sitemap_jobs WHERE id = ?",
+            (original.job_id,),
+        ).fetchone()
+        self.assertEqual(result.expired_jobs, 1)
+        self.assertEqual(job["status"], "dead")
+        self.assertEqual(job["last_error"], "superseded_schedule")
+
+    async def test_maintenance_prunes_low_value_runs_and_unreferenced_jobs(self) -> None:
+        _, _ = await self._new_job(max_attempts=1)
+        claimed = (
+            await self.store.claim_jobs(
+                lease_duration_ms=1_000,
+                lease_owner="worker-a",
+                limit=1,
+                now_ms=1_010,
+            )
+        )[0]
+        await self.store.finish_job_failure(
+            claimed,
+            available_at_ms=2_000,
+            dead=True,
+            error="http_404",
+            finished_at_ms=1_100,
+            next_check_at_ms=86_401_100,
+        )
+        with self.store.connection:
+            self.store.connection.execute(
+                "UPDATE sitemap_jobs SET updated_at = 100 WHERE id = ?",
+                (claimed.job_id,),
+            )
+            self.store.connection.execute(
+                """
+                INSERT INTO sitemap_resources (
+                    id, site_id, url, type, created_at, updated_at
+                ) VALUES ('resource_old', ?, 'https://example.com/sitemap.xml',
+                          'unknown', 100, 100)
+                """,
+                (self.site_id,),
+            )
+            for run_id, result in (("run_failed", "failed"), ("run_changed", "changed")):
+                self.store.connection.execute(
+                    """
+                    INSERT INTO sitemap_runs (
+                        id, run_key, site_id, resource_id, started_at,
+                        finished_at, result, created_at
+                    ) VALUES (?, ?, ?, 'resource_old', 100, 100, ?, 100)
+                    """,
+                    (run_id, run_id, self.site_id, result),
+                )
+
+        result = await self.store.perform_maintenance(
+            job_cutoff_ms=500,
+            limit=100,
+            now_ms=1_000,
+            run_cutoff_ms=500,
+            scan_cutoff_ms=500,
+        )
+
+        remaining_runs = {
+            row[0]
+            for row in self.store.connection.execute(
+                "SELECT id FROM sitemap_runs"
+            ).fetchall()
+        }
+        self.assertEqual(result.pruned_jobs, 1)
+        self.assertEqual(result.pruned_runs, 1)
+        self.assertEqual(remaining_runs, {"run_changed"})
+
     async def test_expired_final_attempt_is_recoverable_instead_of_stuck(self) -> None:
         await self._new_job(max_attempts=1)
         abandoned = (
@@ -931,6 +1038,68 @@ class SchedulerStoreTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SchedulerIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_deterministic_failure_uses_one_attempt_and_site_cooldown_tiers(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            store = SqliteMetadataStore(root / "scheduler.sqlite3")
+            homepage = "https://example.com/"
+            sitemap = "https://example.com/sitemap.xml"
+            robots = "https://example.com/robots.txt"
+            fetcher = FakeFetcher(
+                {
+                    robots: [response(robots, None, 404) for _ in range(3)],
+                    sitemap: [response(sitemap, None, 404) for _ in range(3)],
+                }
+            )
+            monitor = SitemapMonitor(
+                store,
+                FileObjectStore(root / "objects"),
+                fetcher=fetcher,
+            )
+            clock = [1_000]
+            scheduler = SitemapScheduler(
+                store,
+                monitor,
+                explicit_sitemaps=[sitemap],
+                lease_owner="scheduler-test",
+                clock_ms=lambda: clock[0],
+                policy=SchedulerPolicy(
+                    check_interval_sec=21_600,
+                    job_lease_sec=30,
+                    jitter_ratio=0,
+                ),
+            )
+            try:
+                expected_delays = (86_400_000, 259_200_000, 604_800_000)
+                for expected_streak, expected_delay in enumerate(
+                    expected_delays,
+                    start=1,
+                ):
+                    tick = await scheduler.run_once([homepage])
+                    self.assertEqual(tick.executions[0].status, "dead")
+                    job = store.connection.execute(
+                        """
+                        SELECT attempts
+                        FROM sitemap_jobs
+                        ORDER BY created_at DESC, id DESC
+                        LIMIT 1
+                        """
+                    ).fetchone()
+                    site = store.connection.execute(
+                        """
+                        SELECT error_streak, next_check_at
+                        FROM sitemap_sites WHERE id = ?
+                        """,
+                        (site_id_for(homepage),),
+                    ).fetchone()
+                    self.assertEqual(job["attempts"], 1)
+                    self.assertEqual(site["error_streak"], expected_streak)
+                    self.assertEqual(site["next_check_at"], clock[0] + expected_delay)
+                    clock[0] = site["next_check_at"]
+            finally:
+                await monitor.close()
+                store.close()
+
     async def test_success_sets_next_due_and_idle_tick_does_not_rescan(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -1114,6 +1283,10 @@ class SchedulerIntegrationTests(unittest.IsolatedAsyncioTestCase):
             try:
                 tick = await scheduler.run_once(["https://example.com/"])
                 self.assertEqual(tick.executions[0].status, "retry")
+                site = store.connection.execute(
+                    "SELECT error_streak FROM sitemap_sites LIMIT 1"
+                ).fetchone()
+                self.assertEqual(site["error_streak"], 0)
                 self.assertEqual(
                     tick.executions[0].comparability.status,
                     "fetch_incomplete",
@@ -1138,6 +1311,8 @@ class DeploymentBoundaryTests(unittest.TestCase):
     def test_cli_accepts_repeatable_site_files(self) -> None:
         args = parse_args(["--site-file", "one.txt", "--site-file", "two.txt"])
         self.assertEqual(args.site_file, ["one.txt", "two.txt"])
+        self.assertEqual(args.check_interval_seconds, 21_600)
+        self.assertEqual(args.run_detail_retention_days, 7)
 
     def test_formal_migration_builds_only_phase_one_metadata_tables(self) -> None:
         migration = (
@@ -1200,6 +1375,9 @@ class DeploymentBoundaryTests(unittest.TestCase):
         )[0]
         self.assertIn("replicas: ${SITEMAP_MONITOR_REPLICAS:-0}", service)
         self.assertIn("- --require-enabled", service)
+        self.assertIn("${SITEMAP_MONITOR_CHECK_INTERVAL_SECONDS:-21600}", service)
+        self.assertIn("${SITEMAP_MONITOR_RUN_DETAIL_RETENTION_DAYS:-7}", service)
+        self.assertIn("${SITEMAP_MONITOR_MAINTENANCE_BATCH_SIZE:-500}", service)
         self.assertIn("SITEMAP_MONITOR_ENABLED: ${SITEMAP_MONITOR_ENABLED:-0}", service)
         self.assertIn(
             "FOR_ALL_APP_R2_ACCESS_KEY_ID: ${FOR_ALL_APP_R2_ACCESS_KEY_ID}",
@@ -1304,7 +1482,50 @@ class CloudflareMetadataAdapterTests(unittest.IsolatedAsyncioTestCase):
             (site_id,),
         ).fetchone()[0]
         client.connection.close()
-        self.assertEqual(streak, 1)
+        self.assertEqual(streak, 0)
+
+    async def test_d1_maintenance_expires_superseded_jobs(self) -> None:
+        client = SqliteD1ClientDouble()
+        store = CloudflareD1MetadataStore(client)  # type: ignore[arg-type]
+        site_id = site_id_for("https://example.com/")
+        await store.ensure_site(
+            site_id,
+            "https://example.com/",
+            1_000,
+            check_interval_sec=3_600,
+        )
+        due = (
+            await store.claim_due_sites(
+                lease_duration_ms=1_000,
+                lease_owner="scheduler-a",
+                limit=1,
+                now_ms=1_000,
+            )
+        )[0]
+        job = await store.ensure_job(due, max_attempts=3, now_ms=1_000)
+        await store.ensure_site(
+            site_id,
+            "https://example.com/",
+            1_500,
+            check_interval_sec=7_200,
+        )
+
+        result = await store.perform_maintenance(
+            job_cutoff_ms=0,
+            limit=100,
+            now_ms=2_000,
+            run_cutoff_ms=0,
+            scan_cutoff_ms=0,
+        )
+
+        stored = client.connection.execute(
+            "SELECT status, last_error FROM sitemap_jobs WHERE id = ?",
+            (job.job_id,),
+        ).fetchone()
+        client.connection.close()
+        self.assertEqual(result.expired_jobs, 1)
+        self.assertEqual(stored["status"], "dead")
+        self.assertEqual(stored["last_error"], "superseded_schedule")
 
     async def test_d1_scheduler_adapter_matches_atomic_lease_contract(self) -> None:
         client = SqliteD1ClientDouble()

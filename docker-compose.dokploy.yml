@@ -130,13 +130,23 @@ services:
       - --interval-seconds
       - ${SITEMAP_MONITOR_POLL_SECONDS:-30}
       - --check-interval-seconds
-      - ${SITEMAP_MONITOR_CHECK_INTERVAL_SECONDS:-3600}
+      - ${SITEMAP_MONITOR_CHECK_INTERVAL_SECONDS:-21600}
       - --batch-size
       - ${SITEMAP_MONITOR_BATCH_SIZE:-25}
       - --max-attempts
       - ${SITEMAP_MONITOR_MAX_ATTEMPTS:-5}
       - --job-lease-seconds
       - ${SITEMAP_MONITOR_JOB_LEASE_SECONDS:-900}
+      - --maintenance-interval-seconds
+      - ${SITEMAP_MONITOR_MAINTENANCE_INTERVAL_SECONDS:-21600}
+      - --run-detail-retention-days
+      - ${SITEMAP_MONITOR_RUN_DETAIL_RETENTION_DAYS:-7}
+      - --scan-detail-retention-days
+      - ${SITEMAP_MONITOR_SCAN_DETAIL_RETENTION_DAYS:-30}
+      - --job-retention-days
+      - ${SITEMAP_MONITOR_JOB_RETENTION_DAYS:-30}
+      - --maintenance-batch-size
+      - ${SITEMAP_MONITOR_MAINTENANCE_BATCH_SIZE:-500}
     environment:
       <<: *common-environment
       RUNNER_SERVICE_NAME: sitemap-monitor-worker
