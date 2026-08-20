@@ -1,8 +1,8 @@
-"""Shared WAF, anti-bot, and human-verification page signatures.
+"""Shared invalid-transport, WAF, and human-verification page signatures.
 
 The asset and taxonomy pipelines must classify these pages before extracting
-product facts.  A matched challenge page is evidence about the fetch, never
-evidence about the product itself.
+product facts. A matched transport or challenge page is evidence about the
+fetch, never evidence about the product itself.
 """
 
 from __future__ import annotations
@@ -52,6 +52,24 @@ def _signature(
 
 
 ANTI_BOT_SIGNATURES: tuple[AntiBotSignature, ...] = (
+    # Neutral placeholder pages returned by a broken transport/fallback. Keep
+    # the code stable because incident manifests and anomaly evidence use it.
+    _signature(
+        "neutral_transport_example_domain",
+        "neutral_transport",
+        "unrelated_page",
+        100,
+        (
+            r"^\s*example\s+domain\s*$|"
+            r"\bgeneric\s+example\s+domain\s+page\b|"
+            r"\biana\s+example\s+domain\b|"
+            r"\bthis\s+domain\s+is\s+for\s+use\s+in\s+illustrative\s+examples\s+in\s+documents\b|"
+            r"\bthis\s+domain\s+is\s+for\s+use\s+in\s+documentation\s+examples?\b|"
+            r"\bavoid\s+use\s+in\s+operations\b"
+        ),
+        "title",
+        "body",
+    ),
     # Cloudflare challenge and block pages.
     _signature("cf_challenge_platform", "cloudflare", "anti_bot", 100, r"/cdn-cgi/challenge-platform|\bcf[-_]chl[-_]", "html"),
     _signature("cf_ray_id", "cloudflare", "access_denied", 92, r"\bcloudflare\s+ray\s+id\b", "body", "html"),

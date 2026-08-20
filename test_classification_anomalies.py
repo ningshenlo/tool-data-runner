@@ -1,6 +1,10 @@
 import unittest
+from types import SimpleNamespace
 
-from classification_anomalies import build_anti_bot_anomaly_candidate
+from classification_anomalies import (
+    build_anti_bot_anomaly_candidate,
+    reclassification_result_pollution,
+)
 
 
 class ClassificationAnomalyScoringTests(unittest.TestCase):
@@ -90,6 +94,32 @@ class ClassificationAnomalyScoringTests(unittest.TestCase):
             candidate["evidence"]["matches"][0]["code"],
             "neutral_transport_example_domain",
         )
+
+    def test_reclassification_result_gate_rejects_neutral_transport_raw_output(self):
+        detected = reclassification_result_pollution(
+            SimpleNamespace(
+                raw={
+                    "profile": {
+                        "primary_job": "Generic example domain page for documentation examples"
+                    }
+                }
+            )
+        )
+        self.assertIsNotNone(detected)
+        assert detected is not None
+        self.assertEqual(detected["code"], "neutral_transport_example_domain")
+
+    def test_reclassification_result_gate_accepts_clean_product_evidence(self):
+        detected = reclassification_result_pollution(
+            SimpleNamespace(
+                raw={
+                    "profile": {
+                        "primary_job": "Generate product demo videos from scripts"
+                    }
+                }
+            )
+        )
+        self.assertIsNone(detected)
 
 
 if __name__ == "__main__":

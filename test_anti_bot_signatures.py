@@ -39,6 +39,32 @@ class AntiBotSignatureTests(unittest.TestCase):
                 assert detected is not None
                 self.assertEqual(detected.provider, provider)
 
+    def test_detects_neutral_example_transport_page(self):
+        detected = detect_anti_bot_page(
+            "<html><head><title>Example Domain</title></head>"
+            "<body>This domain is for use in illustrative examples in documents.</body></html>",
+            http_status=200,
+        )
+        self.assertIsNotNone(detected)
+        assert detected is not None
+        self.assertEqual(detected.state, "unrelated_page")
+        self.assertEqual(detected.provider, "neutral_transport")
+        self.assertEqual(detected.code, "neutral_transport_example_domain")
+
+    def test_does_not_flag_product_copy_that_uses_example_as_a_noun(self):
+        detected = detect_anti_bot_text(
+            "Configure an example domain in the API playground, then deploy your AI agent."
+        )
+        self.assertIsNone(detected)
+
+    def test_detects_model_summary_of_neutral_transport_page(self):
+        detected = detect_anti_bot_text(
+            "The provided text is a generic example domain page with no product information."
+        )
+        self.assertIsNotNone(detected)
+        assert detected is not None
+        self.assertEqual(detected.code, "neutral_transport_example_domain")
+
     def test_does_not_flag_real_security_product_copy(self):
         detected = detect_anti_bot_text(
             "AI security platform for detecting model attacks, governing access, and monitoring compliance."

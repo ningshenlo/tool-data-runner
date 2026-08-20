@@ -16,7 +16,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
-from anti_bot_signatures import contains_anti_bot_text
+from anti_bot_signatures import detect_anti_bot_text
 
 SHADOW_PROMPT_VERSION = "shadow-top2-v4-trusted-models-2026-08-15"
 SHADOW_EXTRACTOR_VERSION = "cleaned-main-content-v2-evidence-grounded-2026-08-14"
@@ -46,11 +46,6 @@ ENTITY_ERROR_PAGE_RE = re.compile(
     r"invalid\s+ssl\s+certificate|error\s+code\s*52\d|access\s+denied|"
     r"security\s+block\s+page|request\s+blocked|site\s+can(?:not|'t)\s+be\s+reached|"
     r"temporarily\s+unavailable|origin\s+server\s+is\s+unreachable)",
-    re.I,
-)
-NEUTRAL_TRANSPORT_PAGE_RE = re.compile(
-    r"(?:\bexample\s+domain\b|\bthis\s+domain\s+is\s+for\s+use\s+in\s+documentation\s+examples\b|"
-    r"\bavoid\s+use\s+in\s+operations\b)",
     re.I,
 )
 PROVIDER_BLOCKED_RE = re.compile(
@@ -782,11 +777,14 @@ def parse_entity_decision(
             *(str(item.get("quote") or "") for item in evidence),
         ]
     )
-    neutral_transport_detected = bool(NEUTRAL_TRANSPORT_PAGE_RE.search(error_page_text))
+    invalid_transport = detect_anti_bot_text(error_page_text)
+    neutral_transport_detected = bool(
+        invalid_transport
+        and "neutral_transport_example_domain" in invalid_transport.matched_codes
+    )
     error_page_detected = bool(
         ENTITY_ERROR_PAGE_RE.search(error_page_text)
-        or contains_anti_bot_text(error_page_text)
-        or neutral_transport_detected
+        or invalid_transport
     )
     accepted = (
         candidate_kind != "unresolved"

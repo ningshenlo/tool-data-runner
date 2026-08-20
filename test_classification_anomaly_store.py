@@ -117,7 +117,7 @@ def create_store() -> sqlite3.Connection:
     )
     migration = (
         Path(__file__).resolve().parent.parent
-        / "ainav"
+        / "sigpik"
         / "d1"
         / "migrations"
         / "0062_classification_anomaly_reprocessing.sql"
@@ -268,6 +268,67 @@ class ClassificationAnomalyStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             verified_source_queue[0]["taxonomy_evidence_url"],
             "https://clean.example/janitorai",
+        )
+
+    async def test_polluted_success_result_stays_approved_for_manual_attention(self):
+        await scan_classification_anomalies(self.d1, limit=20, lease_owner="test-worker")
+        candidate_id = self.connection.execute(
+            "SELECT id FROM classification_anomaly_candidates WHERE tool_id = 318"
+        ).fetchone()[0]
+        self.connection.execute(
+            """
+            INSERT INTO classification_reprocess_requests (
+              tool_id, anomaly_candidate_id, request_source, evidence_mode,
+              reason, status, requested_by
+            ) VALUES (318, ?, 'anomaly', 'official_url', 'admin approved', 'queued', 'test-admin')
+            """,
+            [candidate_id],
+        )
+        request_id = self.connection.execute("SELECT last_insert_rowid()").fetchone()[0]
+        self.connection.execute(
+            "UPDATE classification_anomaly_candidates SET status = 'approved' WHERE id = ?",
+            [candidate_id],
+        )
+        self.connection.commit()
+
+        lease_token = await claim_reclassification_request(
+            self.d1,
+            request_id,
+            lease_owner="test-taxonomy-worker",
+        )
+        result_status = await complete_reclassification_request(
+            self.d1,
+            request_id=request_id,
+            lease_token=str(lease_token),
+            result=SimpleNamespace(
+                status="succeeded",
+                run_id=1,
+                primary_slug="ai-security-compliance",
+                primary_confidence=0.99,
+                entity_kind="independent_product",
+                error="",
+                raw={"profile": "Generic example domain page for documentation examples"},
+            ),
+            auto_accept_threshold=0.85,
+        )
+
+        self.assertEqual(result_status, "needs_manual")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT status FROM classification_anomaly_candidates WHERE id = ?",
+                [candidate_id],
+            ).fetchone()[0],
+            "approved",
+        )
+        payload = json.loads(
+            self.connection.execute(
+                "SELECT result_json FROM classification_reprocess_requests WHERE id = ?",
+                [request_id],
+            ).fetchone()[0]
+        )
+        self.assertEqual(
+            payload["pollution_gate"]["code"],
+            "neutral_transport_example_domain",
         )
 
     async def test_detector_cursor_advances_past_the_first_page_and_wraps(self):

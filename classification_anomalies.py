@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 import uuid
 from typing import Any
 
@@ -13,13 +12,6 @@ from anti_bot_signatures import detect_anti_bot_text
 ANTI_BOT_CLASSIFICATION_DETECTOR = "anti_bot_classification_pollution_v1"
 ANOMALY_SCAN_INTERVAL_HOURS = 6
 ANOMALY_SCAN_LIMIT = 500
-NEUTRAL_TRANSPORT_PLACEHOLDER_RE = re.compile(
-    r"\b(?:this\s+domain\s+is\s+for\s+use\s+in\s+documentation\s+examples?"
-    r"|example\s+domain\b|iana\s+example(?:\s+domain)?\b|avoid\s+use\s+in\s+operations)\b",
-    re.IGNORECASE,
-)
-
-
 ANOMALY_SCAN_SQL = """
 WITH candidates AS (
   SELECT
@@ -212,19 +204,6 @@ def build_classification_pollution_matches(row: dict[str, Any]) -> list[dict[str
                 }
             )
             continue
-        placeholder = NEUTRAL_TRANSPORT_PLACEHOLDER_RE.search(value)
-        if placeholder:
-            evidence.append(
-                {
-                    "source": source,
-                    "state": "invalid_page",
-                    "provider": "neutral_transport",
-                    "code": "neutral_transport_example_domain",
-                    "evidence": re.sub(r"\s+", " ", placeholder.group(0)).strip()[:240],
-                    "confidence": 0.99,
-                    "matched_codes": ["neutral_transport_example_domain"],
-                }
-            )
     return evidence
 
 
@@ -610,6 +589,30 @@ async def claim_reclassification_request(
     return lease_token if rows else None
 
 
+def reclassification_result_pollution(result: Any) -> dict[str, Any] | None:
+    """Return a stable transport-pollution summary for a proposed repair result."""
+    raw = getattr(result, "raw", None)
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw_text = raw
+    else:
+        try:
+            raw_text = json.dumps(raw, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            raw_text = str(raw)
+    detected = detect_anti_bot_text(raw_text)
+    if not detected:
+        return None
+    return {
+        "state": detected.state,
+        "provider": detected.provider,
+        "code": detected.code,
+        "evidence": detected.evidence,
+        "matched_codes": list(detected.matched_codes),
+    }
+
+
 async def complete_reclassification_request(
     d1: Any,
     *,
@@ -623,8 +626,14 @@ async def complete_reclassification_request(
     run_status = str(getattr(result, "status", "failed") or "failed")
     run_id = int(getattr(result, "run_id", 0) or 0) or None
     error = str(getattr(result, "error", "") or "")[:800]
+    pollution = reclassification_result_pollution(result)
 
-    if run_status == "succeeded" and primary_slug and primary_confidence >= auto_accept_threshold:
+    if (
+        run_status == "succeeded"
+        and primary_slug
+        and primary_confidence >= auto_accept_threshold
+        and pollution is None
+    ):
         request_status = "succeeded"
     elif run_status in {"partial", "skipped", "succeeded"}:
         request_status = "needs_manual"
@@ -638,6 +647,7 @@ async def complete_reclassification_request(
         "entity_kind": str(getattr(result, "entity_kind", "unresolved") or "unresolved"),
         "classification_run_id": run_id,
         "error": error or None,
+        "pollution_gate": pollution,
     }
     rows = await d1.query(
         """
