@@ -217,6 +217,36 @@ def normalize_evidence_item(
     }
 
 
+def normalize_evidence_items(
+    value: Any,
+    *,
+    source_url: str = "",
+    source_text: str = "",
+) -> list[dict[str, Any]]:
+    """Normalize evidence arrays and provider-collapsed quoted strings."""
+    if isinstance(value, list):
+        raw_items = value
+    elif isinstance(value, str):
+        quoted_items = _QUOTED_RE.findall(value)
+        raw_items = quoted_items or [value]
+    elif value in (None, ""):
+        raw_items = []
+    else:
+        raw_items = [value]
+    return [
+        item
+        for item in (
+            normalize_evidence_item(
+                raw_item,
+                source_url=source_url,
+                source_text=source_text,
+            )
+            for raw_item in raw_items
+        )
+        if item
+    ][:5]
+
+
 _EVIDENCE_SPLIT_RE = re.compile(
     r"(?is)\s*(?:evidence|quote|source)\s*[:=]\s*"
 )
@@ -385,6 +415,22 @@ def build_product_profile(
         source_url=source_url,
         source_text=source_text,
     )
+    if (
+        not primary_job
+        and not primary_outputs
+        and not capabilities_raw
+        and entity_decision.get("accepted")
+        and entity_decision.get("evidence")
+    ):
+        # Some JSON-schema providers return evidence-backed entity fields but
+        # collapse all profile fields into unsupported plain strings. Preserve
+        # a minimal, verbatim-grounded signal so downstream taxonomy can still
+        # classify the product without inventing facts.
+        first_evidence = dict(entity_decision["evidence"][0])
+        primary_job = {
+            "value": str(first_evidence.get("quote") or "")[:500],
+            "evidence": [first_evidence],
+        }
     return {
         "primary_job": primary_job,
         "primary_outputs": primary_outputs or None,
@@ -757,20 +803,11 @@ def parse_entity_decision(
         candidate_kind = "unresolved"
     confidence = _as_confidence(raw.get("entity_confidence"), 0.0)
     evidence_raw = raw.get("entity_evidence") or []
-    if not isinstance(evidence_raw, list):
-        evidence_raw = [evidence_raw]
-    evidence = [
-        item
-        for item in (
-            normalize_evidence_item(
-                value,
-                source_url=source_url,
-                source_text=source_text,
-            )
-            for value in evidence_raw
-        )
-        if item
-    ]
+    evidence = normalize_evidence_items(
+        evidence_raw,
+        source_url=source_url,
+        source_text=source_text,
+    )
     error_page_text = " ".join(
         [
             str(raw.get("entity_reason") or ""),

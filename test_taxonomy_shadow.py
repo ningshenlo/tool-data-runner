@@ -23,6 +23,7 @@ from taxonomy_shadow import (
     decide_primary_status,
     load_shadow_tasks,
     merge_capability_decisions,
+    normalize_evidence_items,
     normalize_evidenced_value,
     parse_capabilities,
     parse_entity_decision,
@@ -365,6 +366,59 @@ class EntityDecisionTests(unittest.TestCase):
 
         self.assertEqual(decision["candidate_kind"], "independent_product")
         self.assertEqual(decision["kind"], "unresolved")
+
+    def test_provider_collapsed_entity_evidence_quotes_are_split_and_grounded(self):
+        source_text = (
+            "Build Knowledgeable AI. Pinecone is a fully managed vector database built for AI. "
+            "Start Building. Get a Demo."
+        )
+        evidence = normalize_evidence_items(
+            '"Build Knowledgeable AI"; "Pinecone is a fully managed vector database built for AI."',
+            source_url="https://www.pinecone.io/",
+            source_text=source_text,
+        )
+        self.assertEqual(
+            [item["quote"] for item in evidence],
+            [
+                "Build Knowledgeable AI",
+                "Pinecone is a fully managed vector database built for AI.",
+            ],
+        )
+        decision = parse_entity_decision(
+            {
+                "entity_kind": "independent_product",
+                "entity_confidence": 0.96,
+                "entity_reason": "A dedicated product with signup and demo paths.",
+                "entity_evidence": (
+                    '"Build Knowledgeable AI"; '
+                    '"Pinecone is a fully managed vector database built for AI."'
+                ),
+            },
+            source_url="https://www.pinecone.io/",
+            source_text=source_text,
+        )
+        self.assertTrue(decision["accepted"])
+        self.assertEqual(decision["kind"], "independent_product")
+
+    def test_entity_evidence_is_a_minimal_grounded_profile_fallback(self):
+        profile = build_product_profile(
+            {
+                "entity_kind": "independent_product",
+                "entity_confidence": 0.95,
+                "entity_reason": "Dedicated product.",
+                "entity_evidence": [{"quote": "Build what's next on the AI Native Cloud"}],
+                "primary_job": "Accelerate AI development with a full-stack cloud.",
+                "primary_outputs": "AI model outputs and fine-tuned models.",
+                "capabilities_raw": "Inference; compute; fine-tuning",
+            },
+            source_url="https://www.together.ai/",
+            source_text="Build what's next on the AI Native Cloud. The Together AI Platform.",
+        )
+        self.assertTrue(profile_has_signal(profile))
+        self.assertEqual(
+            profile["primary_job"]["value"],
+            "Build what's next on the AI Native Cloud",
+        )
 
     def test_error_page_can_never_be_accepted_as_non_product(self):
         decision = parse_entity_decision(
