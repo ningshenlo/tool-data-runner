@@ -15,7 +15,7 @@ import httpx
 import runner
 
 
-MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "ainav" / "d1" / "migrations"
+MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "sigpik" / "d1" / "migrations"
 TEST_SKIPPED_DATA_MIGRATIONS = {"0026_reject_catalog_fit_mismatches.sql"}
 
 
@@ -229,6 +229,19 @@ class PageAndNameQualityTests(unittest.TestCase):
         )
         self.assertEqual(assessment.state, "anti_bot")
 
+    def test_neutral_example_transport_is_not_a_valid_product_page(self) -> None:
+        assessment = runner.classify_page_state(
+            "<html><head><title>Example Domain</title></head>"
+            "<body>This domain is for use in illustrative examples in documents.</body></html>",
+            http_status=200,
+        )
+        self.assertEqual(assessment.state, "unrelated_page")
+        self.assertEqual(
+            assessment.reason,
+            "anti_bot_signature:neutral_transport:neutral_transport_example_domain",
+        )
+        self.assertFalse(assessment.is_valid)
+
     def test_access_denied_and_home_are_invalid_names_but_home_assistant_is_valid(self) -> None:
         self.assertEqual(runner.invalid_tool_name_reason("Access Denied"), "access_denied_name")
         self.assertEqual(runner.invalid_tool_name_reason("Home"), "generic_page_name")
@@ -255,6 +268,31 @@ class PageAndNameQualityTests(unittest.TestCase):
         )
         self.assertEqual(result.product_name, "Tractable")
         self.assertEqual(result.review_status, "auto_approved")
+
+    def test_title_like_markup_inside_html_comments_is_ignored(self) -> None:
+        html_body = """
+        <html><head>
+          <!-- SEO: per-page <title>, <meta>, JSON-LD and hreflang are emitted by useSeo(). -->
+          <title>SYNTX AI: 100+ AI Models in One Place | Telegram &amp; Web</title>
+        </head><body>Generate text, images, video and music.</body></html>
+        """
+        result = runner.resolve_tool_name(
+            html_body,
+            "syntx.ai",
+            model_page_title=(
+                ", <meta>, JSON-LD and hreflang are emitted by useSeo(). -->"
+                "<title>SYNTX AI: 100+ AI Models in One Place | Telegram & Web"
+            ),
+        )
+        self.assertEqual(runner.read_html_title(html_body), "SYNTX AI: 100+ AI Models in One Place | Telegram & Web")
+        self.assertEqual(result.product_name, "SYNTX AI")
+        self.assertEqual(result.review_status, "auto_approved")
+
+    def test_html_markup_fragment_is_an_invalid_tool_name(self) -> None:
+        self.assertEqual(
+            runner.invalid_tool_name_reason(", <meta>, JSON-LD -->"),
+            "html_markup_name",
+        )
 
     def test_unproven_name_falls_back_to_domain_and_needs_review(self) -> None:
         result = runner.resolve_tool_name(
@@ -2075,7 +2113,7 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         result = runner.AssetFetchResult(
             final_url=task.official_url,
-            title="Uncertain Name",
+            title="100+ AI Models in One Place",
             description="An AI product whose exact brand needs confirmation.",
             name_source="domain_fallback",
             name_confidence=45,
@@ -2096,6 +2134,20 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(readiness, "blocked")
         enrichment = self.task_row("tool_enrichment_states", "tool_id = ?", [tool_id])
         self.assertNotIn("name_quality", json.loads(enrichment["blocking_json"]))
+
+        self.connection.execute(
+            """
+            UPDATE tool_localizations
+            SET name = ', <meta>, JSON-LD and hreflang/canonical links are emitted by useSeo() into each rendered',
+                name_review_status = 'legacy_unreviewed'
+            WHERE tool_id = ? AND locale_code = 'en'
+            """,
+            [tool_id],
+        )
+        self.connection.commit()
+        await runner.D1EnrichmentStore(self.d1).evaluate_tool(tool_id)
+        enrichment = self.task_row("tool_enrichment_states", "tool_id = ?", [tool_id])
+        self.assertIn("name_quality", json.loads(enrichment["blocking_json"]))
 
     async def test_public_slug_data_migration_is_global_collision_safe_and_idempotent(self) -> None:
         existing_runway_id = self.add_tool("runway", status="published")
@@ -3660,7 +3712,7 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counts["domain_claimed"], 2)
         self.assertEqual(counts["domain_failed"], 0)
 
-    def test_domain_state_batches_poll_again_after_one_second(self) -> None:
+    def test_domain_state_batches_back_off_after_draining_available_work(self) -> None:
         self.assertEqual(
             runner.domain_state_next_delay_seconds(
                 {"claimed": 50},
@@ -3675,8 +3727,41 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 batch_limit=50,
                 idle_interval_seconds=1,
             ),
-            1,
+            10,
         )
+        self.assertEqual(
+            runner.domain_state_next_delay_seconds(
+                {"claimed": 0, "queued": 0},
+                batch_limit=50,
+                idle_interval_seconds=1,
+            ),
+            60,
+        )
+
+    async def test_telemetry_health_checks_only_the_latest_run_per_workload(self) -> None:
+        class TelemetryConfig:
+            runner_instance_id = "telemetry-latest-workload-health"
+            runner_version = "test-version"
+
+        telemetry = runner.RunnerTelemetry(self.d1, TelemetryConfig())
+        traffic_failure = await telemetry.start("traffic")
+        await telemetry.finish(traffic_failure, {"failed": 1})
+        domain_success = await telemetry.start("domain_state")
+        await telemetry.finish(domain_success, {"done": 1})
+
+        degraded = self.connection.execute(
+            "SELECT status FROM runner_instances WHERE instance_id = ?",
+            [TelemetryConfig.runner_instance_id],
+        ).fetchone()
+        self.assertEqual(degraded["status"], "degraded")
+
+        traffic_success = await telemetry.start("traffic")
+        await telemetry.finish(traffic_success, {"done": 1})
+        healthy = self.connection.execute(
+            "SELECT status FROM runner_instances WHERE instance_id = ?",
+            [TelemetryConfig.runner_instance_id],
+        ).fetchone()
+        self.assertEqual(healthy["status"], "healthy")
 
     async def test_activate_market_snapshot_id_cli_does_not_require_brightdata(self) -> None:
         config = type("ActivationConfig", (), {"poll_interval_seconds": 60})()

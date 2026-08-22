@@ -117,6 +117,15 @@ class SchedulerStore(MetadataStore, Protocol):
         check_interval_sec: int | None = None,
     ) -> None: ...
 
+    async def set_site_status(
+        self,
+        site_id: str,
+        status: str,
+        now_ms: int,
+        *,
+        from_status: str,
+    ) -> None: ...
+
     async def claim_due_sites(
         self,
         *,
@@ -363,6 +372,38 @@ class SqliteMetadataStore:
                     check_interval_sec,
                     check_interval_sec,
                 ),
+            )
+
+    async def set_site_status(
+        self,
+        site_id: str,
+        status: str,
+        now_ms: int,
+        *,
+        from_status: str,
+    ) -> None:
+        valid_statuses = {"active", "paused", "blocked"}
+        if status not in valid_statuses or from_status not in valid_statuses:
+            raise ValueError("Unsupported sitemap site status.")
+        if status == from_status:
+            return
+        with self.connection:
+            self.connection.execute(
+                """
+                UPDATE sitemap_sites
+                SET status = ?,
+                    schedule_version = schedule_version + 1,
+                    next_check_at = CASE
+                        WHEN ? = 'active' THEN ?
+                        ELSE next_check_at
+                    END,
+                    dispatch_lease_owner = NULL,
+                    dispatch_lease_token = NULL,
+                    dispatch_lease_expires_at = NULL,
+                    updated_at = ?
+                WHERE id = ? AND status = ?
+                """,
+                (status, status, now_ms, now_ms, site_id, from_status),
             )
 
     @staticmethod

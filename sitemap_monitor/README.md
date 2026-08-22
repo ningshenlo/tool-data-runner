@@ -108,6 +108,7 @@ python -m sitemap_monitor \
 - `SITEMAP_MONITOR_R2_BUCKET`（未设置时回退 `CLOUDFLARE_R2_BUCKET`）
 - `SITEMAP_MONITOR_SITES`（逗号分隔，可替代重复的 `--site`）
 - `SITEMAP_MONITOR_SITE_FILE`（每行一个站点，支持空行和 `#` 注释；首批观察默认使用固定 cohort 文件）
+- `SITEMAP_MONITOR_PAUSED_SITE_FILE`（明确隔离无可用 sitemap 的站点；保留历史数据并停止新任务）
 - `SITEMAP_MONITOR_CHECK_INTERVAL_SECONDS`（成功站点默认 `21600`，即 6 小时）
 - `SITEMAP_MONITOR_MAINTENANCE_INTERVAL_SECONDS`（默认 `21600`）
 - `SITEMAP_MONITOR_RUN_DETAIL_RETENTION_DAYS`（默认 `7`）
@@ -120,8 +121,11 @@ python -m sitemap_monitor \
 
 ```text
 sitemap_monitor/observation-cohort-v1.txt
+sitemap_monitor/observation-cohort-v1-paused.txt
 ```
 
-它包含 ainav 旧主分类 `games-entertainment-lifestyle` 中 38 个非 NSFW 站点。
-该名单只允许执行 fetch、site scan、comparability、baseline 和后续 family snapshot；
-不得直接生成、发布或展示 Signal。
+2026-08-22 的实时资格复核后，30 个站点保持 active，8 个没有可用 sitemap 的站点进入
+paused 清单；历史 run/error 不删除，恢复资格后可重新加入 active 清单并立即重扫。
+该名单在 Sitemap Monitor 内只允许执行 fetch、site scan、comparability、baseline 和后续 family snapshot；
+监控进程本身不得直接生成、发布或展示 Signal。下游 Signal Engine 可以在独立开关已启用、
+变化通过可比较性与跨轮确认、且满足发布策略后，读取已提交的 scan/diff 并形成 Canonical Signal。

@@ -200,6 +200,12 @@ class SitemapScheduler:
                 now_ms,
                 check_interval_sec=self.policy.check_interval_sec,
             )
+            await self.store.set_site_status(
+                site_id,
+                "active",
+                now_ms,
+                from_status="paused",
+            )
             self._registered_sites[site_id] = (
                 normalized,
                 self.policy.check_interval_sec,
@@ -207,6 +213,25 @@ class SitemapScheduler:
             )
             registered.append(site_id)
         return tuple(registered)
+
+    async def pause_sites(self, sites: Iterable[str]) -> tuple[str, ...]:
+        paused: list[str] = []
+        now_ms = self.clock_ms()
+        for homepage_url in dict.fromkeys(sites):
+            normalized = normalize_sitemap_url(
+                homepage_url,
+                max_length=self.monitor.limits.max_url_length,
+            )
+            site_id = site_id_for(normalized)
+            await self.store.set_site_status(
+                site_id,
+                "paused",
+                now_ms,
+                from_status="active",
+            )
+            self._registered_sites.pop(site_id, None)
+            paused.append(site_id)
+        return tuple(paused)
 
     async def perform_maintenance(self) -> MaintenanceResult:
         now_ms = self.clock_ms()

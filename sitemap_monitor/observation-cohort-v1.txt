@@ -2,21 +2,17 @@
 #
 # Source: ainav legacy primary category games-entertainment-lifestyle.
 # Frozen: 2026-08-14.
-# Scope: 38 real sites; the single NSFW/rejected entry was excluded.
+# Active scope: 30 sites after the 2026-08-22 live sitemap eligibility audit.
+# Eight ineligible sites are quarantined in observation-cohort-v1-paused.txt.
 # This cohort is observation-only and must not publish Signals.
-https://travelagent-olive.vercel.app/
 https://www.cultiq.app/
 https://www.immutable.com/
 https://caveduck.io/en
 https://meowa.ai/
 https://www.hexagram.io/
 https://heycurio.com/
-https://www.hooper.gg/
-https://chess.unabotter.xyz/
 https://aidungeon.com/
-https://gptgames.io/
 https://www.dreamcargarage.app/
-https://clawlings.com/
 https://aipartygames.com/
 https://www.rpggo.ai/
 https://www.unakin.ai/
@@ -27,7 +23,6 @@ https://ludo.ai/
 https://rosebud.ai/
 https://www.jabali.ai/
 https://fablefiesta.com/
-https://coplay.dev/
 https://fables.gg/
 https://dualite.dev/
 https://www.videogame.ai/
@@ -38,7 +33,5 @@ https://www.littleumbrella.gg/
 https://gdevelop.io/
 https://www.plutus.gg/
 https://www.ggpredict.io/
-https://incite.dev/
-https://www.withplayvision.ai/
 https://codewisp.ai/
 https://playabl.ai/

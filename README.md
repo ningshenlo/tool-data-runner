@@ -47,7 +47,7 @@ Fill `.env` with:
 
 - `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_D1_DATABASE_ID`, `CLOUDFLARE_API_TOKEN`: D1 REST API access.
 - `AHREF_API_KEY`: Ahrefs free Domain Rating API authentication. The runner sends it as `Authorization: Bearer <token>`.
-- DR cadence and provider budget: `RUNNER_DOMAIN_STATE_MAX_AGE_DAYS` (default `30`), `RUNNER_DOMAIN_POLL_INTERVAL_SECONDS` (default `1`), and `RUNNER_AHREFS_REQUESTS_PER_MINUTE` (default `60`, hard-clamped to Ahrefs' documented ceiling). The free DR endpoint does not consume API units; HTTP 429 responses honor `Retry-After` before retrying.
+- DR cadence and provider budget: `RUNNER_DOMAIN_STATE_MAX_AGE_DAYS` (default `30`), `RUNNER_DOMAIN_POLL_INTERVAL_SECONDS` (default `1` while draining a full batch), and `RUNNER_AHREFS_REQUESTS_PER_MINUTE` (default `60`, hard-clamped to Ahrefs' documented ceiling). Polling backs off to at least 10 seconds after a partial batch and 60 seconds when idle, avoiding a full D1 queue scan every second. The free DR endpoint does not consume API units; HTTP 429 responses honor `Retry-After` before retrying.
   The limiter is process-local, so production should run one `periodic-facts-worker` replica. If that service is intentionally scaled out, divide the 60 requests/minute budget across replicas.
 - `BRIGHTDATA_PROXY_USER`, `BRIGHTDATA_PROXY_PASSWORD`: Bright Data proxy credentials for traffic mode.
 - Optional runner identity and tuning: stable `RUNNER_INSTANCE_ID`, `RUNNER_SERVICE_NAME`, deploy label `RUNNER_VERSION`, `RUNNER_LIMIT`, `RUNNER_PRICING_LIMIT`, `RUNNER_PRICING_MANUAL_REVIEW_REPLAY_LIMIT`, `RUNNER_PRICING_TIMEOUT_SECONDS`.
@@ -100,8 +100,9 @@ docker compose -f docker-compose.dokploy.yml up -d
 
 An additional `sitemap-monitor-worker` profile is defined with a safe-off default.
 Remote migrations `0060_sitemap_monitor_phase1.sql` and
-`0061_sitemap_comparability_gate.sql`, a private R2 bucket, and the first 38-site
-observation cohort have been prepared. Enable it explicitly with both
+`0061_sitemap_comparability_gate.sql`, a private R2 bucket, a 30-site active
+observation cohort, and an 8-site ineligible quarantine have been prepared.
+Enable it explicitly with both
 `SITEMAP_MONITOR_ENABLED=1` and a non-zero `SITEMAP_MONITOR_REPLICAS`; the cohort is
 observation-only and does not publish Signals.
 

@@ -11,6 +11,7 @@ from .normalize import SitemapUrlError, normalize_sitemap_url, sitemap_url_hash
 
 
 _XML_DECLARATION = re.compile(br"^\s*<\?xml\b", re.IGNORECASE)
+_HTML_DOCTYPE = re.compile(br"^\s*<!\s*DOCTYPE\s+html\b", re.IGNORECASE)
 _FORBIDDEN_XML = re.compile(br"<!\s*(?:DOCTYPE|ENTITY)\b", re.IGNORECASE)
 
 
@@ -70,6 +71,11 @@ def _entry(raw_url: str, lastmod: str | None, source_url: str, limits: MonitorLi
 
 
 def _parse_xml(body: bytes, source_url: str, limits: MonitorLimits) -> SitemapDocument:
+    if _HTML_DOCTYPE.match(body):
+        raise SitemapParseError(
+            "unsupported_xml_root",
+            "Expected urlset or sitemapindex, received html.",
+        )
     if _FORBIDDEN_XML.search(body):
         raise SitemapParseError("unsafe_xml", "DOCTYPE and ENTITY declarations are not allowed.")
     root_name: str | None = None

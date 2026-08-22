@@ -19,6 +19,7 @@ from .config import MonitorLimits
 from .engine import SitemapMonitor
 from .fetch import SitemapHttpFetcher
 from .models import ComparabilityResult, SiteScanResult
+from .normalize import normalize_sitemap_url
 from .scheduler import SchedulerPolicy, SitemapScheduler
 from .storage import FileObjectStore, SqliteMetadataStore
 
@@ -38,6 +39,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="append",
         default=[],
         help="UTF-8 file with one homepage URL per line; blank lines and # comments are ignored",
+    )
+    parser.add_argument(
+        "--paused-site-file",
+        action="append",
+        default=[],
+        help="UTF-8 file with sites to pause; blank lines and # comments are ignored",
     )
     parser.add_argument(
         "--sitemap",
@@ -172,6 +179,33 @@ async def run(args: argparse.Namespace) -> None:
     if not sites:
         raise SystemExit("At least one --site or SITEMAP_MONITOR_SITES value is required.")
 
+    configured_paused_site_file = os.getenv(
+        "SITEMAP_MONITOR_PAUSED_SITE_FILE", ""
+    ).strip()
+    paused_site_files = [
+        *args.paused_site_file,
+        *([configured_paused_site_file] if configured_paused_site_file else []),
+    ]
+    paused_sites: list[str] = []
+    for site_file in paused_site_files:
+        path = Path(site_file).expanduser()
+        if not path.is_file():
+            raise SystemExit(f"Paused sitemap site file does not exist: {path}")
+        paused_sites.extend(
+            line.strip()
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.lstrip().startswith("#")
+        )
+    paused_sites = list(dict.fromkeys(paused_sites))
+    normalized_active_sites = {normalize_sitemap_url(site) for site in sites}
+    normalized_paused_sites = {normalize_sitemap_url(site) for site in paused_sites}
+    overlap = normalized_active_sites.intersection(normalized_paused_sites)
+    if overlap:
+        raise SystemExit(
+            "Sitemap sites cannot be both active and paused: "
+            + ", ".join(sorted(overlap))
+        )
+
     cloudflare_metadata: CloudflareD1MetadataStore | None = None
     cloudflare_objects: CloudflareR2ObjectStore | None = None
     local_metadata: SqliteMetadataStore | None = None
@@ -230,6 +264,7 @@ async def run(args: argparse.Namespace) -> None:
         ),
     )
     try:
+        await scheduler.pause_sites(paused_sites)
         while True:
             tick = await scheduler.run_once(sites)
             if tick.maintenance.changed and not args.json:

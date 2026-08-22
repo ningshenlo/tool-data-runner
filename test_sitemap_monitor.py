@@ -181,6 +181,15 @@ class NormalizeAndParserTests(unittest.TestCase):
             )
         self.assertEqual(overflow.exception.code, "url_limit_exceeded")
 
+    def test_html_fallback_is_not_reported_as_unsafe_xml(self) -> None:
+        with self.assertRaises(SitemapParseError) as fallback:
+            parse_sitemap(
+                b"<!DOCTYPE html><html><body>app shell</body></html>",
+                "https://example.com/sitemap.xml",
+                content_type="text/html",
+            )
+        self.assertEqual(fallback.exception.code, "unsupported_xml_root")
+
 
 class FingerprintAndDiffTests(unittest.TestCase):
     def test_three_layer_hash_filters_order_and_serialization_noise(self) -> None:
@@ -738,6 +747,45 @@ class SchedulerStoreTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()[0]
         self.assertEqual(self.store.connection.total_changes, changes_before)
         self.assertEqual(updated_after, updated_before)
+
+    async def test_pausing_site_invalidates_schedule_and_stops_due_claims(self) -> None:
+        before = self.store.connection.execute(
+            "SELECT schedule_version FROM sitemap_sites WHERE id = ?",
+            (self.site_id,),
+        ).fetchone()[0]
+        await self.store.set_site_status(
+            self.site_id,
+            "paused",
+            2_000,
+            from_status="active",
+        )
+        row = self.store.connection.execute(
+            "SELECT status, schedule_version FROM sitemap_sites WHERE id = ?",
+            (self.site_id,),
+        ).fetchone()
+        self.assertEqual(row["status"], "paused")
+        self.assertEqual(row["schedule_version"], before + 1)
+        due = await self.store.claim_due_sites(
+            lease_duration_ms=10_000,
+            lease_owner="scheduler-a",
+            limit=10,
+            now_ms=2_000,
+        )
+        self.assertEqual(due, ())
+
+        await self.store.set_site_status(
+            self.site_id,
+            "active",
+            3_000,
+            from_status="paused",
+        )
+        reactivated = self.store.connection.execute(
+            "SELECT status, schedule_version, next_check_at FROM sitemap_sites WHERE id = ?",
+            (self.site_id,),
+        ).fetchone()
+        self.assertEqual(reactivated["status"], "active")
+        self.assertEqual(reactivated["schedule_version"], before + 2)
+        self.assertEqual(reactivated["next_check_at"], 3_000)
 
     async def test_due_claim_job_idempotency_and_fenced_completion(self) -> None:
         due, first_job = await self._new_job()
@@ -1309,8 +1357,12 @@ class SchedulerIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
 class DeploymentBoundaryTests(unittest.TestCase):
     def test_cli_accepts_repeatable_site_files(self) -> None:
-        args = parse_args(["--site-file", "one.txt", "--site-file", "two.txt"])
+        args = parse_args([
+            "--site-file", "one.txt", "--site-file", "two.txt",
+            "--paused-site-file", "paused.txt",
+        ])
         self.assertEqual(args.site_file, ["one.txt", "two.txt"])
+        self.assertEqual(args.paused_site_file, ["paused.txt"])
         self.assertEqual(args.check_interval_seconds, 21_600)
         self.assertEqual(args.run_detail_retention_days, 7)
 
@@ -1380,6 +1432,10 @@ class DeploymentBoundaryTests(unittest.TestCase):
         self.assertIn("${SITEMAP_MONITOR_MAINTENANCE_BATCH_SIZE:-500}", service)
         self.assertIn("SITEMAP_MONITOR_ENABLED: ${SITEMAP_MONITOR_ENABLED:-0}", service)
         self.assertIn(
+            "SITEMAP_MONITOR_PAUSED_SITE_FILE: ${SITEMAP_MONITOR_PAUSED_SITE_FILE:-sitemap_monitor/observation-cohort-v1-paused.txt}",
+            service,
+        )
+        self.assertIn(
             "FOR_ALL_APP_R2_ACCESS_KEY_ID: ${FOR_ALL_APP_R2_ACCESS_KEY_ID}",
             service,
         )
@@ -1434,6 +1490,44 @@ class CloudflareMetadataAdapterTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
         self.assertEqual(results[1]["results"], [{"value": 1}])
+
+    async def test_d1_site_status_transition_invalidates_schedule(self) -> None:
+        client = SqliteD1ClientDouble()
+        store = CloudflareD1MetadataStore(client)  # type: ignore[arg-type]
+        site_id = site_id_for("https://example.com/")
+        await store.ensure_site(site_id, "https://example.com/", 1_000)
+        before = client.connection.execute(
+            "SELECT schedule_version FROM sitemap_sites WHERE id = ?",
+            (site_id,),
+        ).fetchone()[0]
+
+        await store.set_site_status(
+            site_id,
+            "paused",
+            2_000,
+            from_status="active",
+        )
+        row = client.connection.execute(
+            "SELECT status, schedule_version FROM sitemap_sites WHERE id = ?",
+            (site_id,),
+        ).fetchone()
+        self.assertEqual(row["status"], "paused")
+        self.assertEqual(row["schedule_version"], before + 1)
+
+        await store.set_site_status(
+            site_id,
+            "active",
+            3_000,
+            from_status="paused",
+        )
+        row = client.connection.execute(
+            "SELECT status, schedule_version, next_check_at FROM sitemap_sites WHERE id = ?",
+            (site_id,),
+        ).fetchone()
+        client.connection.close()
+        self.assertEqual(row["status"], "active")
+        self.assertEqual(row["schedule_version"], before + 2)
+        self.assertEqual(row["next_check_at"], 3_000)
 
     async def test_d1_failure_completion_is_retry_safe_and_idempotent(self) -> None:
         client = SqliteD1ClientDouble()

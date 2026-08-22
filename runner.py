@@ -1692,13 +1692,17 @@ def deterministic_fallback_category(
     )
 
 
+def strip_html_comments(html_body: str) -> str:
+    return re.sub(r"<!--[\s\S]*?-->", " ", html_body or "")
+
+
 def read_html_title(html_body: str) -> str:
-    match = re.search(r"<title[^>]*>([\s\S]*?)</title>", html_body or "", re.I)
+    match = re.search(r"<title[^>]*>([\s\S]*?)</title>", strip_html_comments(html_body), re.I)
     return clean_asset_text(match.group(1), 120) if match else ""
 
 
 def read_html_meta(html_body: str, names: set[str]) -> str:
-    for tag in re.findall(r"<meta\b[^>]*>", html_body or "", re.I):
+    for tag in re.findall(r"<meta\b[^>]*>", strip_html_comments(html_body), re.I):
         key = (read_html_attribute(tag, "property") or read_html_attribute(tag, "name")).lower()
         content = read_html_attribute(tag, "content")
         if key in names and content:
@@ -1956,6 +1960,8 @@ def invalid_tool_name_reason(value: Any) -> str:
     name = clean_asset_text(value, 160)
     if not name:
         return "empty_name"
+    if re.search(r"</?(?:title|meta)\b|-->", name, re.I):
+        return "html_markup_name"
     if _CHALLENGE_TITLE_RE.search(name):
         return "anti_bot_name"
     if _ACCESS_DENIED_TITLE_RE.search(name):
@@ -2044,7 +2050,14 @@ def resolve_tool_name(
     model_source: Any = "",
     model_evidence: Any = "",
 ) -> ToolNameResolution:
-    page_title = clean_asset_text(model_page_title or read_html_title(html_body), 200)
+    deterministic_page_title = (
+        read_html_meta(html_body, {"og:title", "twitter:title"})
+        or read_html_title(html_body)
+    )
+    model_title = clean_asset_text(model_page_title, 200)
+    if re.search(r"</?(?:title|meta)\b|-->|json-ld.{0,80}hreflang", model_title, re.I):
+        model_title = ""
+    page_title = model_title or deterministic_page_title
     candidates: list[tuple[str, str, int, str]] = []
 
     for value in _json_ld_product_names(html_body):
@@ -6893,6 +6906,41 @@ class RunnerTelemetry:
                 f"{key}={value}" for key, value in degraded_counts.items()
             )
         status = "failed" if health_error else "succeeded"
+        workload_values = ", ".join("(?)" for _ in self.workloads)
+        latest_health_sql = f"""
+                WITH workloads(workload) AS (
+                  VALUES {workload_values}
+                ),
+                latest_health AS (
+                  SELECT EXISTS (
+                    SELECT 1
+                    FROM workloads workload
+                    WHERE (
+                      SELECT latest.status
+                      FROM runner_runs latest
+                      WHERE latest.instance_id = ?
+                        AND latest.workload = workload.workload
+                      ORDER BY latest.id DESC
+                      LIMIT 1
+                    ) = 'failed'
+                  ) AS has_failed
+                )
+                UPDATE runner_instances
+                SET status = CASE
+                      WHEN ? IS NOT NULL THEN 'degraded'
+                      WHEN (SELECT has_failed FROM latest_health) = 1 THEN 'degraded'
+                      ELSE 'healthy'
+                    END,
+                    last_heartbeat_at = ?,
+                    last_success_at = CASE WHEN ? IS NULL THEN ? ELSE last_success_at END,
+                    last_error = CASE
+                      WHEN ? IS NOT NULL THEN ?
+                      WHEN (SELECT has_failed FROM latest_health) = 1 THEN last_error
+                      ELSE NULL
+                    END,
+                    updated_at = ?
+                WHERE instance_id = ?
+                """
         statements: list[tuple[str, list[Any]]] = [
             (
                 """
@@ -6903,52 +6951,16 @@ class RunnerTelemetry:
                 [status, now, counts_json, health_error, run_id, self.instance_id],
             ),
             (
-                """
-                UPDATE runner_instances
-                SET status = CASE
-                      WHEN ? IS NOT NULL THEN 'degraded'
-                      WHEN EXISTS (
-                        SELECT 1
-                        FROM runner_runs latest
-                        WHERE latest.instance_id = ? AND latest.status = 'failed'
-                          AND latest.id = (
-                            SELECT max(candidate.id)
-                            FROM runner_runs candidate
-                            WHERE candidate.instance_id = latest.instance_id
-                              AND candidate.workload = latest.workload
-                          )
-                      ) THEN 'degraded'
-                      ELSE 'healthy'
-                    END,
-                    last_heartbeat_at = ?,
-                    last_success_at = CASE WHEN ? IS NULL THEN ? ELSE last_success_at END,
-                    last_error = CASE
-                      WHEN ? IS NOT NULL THEN ?
-                      WHEN EXISTS (
-                        SELECT 1
-                        FROM runner_runs latest
-                        WHERE latest.instance_id = ? AND latest.status = 'failed'
-                          AND latest.id = (
-                            SELECT max(candidate.id)
-                            FROM runner_runs candidate
-                            WHERE candidate.instance_id = latest.instance_id
-                              AND candidate.workload = latest.workload
-                          )
-                      ) THEN last_error
-                      ELSE NULL
-                    END,
-                    updated_at = ?
-                WHERE instance_id = ?
-                """,
+                latest_health_sql,
                 [
-                    health_error,
+                    *self.workloads,
                     self.instance_id,
+                    health_error,
                     now,
                     health_error,
                     now,
                     health_error,
                     health_error,
-                    self.instance_id,
                     now,
                     self.instance_id,
                 ],
@@ -7002,6 +7014,11 @@ class D1EnrichmentStore:
                 WHERE l.tool_id = t.id AND l.translation_status = 'published'
                   AND l.published_at IS NOT NULL AND trim(l.name) <> ''
                   AND coalesce(l.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
+                  AND length(trim(l.name)) <= 80
+                  AND instr(l.name, '<') = 0
+                  AND instr(l.name, '>') = 0
+                  AND instr(l.name, '`') = 0
+                  AND instr(lower(l.name), 'json-ld') = 0
               ) THEN 1 ELSE 0 END AS has_name_quality,
               CASE WHEN EXISTS (SELECT 1 FROM tool_key_features f WHERE f.tool_id = t.id)
                      OR EXISTS (
@@ -7060,6 +7077,11 @@ class D1EnrichmentStore:
                 WHERE l.tool_id = t.id AND l.translation_status = 'published'
                   AND l.published_at IS NOT NULL AND trim(l.name) <> ''
                   AND coalesce(l.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
+                  AND length(trim(l.name)) <= 80
+                  AND instr(l.name, '<') = 0
+                  AND instr(l.name, '>') = 0
+                  AND instr(l.name, '`') = 0
+                  AND instr(lower(l.name), 'json-ld') = 0
               ) THEN 1 ELSE 0 END AS has_name_quality,
               CASE WHEN EXISTS (SELECT 1 FROM tool_key_features f WHERE f.tool_id = t.id)
                      OR EXISTS (
@@ -7966,10 +7988,13 @@ class D1AssetStore:
             name_evidence = f"pending_review fallback after {invalid_reason}"
             name_review_status = "auto_approved"
         elif name_confidence < AUTO_APPROVE_TOOL_NAME_CONFIDENCE:
-            title = title or canonical_slug_fallback_tool_name(task)
-            name_source = f"{name_source}_pending_review_fallback"[:80]
+            original_source = name_source
+            title = canonical_slug_fallback_tool_name(task)
+            name_source = "verified_submission_fallback"
             name_confidence = AUTO_APPROVE_TOOL_NAME_CONFIDENCE
-            name_evidence = name_evidence or "Qualified Discovery candidate; final name is reviewed before publication"
+            name_evidence = (
+                f"Qualified Discovery candidate fallback after low-confidence {original_source}"
+            )[:500]
             name_review_status = "auto_approved"
         if not title and not description:
             return
@@ -12341,9 +12366,17 @@ def domain_state_next_delay_seconds(
     batch_limit: int,
     idle_interval_seconds: int,
 ) -> int:
-    """Poll continuously without the former fixed 15-minute batch pause."""
-    del counts, batch_limit
-    return max(1, int(idle_interval_seconds))
+    """Drain full batches quickly, then back off when the queue is light or idle."""
+    configured_interval = max(1, int(idle_interval_seconds))
+    claimed = max(0, int(counts.get("claimed") or 0))
+    queued = max(0, int(counts.get("queued") or 0))
+    effective_limit = max(1, int(batch_limit))
+
+    if claimed >= effective_limit or queued >= effective_limit:
+        return configured_interval
+    if claimed > 0 or queued > 0:
+        return max(configured_interval, 10)
+    return max(configured_interval, 60)
 
 
 async def run_domain_state_loop(config: Config, limit: int | None, interval_seconds: int) -> None:
