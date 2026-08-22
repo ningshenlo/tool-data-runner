@@ -74,13 +74,25 @@ INDEX_WITH_CROSS_HOST = b"""<sitemapindex xmlns="http://www.sitemaps.org/schemas
 </sitemapindex>"""
 
 
-def response(url: str, body: bytes | None, status: int = 200, *, etag: str | None = None) -> FetchResult:
+INDEX_WITH_APEX_CHILD = b"""<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">
+<sitemap><loc>https://example.com/pages.xml</loc></sitemap>
+</sitemapindex>"""
+
+
+def response(
+    url: str,
+    body: bytes | None,
+    status: int = 200,
+    *,
+    etag: str | None = None,
+    final_url: str | None = None,
+) -> FetchResult:
     return FetchResult(
         body=body,
         bytes_downloaded=len(body or b""),
         content_type="application/xml",
         etag=etag,
-        final_url=url,
+        final_url=final_url or url,
         last_modified=None,
         retry_after=None,
         status_code=status,
@@ -674,6 +686,30 @@ class MonitorEngineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.result for item in second.outcomes], ["not_modified", "not_modified"])
         self.assertEqual(fetcher.validators[child][1].etag, '"child-v1"')
 
+    async def test_stale_robots_sitemap_falls_back_to_common_paths(self) -> None:
+        robots = "https://example.com/robots.txt"
+        stale = "https://example.com/sitemap.xml"
+        alternate = "https://example.com/sitemap_index.xml"
+        recovered = "https://example.com/sitemap-index.xml"
+        fetcher = FakeFetcher({
+            robots: [response(robots, b"Sitemap: https://example.com/sitemap.xml\n")],
+            stale: [response(stale, None, 404)],
+            recovered: [response(recovered, URLSET_A)],
+        })
+        monitor = SitemapMonitor(self.metadata, self.objects, fetcher=fetcher)
+
+        result = await monitor.scan_site(self.homepage)
+
+        self.assertEqual(result.discovery_mode, "fallback")
+        self.assertEqual(
+            [item.url for item in result.outcomes],
+            [stale, alternate, recovered],
+        )
+        self.assertEqual(
+            [item.result for item in result.outcomes],
+            ["failed", "failed", "baseline"],
+        )
+
     async def test_index_does_not_expand_cross_host_children(self) -> None:
         robots = "https://example.com/robots.txt"
         index = "https://example.com/sitemap.xml"
@@ -691,6 +727,29 @@ class MonitorEngineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual([item.url for item in result.outcomes], [index, child])
         self.assertNotIn(foreign, fetcher.validators)
+
+    async def test_index_expands_apex_child_from_www_site(self) -> None:
+        homepage = "https://www.example.com/"
+        robots = "https://www.example.com/robots.txt"
+        index = "https://www.example.com/sitemap-index.xml"
+        child = "https://example.com/pages.xml"
+        fetcher = FakeFetcher({
+            robots: [response(robots, None, 404)],
+            index: [response(index, INDEX_WITH_APEX_CHILD)],
+            child: [
+                response(
+                    child,
+                    URLSET_A,
+                    final_url="https://www.example.com/pages.xml",
+                )
+            ],
+        })
+        monitor = SitemapMonitor(self.metadata, self.objects, fetcher=fetcher)
+
+        result = await monitor.scan_site(homepage, explicit_sitemaps=[index])
+
+        self.assertEqual([item.url for item in result.outcomes], [index, child])
+        self.assertIn(child, fetcher.validators)
 
 
 class SchedulerStoreTests(unittest.IsolatedAsyncioTestCase):

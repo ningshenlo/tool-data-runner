@@ -32,6 +32,18 @@ def _now_ms() -> int:
     return int(time.time() * 1_000)
 
 
+def _same_site_hostname(left: str | None, right: str | None) -> bool:
+    left_host = (left or "").lower().rstrip(".")
+    right_host = (right or "").lower().rstrip(".")
+    if not left_host or not right_host:
+        return False
+    if left_host == right_host:
+        return True
+    return left_host.removeprefix("www.") == right_host.removeprefix("www.") and (
+        left_host.startswith("www.") or right_host.startswith("www.")
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _CheckedResource:
     index_entries: tuple[SitemapEntry, ...]
@@ -499,11 +511,20 @@ class SitemapMonitor:
             include_common_paths=False,
             limits=self.limits,
         )
-        roots = authoritative or discovery_candidates(
+        common_roots = discovery_candidates(
             normalized_homepage,
             include_common_paths=True,
             limits=self.limits,
         )
+        if explicit and authoritative:
+            roots = authoritative
+            fallback_roots: set[str] = set()
+        elif authoritative:
+            roots = tuple(dict.fromkeys((*authoritative, *common_roots)))
+            fallback_roots = set(common_roots).difference(authoritative)
+        else:
+            roots = common_roots
+            fallback_roots = set(common_roots)
         discovery_mode = (
             "explicit"
             if explicit
@@ -516,8 +537,8 @@ class SitemapMonitor:
         visited: set[str] = set()
         outcomes: list[CheckOutcome] = []
         traversal_reason_codes: list[str] = []
-        fallback_mode = not authoritative
-        found_fallback = False
+        used_fallback = not authoritative
+        found_root = False
         while queue:
             url, parent_id, depth = queue.popleft()
             if url in visited:
@@ -528,7 +549,8 @@ class SitemapMonitor:
             if depth > self.limits.max_index_depth:
                 traversal_reason_codes.append("index_depth_limit_reached")
                 continue
-            if fallback_mode and parent_id is None and found_fallback:
+            is_fallback_root = parent_id is None and url in fallback_roots
+            if is_fallback_root and found_root:
                 continue
             visited.add(url)
             checked = await self.check_resource(
@@ -538,21 +560,23 @@ class SitemapMonitor:
                 run_namespace=scan_namespace,
             )
             outcomes.append(checked.outcome)
-            if fallback_mode and parent_id is None and checked.outcome.result != "failed":
-                found_fallback = True
+            if parent_id is None and checked.outcome.result != "failed":
+                found_root = True
+                used_fallback = used_fallback or is_fallback_root
             if checked.outcome.sitemap_kind == "sitemap_index":
                 for entry in checked.index_entries:
-                    # Sitemap protocol requires index children to share the index
-                    # host. This also prevents a compromised index from turning
-                    # the monitor into an arbitrary public-web crawler.
-                    if urlsplit(entry.normalized_url).hostname != urlsplit(
-                        checked.outcome.final_url
-                    ).hostname:
+                    # Permit only the common apex/www canonicalization. Other
+                    # cross-host children remain blocked so a compromised index
+                    # cannot turn the monitor into an arbitrary public-web crawler.
+                    if not _same_site_hostname(
+                        urlsplit(entry.normalized_url).hostname,
+                        urlsplit(checked.outcome.final_url).hostname,
+                    ):
                         continue
                     queue.append((entry.normalized_url, checked.outcome.resource_id, depth + 1))
 
         return SiteScanResult(
-            discovery_mode=discovery_mode,
+            discovery_mode="fallback" if used_fallback else discovery_mode,
             finished_at_ms=_now_ms(),
             homepage_url=normalized_homepage,
             outcomes=tuple(outcomes),
