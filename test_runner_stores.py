@@ -5205,6 +5205,76 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(json.loads(instance["workloads_json"]), ["traffic", "domain_state"])
         metadata = json.loads(instance["metadata_json"])
         self.assertIn("traffic", metadata["workload_heartbeats"])
+        self.assertIn("process_heartbeat_at", metadata)
+
+    async def test_service_heartbeat_registers_without_creating_a_batch_run(self) -> None:
+        class TelemetryConfig:
+            runner_instance_id = "taxonomy-service-heartbeat"
+            runner_version = "test-version"
+            runner_service_name = "taxonomy-worker"
+            runner_workloads = ("taxonomy",)
+
+        owner = self
+
+        class FakeD1Context:
+            async def __aenter__(self):
+                return owner.d1
+
+            async def __aexit__(self, exc_type, exc, traceback):
+                return False
+
+        async def operation(telemetry):
+            await asyncio.sleep(0.01)
+            return telemetry.instance_id
+
+        with patch.object(runner, "D1Client", return_value=FakeD1Context()):
+            instance_id = await runner.run_with_service_heartbeat(
+                TelemetryConfig(),
+                operation,
+                heartbeat_interval_seconds=30,
+            )
+
+        self.assertEqual(instance_id, TelemetryConfig.runner_instance_id)
+        instance = self.connection.execute(
+            "SELECT service, metadata_json FROM runner_instances WHERE instance_id = ?",
+            [TelemetryConfig.runner_instance_id],
+        ).fetchone()
+        self.assertEqual(instance["service"], "taxonomy-worker")
+        self.assertIn("process_heartbeat_at", json.loads(instance["metadata_json"]))
+        run_count = self.connection.execute(
+            "SELECT count(*) AS count FROM runner_runs WHERE instance_id = ?",
+            [TelemetryConfig.runner_instance_id],
+        ).fetchone()["count"]
+        self.assertEqual(run_count, 0)
+
+    async def test_service_schedule_records_and_clears_provider_backoff(self) -> None:
+        class TelemetryConfig:
+            runner_instance_id = "taxonomy-service-schedule"
+            runner_version = "test-version"
+            runner_service_name = "taxonomy-worker"
+            runner_workloads = ("taxonomy",)
+
+        telemetry = runner.RunnerTelemetry(self.d1, TelemetryConfig())
+        await telemetry.register()
+        await runner.report_service_schedule(
+            telemetry,
+            21600,
+            backoff_reason="taxonomy_provider_blocked",
+        )
+        metadata = json.loads(self.connection.execute(
+            "SELECT metadata_json FROM runner_instances WHERE instance_id = ?",
+            [TelemetryConfig.runner_instance_id],
+        ).fetchone()["metadata_json"])
+        self.assertEqual(metadata["backoff_reason"], "taxonomy_provider_blocked")
+        self.assertEqual(metadata["backoff_until"], metadata["next_poll_at"])
+
+        await runner.report_service_schedule(telemetry, 300)
+        metadata = json.loads(self.connection.execute(
+            "SELECT metadata_json FROM runner_instances WHERE instance_id = ?",
+            [TelemetryConfig.runner_instance_id],
+        ).fetchone()["metadata_json"])
+        self.assertNotIn("backoff_reason", metadata)
+        self.assertNotIn("backoff_until", metadata)
 
 
 if __name__ == "__main__":

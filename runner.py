@@ -833,7 +833,13 @@ def load_config(require_brightdata: bool = True) -> Config:
         r2_bucket=os.getenv("CLOUDFLARE_R2_BUCKET", DEFAULT_R2_BUCKET),
         r2_public_base_url=os.getenv("R2_PUBLIC_BASE_URL", "").rstrip("/"),
         runner_instance_id=os.getenv("RUNNER_INSTANCE_ID") or f"runner-{uuid.uuid4().hex[:16]}",
-        runner_version=os.getenv("RUNNER_VERSION", "dev"),
+        runner_version=(
+            os.getenv("RUNNER_VERSION")
+            or os.getenv("DOKPLOY_COMMIT_SHA")
+            or os.getenv("GIT_COMMIT_SHA")
+            or os.getenv("SOURCE_COMMIT")
+            or "dev"
+        ).strip(),
         runner_service_name=(os.getenv("RUNNER_SERVICE_NAME") or "tool-data-runner").strip(),
         runner_workloads=(),
     )
@@ -6876,7 +6882,7 @@ class RunnerTelemetry:
         if not configured_workloads and workload is None and getattr(config, "taxonomy_auto_enabled", False):
             self.workloads.insert(-1, "taxonomy")
 
-    async def start(self, workload: str) -> int:
+    async def register(self) -> None:
         now = utc_now_iso()
         await self.d1.run(
             """
@@ -6895,6 +6901,10 @@ class RunnerTelemetry:
             """,
             [self.instance_id, self.service, self.version, json.dumps(self.workloads), now, now, now],
         )
+
+    async def start(self, workload: str) -> int:
+        now = utc_now_iso()
+        await self.register()
         rows = await self.d1.query(
             """
             INSERT INTO runner_runs (instance_id, workload, status, started_at, counts_json)
@@ -6989,20 +6999,36 @@ class RunnerTelemetry:
         ]
         await self.d1.batch(statements)
 
-    async def heartbeat(self) -> None:
+    async def heartbeat(self, metadata: dict[str, Any] | None = None) -> None:
         now = utc_now_iso()
+        heartbeat_metadata: dict[str, Any] = {"process_heartbeat_at": now}
+        heartbeat_metadata.update(metadata or {})
+        metadata_patch = json.dumps(heartbeat_metadata, sort_keys=True)
         await self.d1.run(
             """
             UPDATE runner_instances
             SET last_heartbeat_at = ?,
                 metadata_json = CASE
-                  WHEN ? IS NULL THEN metadata_json
-                  ELSE json_set(metadata_json, '$.workload_heartbeats.' || ?, ?)
+                  WHEN ? IS NULL THEN json_patch(coalesce(metadata_json, '{}'), ?)
+                  ELSE json_set(
+                    json_patch(coalesce(metadata_json, '{}'), ?),
+                    '$.workload_heartbeats.' || ?,
+                    ?
+                  )
                 END,
                 updated_at = ?
             WHERE instance_id = ?
             """,
-            [now, self.workload, self.workload, now, now, self.instance_id],
+            [
+                now,
+                self.workload,
+                metadata_patch,
+                metadata_patch,
+                self.workload,
+                now,
+                now,
+                self.instance_id,
+            ],
         )
 
 
@@ -11117,6 +11143,66 @@ async def run_with_telemetry(
         _LOG_WORKLOAD.reset(log_token)
 
 
+async def run_with_service_heartbeat(
+    config: Config,
+    operation: Any,
+    heartbeat_interval_seconds: int = 30,
+) -> Any:
+    """Keep process liveness independent from bounded workload runs and sleeps."""
+    async with D1Client(config) as heartbeat_d1:
+        telemetry = RunnerTelemetry(heartbeat_d1, config)
+
+        async def heartbeat_loop() -> None:
+            registered = False
+            while True:
+                try:
+                    if not registered:
+                        await telemetry.register()
+                        registered = True
+                    await telemetry.heartbeat()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    registered = False
+                    log_error(
+                        "runner.telemetry.service_heartbeat_failed",
+                        error=str(error)[:300],
+                    )
+                await asyncio.sleep(max(1, heartbeat_interval_seconds))
+
+        heartbeat_task = asyncio.create_task(heartbeat_loop())
+        # Let the first registration attempt begin without making workload
+        # startup depend on telemetry availability.
+        await asyncio.sleep(0)
+        try:
+            return await operation(telemetry)
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+
+
+async def report_service_schedule(
+    telemetry: RunnerTelemetry | None,
+    delay_seconds: int,
+    *,
+    backoff_reason: str | None = None,
+) -> None:
+    if telemetry is None:
+        return
+    delay_seconds = max(0, int(delay_seconds))
+    try:
+        await telemetry.heartbeat(
+            {
+                "next_poll_at": iso_delta(seconds=delay_seconds),
+                "backoff_until": iso_delta(seconds=delay_seconds) if backoff_reason else None,
+                "backoff_reason": backoff_reason,
+            }
+        )
+    except Exception as error:
+        log_error("runner.telemetry.schedule_failed", error=str(error)[:300])
+
+
 async def _run_domain_state_once(config: Config, d1: D1Client, limit: int | None = None) -> dict[str, int]:
     effective_limit = limit or config.domain_state_limit
     concurrency = getattr(config, "domain_state_concurrency", config.concurrency)
@@ -12675,7 +12761,10 @@ def taxonomy_idle_heartbeat_due(
     return last_emitted_at is None or now - last_emitted_at >= max(1, interval_seconds)
 
 
-async def run_taxonomy_loop(config: Config) -> None:
+async def run_taxonomy_loop(
+    config: Config,
+    service_telemetry: RunnerTelemetry | None = None,
+) -> None:
     idle_heartbeat_seconds = max(3600, int(config.taxonomy_interval_seconds))
     log_info(
         "taxonomy_runner.loop.start",
@@ -12701,11 +12790,14 @@ async def run_taxonomy_loop(config: Config) -> None:
     last_idle_log_at: float | None = None
     while True:
         delay = config.taxonomy_interval_seconds
+        backoff_reason: str | None = None
         started_at = time.monotonic()
         try:
             counts = await run_taxonomy_once(config)
             duration_ms = round((time.monotonic() - started_at) * 1000)
             delay = taxonomy_next_delay_seconds(config, counts)
+            if int(counts.get("provider_blocked") or 0) > 0:
+                backoff_reason = "taxonomy_provider_blocked"
             if taxonomy_batch_has_activity(counts):
                 consecutive_idle_batches = 0
                 last_idle_log_at = None
@@ -12760,6 +12852,11 @@ async def run_taxonomy_loop(config: Config) -> None:
             delay = min(60, config.taxonomy_interval_seconds)
             log_error("taxonomy_runner.batch.failed", error=str(error)[:500])
             log_info("taxonomy_runner.batch.retry_scheduled", delay_seconds=delay)
+        await report_service_schedule(
+            service_telemetry,
+            delay,
+            backoff_reason=backoff_reason,
+        )
         await asyncio.sleep(delay)
 
 
@@ -12798,7 +12895,13 @@ async def run_periodic_facts_loop(
     )
 
 
-async def run_all_loop(config: Config, limit: int | None, interval_seconds: int, timeout_seconds: int | None) -> None:
+async def run_all_loop(
+    config: Config,
+    limit: int | None,
+    interval_seconds: int,
+    timeout_seconds: int | None,
+    service_telemetry: RunnerTelemetry | None = None,
+) -> None:
     shared_interval = interval_seconds or 300
     assets_interval = max(60, shared_interval // 2)
     traffic_interval = shared_interval
@@ -12831,7 +12934,7 @@ async def run_all_loop(config: Config, limit: int | None, interval_seconds: int,
             )
         )
     if config.taxonomy_auto_enabled:
-        loops.append(run_taxonomy_loop(config))
+        loops.append(run_taxonomy_loop(config, service_telemetry))
     await asyncio.gather(*loops)
 
 
@@ -13394,10 +13497,13 @@ def main() -> None:
     if args.periodic_facts:
         if args.loop:
             asyncio.run(
-                run_periodic_facts_loop(
+                run_with_service_heartbeat(
                     config,
-                    args.limit,
-                    interval_seconds,
+                    lambda telemetry: run_periodic_facts_loop(
+                        config,
+                        args.limit,
+                        interval_seconds,
+                    ),
                 )
             )
             return
@@ -13406,19 +13512,36 @@ def main() -> None:
         return
     if args.taxonomy:
         if args.loop:
-            asyncio.run(run_taxonomy_loop(config))
+            asyncio.run(
+                run_with_service_heartbeat(
+                    config,
+                    lambda telemetry: run_taxonomy_loop(config, telemetry),
+                )
+            )
             return
         counts = asyncio.run(run_taxonomy_once(config))
         log_info("taxonomy_runner.batch.summary", **counts)
         return
     if args.all:
         log_info("all_runner.deprecated", replacement="split Dokploy worker profiles")
-        asyncio.run(run_all_loop(config, args.limit, interval_seconds, args.timeout))
+        asyncio.run(
+            run_with_service_heartbeat(
+                config,
+                lambda telemetry: run_all_loop(
+                    config, args.limit, interval_seconds, args.timeout, telemetry
+                ),
+            )
+        )
         return
 
     if args.assets:
         if args.loop:
-            asyncio.run(run_assets_loop(config, args.limit, interval_seconds))
+            asyncio.run(
+                run_with_service_heartbeat(
+                    config,
+                    lambda telemetry: run_assets_loop(config, args.limit, interval_seconds),
+                )
+            )
             return
 
         counts = asyncio.run(run_assets_once(config, args.limit))
@@ -13428,10 +13551,13 @@ def main() -> None:
     if args.domain_state:
         if args.loop:
             asyncio.run(
-                run_domain_state_loop(
+                run_with_service_heartbeat(
                     config,
-                    args.limit,
-                    args.interval_seconds or config.domain_state_poll_interval_seconds,
+                    lambda telemetry: run_domain_state_loop(
+                        config,
+                        args.limit,
+                        args.interval_seconds or config.domain_state_poll_interval_seconds,
+                    ),
                 )
             )
             return True
@@ -13443,14 +13569,17 @@ def main() -> None:
     if args.pricing:
         if args.loop:
             asyncio.run(
-                run_pricing_loop(
+                run_with_service_heartbeat(
                     config,
-                    args.limit,
-                    interval_seconds,
-                    args.task_id,
-                    args.approve_pricing,
-                    args.dry_run,
-                    args.timeout,
+                    lambda telemetry: run_pricing_loop(
+                        config,
+                        args.limit,
+                        interval_seconds,
+                        args.task_id,
+                        args.approve_pricing,
+                        args.dry_run,
+                        args.timeout,
+                    ),
                 )
             )
             return
@@ -13469,7 +13598,12 @@ def main() -> None:
         return
 
     if args.loop:
-        asyncio.run(run_loop(config, args.limit, interval_seconds))
+        asyncio.run(
+            run_with_service_heartbeat(
+                config,
+                lambda telemetry: run_loop(config, args.limit, interval_seconds),
+            )
+        )
         return
 
     counts = asyncio.run(run_once(config, args.limit))
