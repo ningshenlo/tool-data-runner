@@ -4,12 +4,14 @@ import argparse
 import asyncio
 import json
 import os
+import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
 
 from dotenv import load_dotenv
 
+from .catalog import load_published_catalog_sites
 from .cloudflare import (
     CloudflareD1Client,
     CloudflareD1MetadataStore,
@@ -88,6 +90,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="successful per-site check cadence in seconds (minimum 60)",
     )
     parser.add_argument("--batch-size", type=int, default=25)
+    parser.add_argument(
+        "--execution-concurrency",
+        type=int,
+        default=1,
+        help="maximum concurrently executed sitemap jobs within a claimed batch",
+    )
+    parser.add_argument(
+        "--catalog-sync",
+        action="store_true",
+        help="authoritatively sync safe published tools from Cloudflare D1",
+    )
+    parser.add_argument("--catalog-refresh-seconds", type=int, default=3_600)
+    parser.add_argument("--catalog-page-size", type=int, default=500)
     parser.add_argument("--max-attempts", type=int, default=5)
     parser.add_argument("--job-lease-seconds", type=int, default=900)
     parser.add_argument("--maintenance-interval-seconds", type=int, default=21_600)
@@ -103,6 +118,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--check-interval-seconds must be at least 60")
     if args.batch_size <= 0:
         parser.error("--batch-size must be positive")
+    if args.execution_concurrency <= 0 or args.execution_concurrency > args.batch_size:
+        parser.error("--execution-concurrency must be between 1 and --batch-size")
+    if args.catalog_refresh_seconds < 300:
+        parser.error("--catalog-refresh-seconds must be at least 300")
+    if args.catalog_page_size <= 0 or args.catalog_page_size > 1_000:
+        parser.error("--catalog-page-size must be between 1 and 1000")
     if args.max_attempts <= 0:
         parser.error("--max-attempts must be positive")
     if args.job_lease_seconds < 30:
@@ -176,8 +197,10 @@ async def run(args: argparse.Namespace) -> None:
         )
     sites = [*args.site, *file_sites, *configured_sites]
     sites = list(dict.fromkeys(sites))
-    if not sites:
+    if not sites and not args.catalog_sync:
         raise SystemExit("At least one --site or SITEMAP_MONITOR_SITES value is required.")
+    if args.catalog_sync and args.backend != "cloudflare":
+        raise SystemExit("--catalog-sync requires --backend cloudflare.")
 
     configured_paused_site_file = os.getenv(
         "SITEMAP_MONITOR_PAUSED_SITE_FILE", ""
@@ -208,6 +231,7 @@ async def run(args: argparse.Namespace) -> None:
 
     cloudflare_metadata: CloudflareD1MetadataStore | None = None
     cloudflare_objects: CloudflareR2ObjectStore | None = None
+    d1_client: CloudflareD1Client | None = None
     local_metadata: SqliteMetadataStore | None = None
     if args.backend == "cloudflare":
         cloudflare_objects = CloudflareR2ObjectStore(
@@ -250,6 +274,7 @@ async def run(args: argparse.Namespace) -> None:
         metadata,
         monitor,
         batch_size=args.batch_size,
+        execution_concurrency=args.execution_concurrency,
         explicit_sitemaps=args.sitemap,
         lease_owner=lease_owner,
         policy=SchedulerPolicy(
@@ -264,9 +289,36 @@ async def run(args: argparse.Namespace) -> None:
         ),
     )
     try:
-        await scheduler.pause_sites(paused_sites)
+        catalog_refresh_at = 0.0
+        if not args.catalog_sync:
+            await scheduler.pause_sites(paused_sites)
         while True:
-            tick = await scheduler.run_once(sites)
+            if args.catalog_sync and time.monotonic() >= catalog_refresh_at:
+                if d1_client is None:
+                    raise RuntimeError("Catalog sync requires a Cloudflare D1 client.")
+                snapshot = await load_published_catalog_sites(
+                    d1_client,
+                    page_size=args.catalog_page_size,
+                )
+                reconciliation = await scheduler.reconcile_sites(
+                    [*sites, *snapshot.homepage_urls],
+                    authoritative=True,
+                    paused_sites=paused_sites,
+                )
+                catalog_refresh_at = time.monotonic() + args.catalog_refresh_seconds
+                if not args.json:
+                    print(
+                        "sitemap catalog sync: "
+                        f"source_rows={snapshot.source_rows} "
+                        f"active={reconciliation.active_sites} "
+                        f"inserted={reconciliation.inserted_sites} "
+                        f"updated={reconciliation.updated_sites} "
+                        f"reactivated={reconciliation.reactivated_sites} "
+                        f"paused={reconciliation.paused_sites} "
+                        f"invalid_urls={snapshot.invalid_urls} "
+                        f"duplicate_origins={snapshot.duplicate_origins}"
+                    )
+            tick = await scheduler.run_once(() if args.catalog_sync else sites)
             if tick.maintenance.changed and not args.json:
                 print(
                     "sitemap maintenance: "

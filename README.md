@@ -98,13 +98,21 @@ docker compose -f docker-compose.dokploy.yml up -d
 | `pricing-monitor-worker` | `--pricing --loop` | paused by default; pricing snapshots/extractions/Claims shadow when explicitly enabled |
 | `taxonomy-worker` | `--taxonomy --loop` | production primary taxonomy automation |
 
-An additional `sitemap-monitor-worker` profile is defined with a safe-off default.
-Remote migrations `0060_sitemap_monitor_phase1.sql` and
-`0061_sitemap_comparability_gate.sql`, a private R2 bucket, a 30-site active
-observation cohort, and an 8-site ineligible quarantine have been prepared.
-Enable it explicitly with both
-`SITEMAP_MONITOR_ENABLED=1` and a non-zero `SITEMAP_MONITOR_REPLICAS`; the cohort is
-observation-only and does not publish Signals.
+An additional `sitemap-monitor-worker` profile is defined with a safe-off process
+gate. Once enabled with `SITEMAP_MONITOR_ENABLED=1` and a non-zero
+`SITEMAP_MONITOR_REPLICAS`, it authoritatively syncs every safe, non-duplicate,
+published tool from remote D1 once per hour. Newly published domains are registered,
+domains that leave the eligible catalog are paused, and previously paused domains are
+reactivated when eligible again. Explicit `SITEMAP_MONITOR_SITES` and optional site
+files remain supported as operator additions; an optional paused file overrides both
+catalog and manual sources.
+
+The initial catalog baseline is bounded by `SITEMAP_MONITOR_BATCH_SIZE` and
+`SITEMAP_MONITOR_EXECUTION_CONCURRENCY`; it does not create unbounded HTTP work.
+Sites without a usable sitemap remain registered and move through the existing
+24-hour, 72-hour, and seven-day failure cooldown instead of being permanently
+excluded. The historical 38-site observation files remain audit fixtures but are no
+longer production defaults.
 
 The compose file is intended for a Dokploy Compose project and intentionally exposes
 no HTTP ports. Give every service a stable, unique `RUNNER_INSTANCE_ID`; the defaults
@@ -115,9 +123,52 @@ overlap. Once all four services have healthy heartbeats, stop the old `--all` se
 `--all --loop` remains available only for rollback compatibility and logs a deprecation
 event. Do not add new production workloads to it.
 
-The taxonomy worker classifies active `pending_enrich`, `pending_review`, and `published`
-tools that have no terminal run for the current prompt. It runs primary classification
-only; capabilities remain optional and never block the primary category.
+The taxonomy worker incrementally classifies active `pending_enrich`, `pending_review`,
+and `published` tools. A verified or auto-accepted assignment to an active leaf is a
+trusted primary and is never reclassified merely because the prompt or provider changed.
+Only tools without such a primary enter the full profile/L1/leaf pipeline. Each eligible
+product can receive one stable primary market, up to three evidence-backed secondary
+markets, and up to twelve controlled capabilities. Capability assignments carry a
+`core`, `supporting`, or `integration` role inside `evidence_json`.
+
+By default (`TAXONOMY_BATCH_ENABLED=1`) all model work uses the OpenAI Batch API and
+the Responses API with strict Structured Outputs. One D1-backed state machine records
+the profile, L1, leaf, and capability stages, each JSONL request, the OpenAI batch/file
+IDs, and input/cached/output/reasoning token usage. Jobs can therefore wait up to the
+Batch API's 24-hour completion window and resume safely after a runner restart. Batch
+files are grouped by model because an OpenAI input file may contain only one model.
+An existing evidence-grounded profile from the current extractor version is reused,
+so those tools begin at L1 and avoid one model call. Requests also share stable prompt
+cache routing keys; actual cached-token hits are recorded per request rather than
+assumed in the cost estimate.
+
+`gpt-5.6-luna` handles the normal path. L1 uses low reasoning, profile and capability
+use medium reasoning, and the primary leaf uses high reasoning. A missing or weak
+answer, absent grounded leaf evidence, leaf confidence below `0.60`, or an L1 Top-2
+gap below `0.08` escalates only that item to `gpt-5.6-terra` with high reasoning. A
+tool that still has no valid leaf after escalation is explicitly stored as
+`needs_review`; it is not silently treated as a successful classification.
+
+The worker accepts either the standard `OPENAI_API_KEY` variable or the existing
+`OPENAI_API` variable. `TAXONOMY_BATCH_ENABLED=0` is the rollback switch for the old
+synchronous provider path. D1 migrations `0077_openai_taxonomy_batch.sql` and
+`0079_taxonomy_batch_retry.sql` must be applied before enabling the Batch worker.
+They create the persistent Batch tables and the bounded retry state respectively.
+
+Capability classification is enabled by `TAXONOMY_CAPABILITIES_ENABLED=1`. It does not
+send all active capability terms to the model: the worker deterministically recalls at
+most `TAXONOMY_CAPABILITY_CANDIDATE_LIMIT` terms (default `96`) from the selected market
+leaves and grounded product profile, then makes one capability model call. Set the
+capability switch to `0` as an independent cost kill switch. A capability provider
+failure never removes prior assignments or invalidates a successfully selected primary.
+
+`TAXONOMY_CAPABILITY_BACKFILL_ENABLED=1` gradually fills tools that already have a
+stored grounded profile but no active capabilities. For a tool with a trusted primary,
+backfill preserves that primary, reuses the profile, skips homepage/profile/L1/leaf model
+calls, and makes only the single bounded capability call. Tools whose profiles contain no
+grounded capability evidence are left for evidence refresh instead of being sent through
+full classification. Backfill batches always wait for the normal taxonomy interval even
+when full; set this switch to `0` independently while comparing classification LLMs.
 
 Successful leaves at or above `TAXONOMY_AUTO_ACCEPT_CONFIDENCE` (default `0.50`)
 are stored as `auto_accepted` and are immediately available to product detail
@@ -130,10 +181,23 @@ continue immediately while work remains; the worker waits 5 minutes only after a
 partial or empty batch indicates that the current backlog is drained. A
 billing, quota, rate-limit, or authentication response trips a batch circuit
 breaker and backs taxonomy off for 6 hours. Set `TAXONOMY_AUTO_ENABLED=0` as the
-emergency kill switch. Genuine failed runs retry at most three times; succeeded,
-partial, and skipped results are not repeatedly charged. Failed-run budgets are
+emergency kill switch. Genuine failures receive at most three total attempts;
+succeeded, partial, and skipped results are not repeatedly charged. Failed-run budgets are
 scoped to the active primary model, so switching providers can recover previously
 exhausted tools without deleting their audit history.
+
+Homepage acquisition and retryable OpenAI stage failures use persistent exponential
+backoff. `OPENAI_TAXONOMY_MAX_ATTEMPTS` defaults to `3` total attempts, including the
+first, and `OPENAI_TAXONOMY_RETRY_BASE_SECONDS` defaults to `300` seconds (then 600
+seconds). Retry state survives process restarts. Only an exhausted item enters review;
+deterministic request defects are not repeatedly submitted, and a late result from an
+older attempt cannot overwrite a newer attempt.
+
+Leaf transport/provider exceptions are stored as `failed` and remain retryable. A
+semantic no-fit response is stored as `partial` for review. Either case preserves the
+last valid automatic primary; old assignments are superseded only after a replacement
+has been written. Browser extensions and standalone apps are product-eligible alongside
+independent web products.
 
 The paid stale-`non_product` incident recheck is frozen by default. When explicitly
 enabled, it selects published tools whose labels were written automatically and have

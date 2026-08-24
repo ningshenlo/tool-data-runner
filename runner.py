@@ -248,11 +248,29 @@ class Config:
     pricing_timeout_seconds: int
     taxonomy_auto_enabled: bool
     taxonomy_recheck_auto_non_product: bool
+    taxonomy_capabilities_enabled: bool
+    taxonomy_capability_backfill_enabled: bool
+    taxonomy_capability_candidate_limit: int
     taxonomy_limit: int
     taxonomy_interval_seconds: int
     taxonomy_concurrency: int
     taxonomy_auto_accept_confidence: float
     taxonomy_provider_backoff_seconds: int
+    taxonomy_batch_enabled: bool
+    taxonomy_batch_model: str
+    taxonomy_batch_escalation_model: str
+    taxonomy_batch_profile_reasoning_effort: str
+    taxonomy_batch_l1_reasoning_effort: str
+    taxonomy_batch_leaf_reasoning_effort: str
+    taxonomy_batch_capability_reasoning_effort: str
+    taxonomy_batch_escalation_reasoning_effort: str
+    taxonomy_batch_max_output_tokens: int
+    taxonomy_batch_request_limit: int
+    taxonomy_batch_timeout_seconds: int
+    taxonomy_batch_max_attempts: int
+    taxonomy_batch_retry_base_seconds: int
+    taxonomy_batch_leaf_min_confidence: float
+    taxonomy_batch_l1_min_gap: float
     pricing_claims_shadow: bool
     pricing_claims_publish: bool
     openai_api_key: str
@@ -774,6 +792,16 @@ def load_config(require_brightdata: bool = True) -> Config:
         taxonomy_recheck_auto_non_product=read_bool_env(
             "TAXONOMY_RECHECK_AUTO_NON_PRODUCT", False
         ),
+        taxonomy_capabilities_enabled=read_bool_env(
+            "TAXONOMY_CAPABILITIES_ENABLED", True
+        ),
+        taxonomy_capability_backfill_enabled=read_bool_env(
+            "TAXONOMY_CAPABILITY_BACKFILL_ENABLED", True
+        ),
+        taxonomy_capability_candidate_limit=min(
+            160,
+            max(12, read_int_env("TAXONOMY_CAPABILITY_CANDIDATE_LIMIT", 96)),
+        ),
         taxonomy_limit=max(1, read_int_env("RUNNER_TAXONOMY_LIMIT", 50)),
         taxonomy_interval_seconds=max(
             300, read_int_env("RUNNER_TAXONOMY_INTERVAL_SECONDS", 300)
@@ -787,6 +815,59 @@ def load_config(require_brightdata: bool = True) -> Config:
         ),
         taxonomy_provider_backoff_seconds=max(
             900, read_int_env("RUNNER_TAXONOMY_PROVIDER_BACKOFF_SECONDS", 21600)
+        ),
+        taxonomy_batch_enabled=read_bool_env("TAXONOMY_BATCH_ENABLED", True),
+        taxonomy_batch_model=(
+            os.getenv("OPENAI_TAXONOMY_MODEL", "gpt-5.6-luna").strip()
+            or "gpt-5.6-luna"
+        ),
+        taxonomy_batch_escalation_model=(
+            os.getenv("OPENAI_TAXONOMY_ESCALATION_MODEL", "gpt-5.6-terra").strip()
+            or "gpt-5.6-terra"
+        ),
+        taxonomy_batch_profile_reasoning_effort=os.getenv(
+            "OPENAI_TAXONOMY_PROFILE_REASONING_EFFORT", "medium"
+        ).strip(),
+        taxonomy_batch_l1_reasoning_effort=os.getenv(
+            "OPENAI_TAXONOMY_L1_REASONING_EFFORT", "low"
+        ).strip(),
+        taxonomy_batch_leaf_reasoning_effort=os.getenv(
+            "OPENAI_TAXONOMY_LEAF_REASONING_EFFORT", "high"
+        ).strip(),
+        taxonomy_batch_capability_reasoning_effort=os.getenv(
+            "OPENAI_TAXONOMY_CAPABILITY_REASONING_EFFORT", "medium"
+        ).strip(),
+        taxonomy_batch_escalation_reasoning_effort=os.getenv(
+            "OPENAI_TAXONOMY_ESCALATION_REASONING_EFFORT", "high"
+        ).strip(),
+        taxonomy_batch_max_output_tokens=min(
+            16384,
+            max(1024, read_int_env("OPENAI_TAXONOMY_MAX_OUTPUT_TOKENS", 4096)),
+        ),
+        taxonomy_batch_request_limit=min(
+            50000,
+            max(1, read_int_env("OPENAI_TAXONOMY_BATCH_REQUEST_LIMIT", 500)),
+        ),
+        taxonomy_batch_timeout_seconds=max(
+            30, read_int_env("OPENAI_TAXONOMY_TIMEOUT_SECONDS", 90)
+        ),
+        taxonomy_batch_max_attempts=min(
+            10, max(1, read_int_env("OPENAI_TAXONOMY_MAX_ATTEMPTS", 3))
+        ),
+        taxonomy_batch_retry_base_seconds=min(
+            21600,
+            max(30, read_int_env("OPENAI_TAXONOMY_RETRY_BASE_SECONDS", 300)),
+        ),
+        taxonomy_batch_leaf_min_confidence=min(
+            1.0,
+            max(
+                0.35,
+                read_float_env("OPENAI_TAXONOMY_LEAF_MIN_CONFIDENCE", 0.60),
+            ),
+        ),
+        taxonomy_batch_l1_min_gap=min(
+            1.0,
+            max(0.0, read_float_env("OPENAI_TAXONOMY_L1_MIN_GAP", 0.08)),
         ),
         pricing_claims_shadow=read_bool_env("PRICING_CLAIMS_SHADOW", False),
         pricing_claims_publish=read_bool_env("PRICING_CLAIMS_PUBLISH", False),
@@ -12687,6 +12768,15 @@ async def run_taxonomy_once(config: Config) -> dict[str, int]:
         return {"disabled": 1}
 
     async def operation() -> dict[str, int]:
+        # Older tests and maintenance callers may pass a lightweight config
+        # object without this field; only the real loaded Config opts in.
+        if getattr(config, "taxonomy_batch_enabled", False):
+            from taxonomy_batch import run_openai_taxonomy_batch_once
+
+            return await run_openai_taxonomy_batch_once(
+                config,
+                config.taxonomy_limit,
+            )
         # Import inside the telemetered operation so packaging/import failures
         # are visible as failed taxonomy runs instead of disappearing in logs.
         from taxonomy_shadow import run_shadow_taxonomy
@@ -12698,7 +12788,15 @@ async def run_taxonomy_once(config: Config) -> dict[str, int]:
             include_auto_non_product_recheck=getattr(
                 config, "taxonomy_recheck_auto_non_product", True
             ),
-            include_capabilities=False,
+            include_capabilities=getattr(
+                config, "taxonomy_capabilities_enabled", True
+            ),
+            include_capability_backfill=getattr(
+                config, "taxonomy_capability_backfill_enabled", True
+            ),
+            capability_candidate_limit=getattr(
+                config, "taxonomy_capability_candidate_limit", 96
+            ),
             concurrency=config.taxonomy_concurrency,
             auto_accept_threshold=config.taxonomy_auto_accept_confidence,
         )
@@ -12719,6 +12817,13 @@ def taxonomy_next_delay_seconds(config: Config, counts: dict[str, int]) -> int:
     if int(counts.get("auto_non_product_recheck_selected") or 0) > 0:
         # Incident repair is intentionally paced so operators can inspect each
         # batch and trip the kill switch before another provider-cost burst.
+        return int(config.taxonomy_interval_seconds)
+    if (
+        int(counts.get("capability_backfill_selected") or 0) > 0
+        or int(counts.get("capability_only_selected") or 0) > 0
+    ):
+        # Backfill is deliberately paced: one bounded model call per stored
+        # profile, with an operator-visible interval between paid batches.
         return int(config.taxonomy_interval_seconds)
     if int(counts.get("selected") or 0) >= int(config.taxonomy_limit):
         return 0
@@ -12748,6 +12853,15 @@ def taxonomy_batch_has_activity(counts: dict[str, int]) -> bool:
         "auto_non_product_recheck_failed",
         "auto_non_product_recheck_skipped",
         "auto_non_product_recheck_deferred",
+        "batches_submitted",
+        "batches_completed",
+        "batch_requests_completed",
+        "batch_requests_failed",
+        "submit_failed",
+        "submit_retries_scheduled",
+        "model_retries_resumed",
+        "source_retry_scheduled",
+        "source_retry_exhausted",
     )
     return any(int(counts.get(field) or 0) > 0 for field in activity_fields)
 
@@ -13462,6 +13576,7 @@ def main() -> None:
                 allow_unresolved_entity=args.allow_unresolved_entity,
                 after_tool_id=args.after_tool_id,
                 include_capabilities=not args.primary_only,
+                capability_candidate_limit=config.taxonomy_capability_candidate_limit,
                 concurrency=args.shadow_concurrency,
                 auto_accept_threshold=config.taxonomy_auto_accept_confidence,
             )

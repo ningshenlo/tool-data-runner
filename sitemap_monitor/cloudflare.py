@@ -20,6 +20,7 @@ from .models import (
     ComparabilityResult,
     DueSite,
     MaintenanceResult,
+    RegisteredSite,
     ResourceState,
     SitemapJob,
     SiteScanSnapshot,
@@ -358,21 +359,21 @@ class CloudflareD1MetadataStore:
             pruned_jobs=len(results[3].get("results") or []),
         )
 
-    async def ensure_site(
-        self,
+    @staticmethod
+    def _ensure_site_statement(
         site_id: str,
         homepage_url: str,
         now_ms: int,
         *,
         check_interval_sec: int | None = None,
-    ) -> None:
+    ) -> tuple[str, list[object]]:
         from urllib.parse import urlsplit
 
         domain = (urlsplit(homepage_url).hostname or "").lower()
         interval = check_interval_sec or 21_600
         if interval <= 0:
             raise ValueError("check_interval_sec must be positive.")
-        await self.client.query(
+        return (
             """
             INSERT INTO sitemap_sites (
                 id, domain, homepage_url, check_interval_sec, next_check_at,
@@ -440,6 +441,77 @@ class CloudflareD1MetadataStore:
                 check_interval_sec,
             ],
         )
+
+    async def ensure_site(
+        self,
+        site_id: str,
+        homepage_url: str,
+        now_ms: int,
+        *,
+        check_interval_sec: int | None = None,
+    ) -> None:
+        sql, params = self._ensure_site_statement(
+            site_id,
+            homepage_url,
+            now_ms,
+            check_interval_sec=check_interval_sec,
+        )
+        await self.client.query(sql, params)
+
+    async def ensure_sites(
+        self,
+        sites: tuple[tuple[str, str], ...],
+        now_ms: int,
+        *,
+        check_interval_sec: int,
+    ) -> None:
+        statements = [
+            self._ensure_site_statement(
+                site_id,
+                homepage_url,
+                now_ms,
+                check_interval_sec=check_interval_sec,
+            )
+            for site_id, homepage_url in sites
+        ]
+        for index in range(0, len(statements), 100):
+            await self.client.batch(statements[index : index + 100])
+
+    async def list_registered_sites(self) -> tuple[RegisteredSite, ...]:
+        rows: list[RegisteredSite] = []
+        cursor_id = ""
+        while True:
+            result = await self.client.query(
+                """
+                SELECT id, homepage_url, check_interval_sec, status
+                FROM sitemap_sites
+                WHERE id > ?
+                ORDER BY id
+                LIMIT 1000
+                """,
+                [cursor_id],
+            )
+            page = result.get("results") or []
+            if not isinstance(page, list):
+                raise CloudflareApiError("Cloudflare D1 returned invalid sitemap site rows.")
+            for row in page:
+                if not isinstance(row, dict):
+                    raise CloudflareApiError("Cloudflare D1 returned an invalid sitemap site row.")
+                site_id = str(row.get("id") or "")
+                if not site_id or site_id <= cursor_id:
+                    raise CloudflareApiError("Sitemap site cursor did not advance.")
+                cursor_id = site_id
+                rows.append(
+                    RegisteredSite(
+                        check_interval_sec=int(row.get("check_interval_sec") or 0),
+                        homepage_url=str(row.get("homepage_url") or ""),
+                        site_id=site_id,
+                        status=row["status"],
+                    )
+                )
+            if len(page) < 1_000:
+                break
+        return tuple(rows)
 
     async def set_site_status(
         self,

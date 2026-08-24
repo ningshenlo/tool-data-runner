@@ -11,6 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 import httpx
 
+from sitemap_monitor.catalog import load_published_catalog_sites
 from sitemap_monitor.cloudflare import (
     CloudflareD1Client,
     CloudflareD1MetadataStore,
@@ -846,6 +847,50 @@ class SchedulerStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(reactivated["schedule_version"], before + 2)
         self.assertEqual(reactivated["next_check_at"], 3_000)
 
+    async def test_authoritative_catalog_reconciliation_adds_reactivates_and_pauses(self) -> None:
+        old_homepage = "https://old.example/"
+        returning_homepage = "https://returning.example/"
+        old_site_id = site_id_for(old_homepage)
+        returning_site_id = site_id_for(returning_homepage)
+        await self.store.ensure_site(old_site_id, old_homepage, 1_000)
+        await self.store.ensure_site(returning_site_id, returning_homepage, 1_000)
+        await self.store.set_site_status(
+            returning_site_id,
+            "paused",
+            2_000,
+            from_status="active",
+        )
+        objects = FileObjectStore(Path(self.temporary.name) / "objects")
+        monitor = SitemapMonitor(self.store, objects)
+        scheduler = SitemapScheduler(
+            self.store,
+            monitor,
+            batch_size=5,
+            clock_ms=lambda: 3_000,
+            policy=SchedulerPolicy(check_interval_sec=3_600),
+        )
+        try:
+            result = await scheduler.reconcile_sites(
+                [returning_homepage, "https://new.example/"],
+                authoritative=True,
+            )
+        finally:
+            await monitor.close()
+
+        rows = {
+            row["domain"]: row["status"]
+            for row in self.store.connection.execute(
+                "SELECT domain, status FROM sitemap_sites"
+            )
+        }
+        self.assertEqual(result.active_sites, 2)
+        self.assertEqual(result.inserted_sites, 1)
+        self.assertEqual(result.reactivated_sites, 1)
+        self.assertEqual(result.paused_sites, 2)
+        self.assertEqual(rows["old.example"], "paused")
+        self.assertEqual(rows["returning.example"], "active")
+        self.assertEqual(rows["new.example"], "active")
+
     async def test_due_claim_job_idempotency_and_fenced_completion(self) -> None:
         due, first_job = await self._new_job()
         duplicate = await self.store.ensure_job(due, max_attempts=5, now_ms=1_001)
@@ -1414,6 +1459,39 @@ class SchedulerIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 store.close()
 
 
+class CatalogSyncTests(unittest.IsolatedAsyncioTestCase):
+    async def test_catalog_loader_pages_filters_and_deduplicates_origins(self) -> None:
+        client = SqliteD1ClientDouble()
+        client.connection.executescript(
+            """
+            CREATE TABLE tools (
+                id INTEGER PRIMARY KEY,
+                official_url TEXT NOT NULL,
+                normalized_domain TEXT NOT NULL,
+                status TEXT NOT NULL,
+                content_safety_status TEXT NOT NULL,
+                duplicate_of_tool_id INTEGER
+            );
+            INSERT INTO tools VALUES
+                (1, 'https://example.com/product?ref=catalog', 'example.com', 'published', 'safe', NULL),
+                (2, 'https://www.example.com/', 'example.com', 'published', 'safe', NULL),
+                (3, 'https://unsafe.example/', 'unsafe.example', 'published', 'nsfw', NULL),
+                (4, 'https://duplicate.example/', 'duplicate.example', 'published', 'safe', 1),
+                (5, 'https://example.com/other', 'alias.example', 'published', 'safe', NULL),
+                (6, 'file:///not-public', '127.0.0.1', 'published', 'safe', NULL);
+            """
+        )
+        try:
+            snapshot = await load_published_catalog_sites(client, page_size=2)
+        finally:
+            client.connection.close()
+
+        self.assertEqual(snapshot.homepage_urls, ("https://example.com/",))
+        self.assertEqual(snapshot.source_rows, 3)
+        self.assertEqual(snapshot.duplicate_origins, 1)
+        self.assertEqual(snapshot.invalid_urls, 1)
+
+
 class DeploymentBoundaryTests(unittest.TestCase):
     def test_cli_accepts_repeatable_site_files(self) -> None:
         args = parse_args([
@@ -1424,6 +1502,9 @@ class DeploymentBoundaryTests(unittest.TestCase):
         self.assertEqual(args.paused_site_file, ["paused.txt"])
         self.assertEqual(args.check_interval_seconds, 21_600)
         self.assertEqual(args.run_detail_retention_days, 7)
+        self.assertEqual(args.execution_concurrency, 1)
+        self.assertEqual(args.catalog_refresh_seconds, 3_600)
+        self.assertEqual(args.catalog_page_size, 500)
 
     def test_formal_migration_builds_only_phase_one_metadata_tables(self) -> None:
         migration = (
@@ -1489,9 +1570,13 @@ class DeploymentBoundaryTests(unittest.TestCase):
         self.assertIn("${SITEMAP_MONITOR_CHECK_INTERVAL_SECONDS:-21600}", service)
         self.assertIn("${SITEMAP_MONITOR_RUN_DETAIL_RETENTION_DAYS:-7}", service)
         self.assertIn("${SITEMAP_MONITOR_MAINTENANCE_BATCH_SIZE:-500}", service)
+        self.assertIn("- --catalog-sync", service)
+        self.assertIn("${SITEMAP_MONITOR_CATALOG_REFRESH_SECONDS:-3600}", service)
+        self.assertIn("${SITEMAP_MONITOR_CATALOG_PAGE_SIZE:-500}", service)
+        self.assertIn("${SITEMAP_MONITOR_EXECUTION_CONCURRENCY:-8}", service)
         self.assertIn("SITEMAP_MONITOR_ENABLED: ${SITEMAP_MONITOR_ENABLED:-0}", service)
         self.assertIn(
-            "SITEMAP_MONITOR_PAUSED_SITE_FILE: ${SITEMAP_MONITOR_PAUSED_SITE_FILE:-sitemap_monitor/observation-cohort-v1-paused.txt}",
+            "SITEMAP_MONITOR_PAUSED_SITE_FILE: ${SITEMAP_MONITOR_PAUSED_SITE_FILE:-}",
             service,
         )
         self.assertIn(
@@ -1587,6 +1672,25 @@ class CloudflareMetadataAdapterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(row["status"], "active")
         self.assertEqual(row["schedule_version"], before + 2)
         self.assertEqual(row["next_check_at"], 3_000)
+
+    async def test_d1_adapter_bulk_registers_and_lists_catalog_sites(self) -> None:
+        client = SqliteD1ClientDouble()
+        store = CloudflareD1MetadataStore(client)  # type: ignore[arg-type]
+        registrations = tuple(
+            (site_id_for(url), url)
+            for url in ("https://one.example/", "https://two.example/")
+        )
+        await store.ensure_sites(
+            registrations,
+            1_000,
+            check_interval_sec=3_600,
+        )
+        sites = await store.list_registered_sites()
+        client.connection.close()
+
+        self.assertEqual(len(sites), 2)
+        self.assertEqual({site.status for site in sites}, {"active"})
+        self.assertEqual({site.check_interval_sec for site in sites}, {3_600})
 
     async def test_d1_failure_completion_is_retry_safe_and_idempotent(self) -> None:
         client = SqliteD1ClientDouble()

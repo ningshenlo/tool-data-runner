@@ -19,8 +19,11 @@ from taxonomy_shadow import (
     capability_retry_terms,
     capabilities_prompt,
     catalog_from_rows,
+    classify_capability_profile_shadow,
     classify_tool_shadow,
     decide_primary_status,
+    evidence_quote_is_grounded,
+    load_capability_backfill_tasks,
     load_shadow_tasks,
     merge_capability_decisions,
     normalize_evidence_items,
@@ -28,8 +31,10 @@ from taxonomy_shadow import (
     parse_capabilities,
     parse_entity_decision,
     parse_leaf_decision,
+    parse_secondary_leaf_decisions,
     parse_top2_l1,
     profile_has_signal,
+    recall_capability_candidates,
     resolve_entity_decision,
 )
 
@@ -51,6 +56,7 @@ def _catalog():
             "name": "text to video",
             "parent_id": 1,
             "parent_slug": "video",
+            "includes": "text to video; image to video",
             "taxonomy_version": 1,
         },
         {
@@ -68,6 +74,7 @@ def _catalog():
             "name": "image generation",
             "parent_id": 3,
             "parent_slug": "image",
+            "includes": "image generation; background removal",
             "taxonomy_version": 1,
         },
         {
@@ -139,6 +146,28 @@ class CatalogVersionTests(unittest.TestCase):
 
 
 class ShadowTaskSourceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_capability_backfill_reuses_profiles_and_targets_undercoverage(self):
+        observed: dict[str, object] = {}
+
+        class FakeD1:
+            async def query(self, sql, params):
+                observed["sql"] = sql
+                observed["params"] = params
+                return []
+
+        await load_capability_backfill_tasks(
+            FakeD1(),
+            limit=25,
+            retry_model_name="test-model",
+        )
+
+        sql = str(observed["sql"])
+        self.assertIn("JOIN product_profiles", sql)
+        self.assertIn("'capability_backfill' AS selection_reason", sql)
+        self.assertIn("< 3", sql)
+        self.assertIn("'app_or_extension'", sql)
+        self.assertIn("failed_run.model_name = ?", sql)
+
     async def test_task_query_prefers_explicit_verified_taxonomy_evidence_source(self):
         observed: dict[str, object] = {}
 
@@ -520,6 +549,68 @@ class EntityDecisionTests(unittest.TestCase):
         self.assertEqual(decision["source"], "manual")
 
 
+class CapabilityBackfillPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def test_backfill_reuses_profile_and_makes_only_one_model_call(self):
+        stages: list[str] = []
+
+        class FakeD1:
+            async def query(self, sql, params):
+                return [{"term_id": 2}]
+
+        class FakeBrowser:
+            def category_custom_ai(self):
+                return [{"model": "candidate-model"}]
+
+            async def fetch_homepage_content(self, task):
+                raise AssertionError("capability backfill must not refetch the homepage")
+
+            async def fetch_structured_text_data(
+                self, *, source_url, stage, prompt, json_schema, custom_ai, **kwargs
+            ):
+                stages.append(stage)
+                return source_url, {
+                    "capability_slugs": [
+                        {
+                            "slug": "text-to-video",
+                            "role": "core",
+                            "confidence": 0.9,
+                            "evidence": [{"quote": "Turn text into video"}],
+                        }
+                    ]
+                }
+
+        result = await classify_capability_profile_shadow(
+            d1=FakeD1(),
+            browser_client=FakeBrowser(),
+            task=AssetTask(
+                tool_id=122,
+                canonical_slug="stored-profile",
+                normalized_domain="stored.test",
+                official_url="https://stored.test/",
+                attempts=0,
+                max_attempts=1,
+                generation=0,
+                lease_token="test-shadow",
+            ),
+            catalog=_catalog(),
+            profile={
+                "source_url": "https://stored.test/",
+                "capabilities_raw": [
+                    {
+                        "value": "text to video",
+                        "evidence": [{"quote": "Turn text into video"}],
+                    }
+                ],
+            },
+            dry_run=True,
+            capability_candidate_limit=24,
+        )
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(stages, ["shadow_capabilities_backfill"])
+        self.assertEqual(result.capability_slugs, ["text-to-video"])
+
+
 class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_primary_only_never_calls_capability_stages(self):
         stages: list[str] = []
@@ -613,6 +704,165 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.raw["profile_extraction_path"], "cleaned_main_content")
         self.assertEqual(result.raw["classification_transport"], "cleaned_main_content_only")
         self.assertEqual(result.raw["capabilities_skipped"], "primary_only")
+
+    async def test_capabilities_use_one_bounded_call_and_keep_roles(self):
+        stages: list[str] = []
+
+        class FakeBrowser:
+            def category_custom_ai(self):
+                return [{"model": "fake-model"}]
+
+            async def fetch_homepage_content(self, task):
+                return task.official_url, (
+                    "<html><body><h1>Turn text into video</h1>"
+                    "<p>Generate videos from text in one click.</p>"
+                    "<a href='/signup'>Start for free</a></body></html>"
+                )
+
+            async def fetch_structured_text_data(
+                self, *, source_url, stage, prompt, json_schema, custom_ai, **kwargs
+            ):
+                stages.append(stage)
+                if stage == "shadow_profile_main_content":
+                    return source_url, {
+                        "entity_kind": "independent_product",
+                        "entity_confidence": 0.95,
+                        "entity_reason": "Dedicated product",
+                        "entity_evidence": [{"quote": "Start for free"}],
+                        "primary_job": {
+                            "value": "Generate videos",
+                            "evidence": [{"quote": "Generate videos from text in one click."}],
+                        },
+                        "primary_outputs": [],
+                        "capabilities_raw": [
+                            {
+                                "value": "text to video",
+                                "evidence": [{"quote": "Turn text into video"}],
+                            }
+                        ],
+                    }
+                if stage == "shadow_l1_top2":
+                    return source_url, {
+                        "l1_candidates": [
+                            {"slug": "video", "confidence": 0.9, "reason": "market"}
+                        ]
+                    }
+                if stage == "shadow_leaf":
+                    return source_url, {
+                        "leaf_slug": "text-to-video",
+                        "confidence": 0.88,
+                        "reason": "primary job",
+                        "evidence": [{"quote": "Generate videos from text in one click."}],
+                        "secondary_leaves": [],
+                    }
+                if stage == "shadow_capabilities":
+                    if "text-to-video" not in prompt:
+                        raise AssertionError("bounded whitelist omitted text-to-video")
+                    return source_url, {
+                        "capability_slugs": [
+                            {
+                                "slug": "text-to-video",
+                                "role": "core",
+                                "confidence": 0.9,
+                                "evidence": [{"quote": "Turn text into video"}],
+                            }
+                        ]
+                    }
+                raise AssertionError(f"unexpected stage: {stage}")
+
+        result = await classify_tool_shadow(
+            d1=object(),
+            browser_client=FakeBrowser(),
+            task=AssetTask(
+                tool_id=124,
+                canonical_slug="capability-example",
+                normalized_domain="capability.test",
+                official_url="https://capability.test/",
+                attempts=0,
+                max_attempts=1,
+                generation=0,
+                lease_token="test-shadow",
+            ),
+            catalog=_catalog(),
+            dry_run=True,
+            include_capabilities=True,
+            capability_candidate_limit=24,
+        )
+
+        self.assertEqual(result.status, "succeeded")
+        self.assertEqual(stages.count("shadow_capabilities"), 1)
+        self.assertEqual(result.capability_slugs, ["text-to-video"])
+        self.assertEqual(result.raw["capabilities_accepted"][0]["role"], "core")
+        self.assertLessEqual(
+            result.raw["capability_candidate_recall"]["candidate_count"], 24
+        )
+
+    async def test_leaf_transport_failure_is_retryable_and_skips_capability_cost(self):
+        stages: list[str] = []
+
+        class FakeBrowser:
+            def category_custom_ai(self):
+                return [{"model": "fake-model"}]
+
+            async def fetch_homepage_content(self, task):
+                return task.official_url, (
+                    "<html><body><h1>Turn text into video</h1>"
+                    "<a href='/signup'>Start for free</a></body></html>"
+                )
+
+            async def fetch_structured_text_data(
+                self, *, source_url, stage, prompt, json_schema, custom_ai, **kwargs
+            ):
+                stages.append(stage)
+                if stage == "shadow_profile_main_content":
+                    return source_url, {
+                        "entity_kind": "independent_product",
+                        "entity_confidence": 0.95,
+                        "entity_reason": "Dedicated product",
+                        "entity_evidence": [{"quote": "Start for free"}],
+                        "primary_job": {
+                            "value": "Generate videos",
+                            "evidence": [{"quote": "Turn text into video"}],
+                        },
+                        "primary_outputs": [],
+                        "capabilities_raw": [
+                            {
+                                "value": "text to video",
+                                "evidence": [{"quote": "Turn text into video"}],
+                            }
+                        ],
+                    }
+                if stage == "shadow_l1_top2":
+                    return source_url, {
+                        "l1_candidates": [
+                            {"slug": "video", "confidence": 0.9, "reason": "market"}
+                        ]
+                    }
+                if stage == "shadow_leaf":
+                    raise RuntimeError("provider connection reset")
+                raise AssertionError(f"unexpected stage: {stage}")
+
+        result = await classify_tool_shadow(
+            d1=object(),
+            browser_client=FakeBrowser(),
+            task=AssetTask(
+                tool_id=129,
+                canonical_slug="retry-leaf",
+                normalized_domain="retry.test",
+                official_url="https://retry.test/",
+                attempts=0,
+                max_attempts=1,
+                generation=0,
+                lease_token="test-shadow",
+            ),
+            catalog=_catalog(),
+            dry_run=True,
+            include_capabilities=True,
+        )
+
+        self.assertEqual(result.status, "failed")
+        self.assertIn("leaf_failed", result.error)
+        self.assertNotIn("shadow_capabilities", stages)
 
     async def test_cursor_kimi_example_domain_evidence_fails_closed(self):
         stages: list[str] = []
@@ -1004,6 +1254,21 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ProfileEvidenceTests(unittest.TestCase):
+    def test_grounding_tolerates_only_rendering_punctuation_drift(self):
+        source = "Build — deploy, and monitor AI models in production."
+        self.assertTrue(
+            evidence_quote_is_grounded(
+                "Build - deploy and monitor AI models in production",
+                source,
+            )
+        )
+        self.assertFalse(
+            evidence_quote_is_grounded(
+                "Monitor models before building and deploying them",
+                source,
+            )
+        )
+
     def test_rejects_bare_string_without_evidence(self):
         self.assertIsNone(normalize_evidenced_value("Generate videos"))
 
@@ -1191,8 +1456,70 @@ class PrimaryTop2Tests(unittest.TestCase):
             )
         )
 
+    def test_parses_distinct_grounded_secondary_markets(self):
+        catalog = _catalog()
+        hits = parse_top2_l1(
+            {
+                "l1_candidates": [
+                    {"slug": "video", "confidence": 0.9, "reason": "main"},
+                    {"slug": "image", "confidence": 0.7, "reason": "secondary"},
+                ]
+            },
+            catalog,
+        )
+        pool = build_leaf_candidate_pool(hits, catalog)
+        decisions = parse_secondary_leaf_decisions(
+            {
+                "secondary_leaves": [
+                    {
+                        "slug": "image-generation",
+                        "confidence": 0.72,
+                        "reason": "also generates images",
+                        "evidence": [{"quote": "Generate images and videos"}],
+                    },
+                    {
+                        "slug": "text-to-video",
+                        "confidence": 0.8,
+                        "reason": "duplicate primary",
+                        "evidence": [{"quote": "Generate images and videos"}],
+                    },
+                ]
+            },
+            pool,
+            catalog,
+            primary_slug="text-to-video",
+            source_text="Generate images and videos",
+        )
+        self.assertEqual(
+            [decision["term"].slug for decision in decisions],
+            ["image-generation"],
+        )
+
 
 class CapabilityTests(unittest.TestCase):
+    def test_recalls_market_atomic_tasks_and_profile_matches_with_a_hard_limit(self):
+        catalog = _catalog()
+        market = catalog.get("primary_category", "text-to-video")
+        assert market is not None
+        candidates = recall_capability_candidates(
+            {
+                "capabilities_raw": [
+                    {
+                        "value": "Generate code and video",
+                        "evidence": [{"quote": "Generate code and video"}],
+                    }
+                ]
+            },
+            catalog,
+            markets=[market],
+            limit=12,
+        )
+        slugs = [term.slug for term in candidates]
+        self.assertIn("text-to-video", slugs)
+        self.assertIn("image-to-video", slugs)
+        self.assertIn("code-generation", slugs)
+        self.assertLessEqual(len(slugs), 12)
+
     def test_capability_terms_are_chunked_without_loss(self):
         terms = [
             TaxonomyTerm(
@@ -1301,6 +1628,34 @@ class CapabilityTests(unittest.TestCase):
             source_url="https://example.com/",
         )
         self.assertEqual([c["term"].slug for c in caps], ["text-to-video"])
+        self.assertEqual(caps[0]["role"], "supporting")
+
+    def test_capability_role_and_grounded_evidence_are_preserved(self):
+        catalog = _catalog()
+        caps = parse_capabilities(
+            {
+                "capability_slugs": [
+                    {
+                        "slug": "text-to-video",
+                        "role": "core",
+                        "confidence": 0.91,
+                        "evidence": [{"quote": "Turn text into video"}],
+                    },
+                    {
+                        "slug": "image-to-video",
+                        "role": "supporting",
+                        "confidence": 0.8,
+                        "evidence": [{"quote": "Not on the homepage"}],
+                    },
+                ]
+            },
+            catalog,
+            source_text="Turn text into video in one click",
+        )
+        self.assertEqual(
+            [(cap["term"].slug, cap["role"]) for cap in caps],
+            [("text-to-video", "core")],
+        )
 
     def test_bare_string_capabilities_are_retry_candidates_not_assignments(self):
         catalog = _catalog()

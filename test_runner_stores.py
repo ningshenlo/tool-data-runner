@@ -915,6 +915,9 @@ class WorkerControlTests(unittest.IsolatedAsyncioTestCase):
             {
                 "taxonomy_auto_enabled": True,
                 "taxonomy_recheck_auto_non_product": True,
+                "taxonomy_capabilities_enabled": True,
+                "taxonomy_capability_backfill_enabled": True,
+                "taxonomy_capability_candidate_limit": 96,
                 "taxonomy_limit": 50,
                 "taxonomy_concurrency": 3,
                 "taxonomy_auto_accept_confidence": 0.5,
@@ -944,7 +947,13 @@ class WorkerControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             classifier.await_args.kwargs["include_auto_non_product_recheck"]
         )
-        self.assertFalse(classifier.await_args.kwargs["include_capabilities"])
+        self.assertTrue(classifier.await_args.kwargs["include_capabilities"])
+        self.assertTrue(
+            classifier.await_args.kwargs["include_capability_backfill"]
+        )
+        self.assertEqual(
+            classifier.await_args.kwargs["capability_candidate_limit"], 96
+        )
 
     def test_taxonomy_full_batch_continues_without_poll_delay(self) -> None:
         config = type(
@@ -979,6 +988,20 @@ class WorkerControlTests(unittest.IsolatedAsyncioTestCase):
             ),
             300,
         )
+        self.assertEqual(
+            runner.taxonomy_next_delay_seconds(
+                config,
+                {"selected": 50, "capability_backfill_selected": 50},
+            ),
+            300,
+        )
+        self.assertEqual(
+            runner.taxonomy_next_delay_seconds(
+                config,
+                {"selected": 50, "capability_only_selected": 50},
+            ),
+            300,
+        )
 
     def test_taxonomy_idle_detection_ignores_scan_only_bookkeeping(self) -> None:
         self.assertFalse(
@@ -999,6 +1022,11 @@ class WorkerControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             runner.taxonomy_batch_has_activity(
                 {"selected": 0, "anomaly_scan_failed": 1}
+            )
+        )
+        self.assertTrue(
+            runner.taxonomy_batch_has_activity(
+                {"selected": 0, "model_retries_resumed": 1}
             )
         )
 

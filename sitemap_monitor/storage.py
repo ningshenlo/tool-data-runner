@@ -18,6 +18,7 @@ from .models import (
     ComparabilityResult,
     DueSite,
     MaintenanceResult,
+    RegisteredSite,
     ResourceState,
     SitemapJob,
     SiteScanSnapshot,
@@ -116,6 +117,16 @@ class SchedulerStore(MetadataStore, Protocol):
         *,
         check_interval_sec: int | None = None,
     ) -> None: ...
+
+    async def ensure_sites(
+        self,
+        sites: tuple[tuple[str, str], ...],
+        now_ms: int,
+        *,
+        check_interval_sec: int,
+    ) -> None: ...
+
+    async def list_registered_sites(self) -> tuple[RegisteredSite, ...]: ...
 
     async def set_site_status(
         self,
@@ -373,6 +384,39 @@ class SqliteMetadataStore:
                     check_interval_sec,
                 ),
             )
+
+    async def ensure_sites(
+        self,
+        sites: tuple[tuple[str, str], ...],
+        now_ms: int,
+        *,
+        check_interval_sec: int,
+    ) -> None:
+        for site_id, homepage_url in sites:
+            await self.ensure_site(
+                site_id,
+                homepage_url,
+                now_ms,
+                check_interval_sec=check_interval_sec,
+            )
+
+    async def list_registered_sites(self) -> tuple[RegisteredSite, ...]:
+        rows = self.connection.execute(
+            """
+            SELECT id, homepage_url, check_interval_sec, status
+            FROM sitemap_sites
+            ORDER BY id
+            """
+        ).fetchall()
+        return tuple(
+            RegisteredSite(
+                check_interval_sec=int(row["check_interval_sec"]),
+                homepage_url=str(row["homepage_url"]),
+                site_id=str(row["id"]),
+                status=row["status"],
+            )
+            for row in rows
+        )
 
     async def set_site_status(
         self,

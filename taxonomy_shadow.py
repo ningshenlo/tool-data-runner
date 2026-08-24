@@ -18,12 +18,15 @@ from typing import Any
 
 from anti_bot_signatures import detect_anti_bot_text
 
-SHADOW_PROMPT_VERSION = "shadow-top2-v4-trusted-models-2026-08-15"
+SHADOW_PROMPT_VERSION = "shadow-markets-capabilities-v5-2026-08-24"
 SHADOW_EXTRACTOR_VERSION = "cleaned-main-content-v2-evidence-grounded-2026-08-14"
-SHADOW_PIPELINE_VERSION = "p2a-shadow-v3-2026-08-14"
+SHADOW_PIPELINE_VERSION = "p2a-markets-capabilities-v4-2026-08-24"
 DEFAULT_TAXONOMY_VERSION = 1
 PROFILE_VERSION = 1
-MAX_CAPABILITIES = 8
+MAX_L1_CANDIDATES = 3
+MAX_SECONDARY_MARKETS = 3
+MAX_CAPABILITIES = 12
+DEFAULT_CAPABILITY_CANDIDATE_LIMIT = 96
 MAX_CAPABILITY_CATALOG_SIZE = 1000
 CAPABILITY_CHUNK_SIZE = 160
 MIN_LEAF_CONFIDENCE_PROVISIONAL = 0.35
@@ -41,6 +44,8 @@ ENTITY_KINDS = {
     "non_product",
     "unresolved",
 }
+PRODUCT_ENTITY_KINDS = {"independent_product", "app_or_extension"}
+CAPABILITY_ROLES = {"core", "supporting", "integration"}
 ENTITY_ERROR_PAGE_RE = re.compile(
     r"(?:unable\s+to\s+load\s+(?:site|page)|sorry[,\s]+you\s+have\s+been\s+blocked|"
     r"invalid\s+ssl\s+certificate|error\s+code\s*52\d|access\s+denied|"
@@ -182,14 +187,51 @@ def catalog_from_rows(rows: list[dict[str, Any]]) -> TaxonomyCatalog:
 
 def _normalized_grounding_text(value: Any) -> str:
     text = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    text = text.translate(
+        str.maketrans(
+            {
+                "\u2018": "'",
+                "\u2019": "'",
+                "\u201c": '"',
+                "\u201d": '"',
+                "\u2013": "-",
+                "\u2014": "-",
+                "\u2212": "-",
+            }
+        )
+    )
+    text = re.sub(r"[\u200b-\u200d\ufeff]", "", text)
     return re.sub(r"\s+", " ", text).strip()
 
 
+def _punctuation_insensitive_grounding_text(value: Any) -> str:
+    """Normalize rendering-only punctuation without allowing reordered words."""
+    normalized = _normalized_grounding_text(value)
+    chars = [
+        char if unicodedata.category(char)[:1] in {"L", "N"} else " "
+        for char in normalized
+    ]
+    return re.sub(r"\s+", " ", "".join(chars)).strip()
+
+
 def evidence_quote_is_grounded(quote: Any, source_text: str) -> bool:
-    """Require model evidence to be a verbatim, whitespace-normalized source span."""
+    """Require a contiguous source span, tolerating only rendering punctuation drift."""
     normalized_quote = _normalized_grounding_text(quote)
     normalized_source = _normalized_grounding_text(source_text)
-    return bool(normalized_quote and normalized_source and normalized_quote in normalized_source)
+    if not normalized_quote or not normalized_source:
+        return False
+    if normalized_quote in normalized_source:
+        return True
+    canonical_quote = _punctuation_insensitive_grounding_text(quote)
+    canonical_source = _punctuation_insensitive_grounding_text(source_text)
+    # Short fragments are too easy to match accidentally. This fallback still
+    # requires the same words in the same contiguous order; it is not fuzzy
+    # bag-of-words matching.
+    return bool(
+        len(canonical_quote.replace(" ", "")) >= 12
+        and len(canonical_quote.split()) >= 3
+        and canonical_quote in canonical_source
+    )
 
 
 def normalize_evidence_item(
@@ -522,7 +564,11 @@ def profile_extract_schema() -> dict[str, Any]:
 def profile_classification_context(profile: dict[str, Any]) -> str:
     """Render a compact, evidence-backed profile for downstream classifiers."""
     compact: dict[str, Any] = {}
-    for key, limit in (("primary_job", 1), ("primary_outputs", 6), ("capabilities_raw", 8)):
+    for key, limit in (
+        ("primary_job", 1),
+        ("primary_outputs", 6),
+        ("capabilities_raw", MAX_CAPABILITIES),
+    ):
         raw_value = profile.get(key)
         values = raw_value if isinstance(raw_value, list) else [raw_value]
         rendered: list[dict[str, Any]] = []
@@ -547,6 +593,95 @@ def profile_classification_context(profile: dict[str, Any]) -> str:
     return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
 
 
+def profile_evidence_text(
+    profile: dict[str, Any],
+    *,
+    keys: tuple[str, ...] = ("primary_job", "primary_outputs", "capabilities_raw"),
+) -> str:
+    """Return only previously grounded homepage quotes for downstream validation."""
+    quotes: list[str] = []
+    for key in keys:
+        raw_value = profile.get(key)
+        values = raw_value if isinstance(raw_value, list) else [raw_value]
+        for item in values:
+            if not isinstance(item, dict):
+                continue
+            for evidence in item.get("evidence") or []:
+                if isinstance(evidence, dict) and evidence.get("quote"):
+                    quotes.append(str(evidence["quote"]))
+    return "\n".join(quotes)
+
+
+_CAPABILITY_STOPWORDS = {
+    "a", "an", "and", "ai", "for", "from", "in", "of", "on", "or", "the", "to", "with",
+}
+
+
+def _search_tokens(value: Any) -> set[str]:
+    return {
+        token
+        for token in _punctuation_insensitive_grounding_text(value).split()
+        if len(token) > 1 and token not in _CAPABILITY_STOPWORDS
+    }
+
+
+def _market_atomic_phrases(markets: list[TaxonomyTerm]) -> set[str]:
+    phrases: set[str] = set()
+    for market in markets:
+        for raw_phrase in re.split(r"[;；]", market.includes or ""):
+            phrase = _punctuation_insensitive_grounding_text(raw_phrase)
+            if phrase:
+                phrases.add(phrase)
+    return phrases
+
+
+def recall_capability_candidates(
+    profile: dict[str, Any],
+    catalog: TaxonomyCatalog,
+    *,
+    markets: list[TaxonomyTerm] | None = None,
+    limit: int = DEFAULT_CAPABILITY_CANDIDATE_LIMIT,
+) -> list[TaxonomyTerm]:
+    """Recall a bounded whitelist without an additional model call.
+
+    The original taxonomy document is represented in each market leaf's
+    ``includes`` field. Matching those atomic phrases back to capability names
+    makes that source taxonomy operational instead of sending all 791 terms to
+    the model. Profile overlap adds cross-market and horizontal capabilities.
+    """
+    bounded_limit = max(MAX_CAPABILITIES, min(int(limit or 0), MAX_CAPABILITY_CATALOG_SIZE))
+    profile_text = _punctuation_insensitive_grounding_text(
+        profile_classification_context(profile)
+    )
+    profile_tokens = _search_tokens(profile_text)
+    market_phrases = _market_atomic_phrases(markets or [])
+    scored: list[tuple[float, int, TaxonomyTerm]] = []
+    for term in catalog.capabilities():
+        names = {
+            _punctuation_insensitive_grounding_text(term.slug.replace("-", " ")),
+            _punctuation_insensitive_grounding_text(term.name),
+        }
+        names.discard("")
+        term_tokens = set().union(*(_search_tokens(name) for name in names)) if names else set()
+        score = 0.0
+        if any(name in market_phrases for name in names):
+            score += 100.0
+        exact_profile_match = any(
+            len(name.replace(" ", "")) >= 4 and name in profile_text for name in names
+        )
+        if exact_profile_match:
+            score += 40.0
+        overlap = term_tokens & profile_tokens
+        if overlap:
+            score += len(overlap) * 4.0
+            if term_tokens and overlap == term_tokens:
+                score += 12.0
+        if score > 0:
+            scored.append((score, term.term_id, term))
+    scored.sort(key=lambda item: (-item[0], item[1], item[2].slug))
+    return [item[2] for item in scored[:bounded_limit]]
+
+
 def top2_l1_prompt(
     roots: list[TaxonomyTerm],
     catalog: TaxonomyCatalog,
@@ -555,7 +690,7 @@ def top2_l1_prompt(
     return (
         "Ignore the neutral transport page. Classify only the evidence-backed product "
         "facts embedded below into PRIMARY MARKET categories. "
-        "Return the top 1 or 2 best-matching L1 (top-level) category slugs from the catalog. "
+        "Return the top 1 to 3 best-matching L1 (top-level) category slugs from the catalog. "
         "Order by fit (best first). Use exact slugs only. "
         "Prefer the product's main market positioning, not incidental features. "
         "Definitions and excludes are binding. Do not invent slugs.\n\n"
@@ -572,7 +707,7 @@ def top2_l1_schema() -> dict[str, Any]:
             "l1_candidates": {
                 "type": "array",
                 "minItems": 1,
-                "maxItems": 2,
+                "maxItems": MAX_L1_CANDIDATES,
                 "items": {
                     "type": "object",
                     "additionalProperties": False,
@@ -599,16 +734,41 @@ def leaf_adjudication_prompt(
         "Ignore the neutral transport page. Classify only the evidence-backed product "
         "facts embedded below. "
         f"L1 candidates already selected: {', '.join(l1_slugs)}. "
-        "Choose exactly one LEAF primary_category slug from the candidate list below. "
+        "Choose exactly one stable PRIMARY market leaf and 0 to 3 materially supported "
+        "SECONDARY market leaves from the candidate list below. A secondary market must "
+        "represent another real competitor set for the product, not a feature or integration. "
         "A leaf is the most specific market category. Prefer child (L2) when one fits; "
         "only pick an L1 slug if that L1 has no children or no child is supported. "
-        "Definitions and excludes are binding. Empty leaf_slug only if none fit.\n\n"
+        "Definitions and excludes are binding. Empty leaf_slug only if none fit. "
+        "secondary_leaves must exclude leaf_slug and use exact candidate slugs.\n\n"
         f"Product facts: {profile_classification_context(profile)}\n\n"
         f"Leaf candidates:\n{catalog.render_terms(candidates)}"
     )
 
 
 def leaf_adjudication_schema() -> dict[str, Any]:
+    evidenced_leaf = {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "slug": {"type": "string"},
+            "confidence": {"type": "number"},
+            "reason": {"type": "string"},
+            "evidence": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "quote": {"type": "string"},
+                        "node_id": {"type": "string"},
+                    },
+                    "required": ["quote"],
+                },
+            },
+        },
+        "required": ["slug", "confidence", "reason", "evidence"],
+    }
     return {
         "type": "object",
         "additionalProperties": False,
@@ -628,8 +788,13 @@ def leaf_adjudication_schema() -> dict[str, Any]:
                     "required": ["quote"],
                 },
             },
+            "secondary_leaves": {
+                "type": "array",
+                "maxItems": MAX_SECONDARY_MARKETS,
+                "items": evidenced_leaf,
+            },
         },
-        "required": ["leaf_slug", "confidence", "reason"],
+        "required": ["leaf_slug", "confidence", "reason", "evidence", "secondary_leaves"],
     }
 
 
@@ -660,14 +825,17 @@ def capabilities_prompt(
     if isinstance(profile.get("primary_job"), dict):
         job = str(profile["primary_job"].get("value") or "")
     return (
-        "Map the product to 0–8 capability taxonomy slugs from the whitelist below. "
+        f"Map the product to 0–{MAX_CAPABILITIES} capability taxonomy slugs from the whitelist below. "
         "Return capability_slugs as objects, never bare strings. Every object must contain "
-        "slug, confidence, and evidence copied verbatim from capabilities_raw_json. "
+        "slug, role, confidence, and evidence copied verbatim from capabilities_raw_json. "
+        "role must be core, supporting, or integration. core means central advertised workflow "
+        "or output; supporting means a real supporting function; integration means connectivity, "
+        "extension, API, import/export, or platform interoperability. "
         "Only include capabilities explicitly supported by those page evidence quotes. "
         "Do not invent capabilities from brand reputation. "
         "Use exact slugs only.\n\n"
         f"primary_job={job}\n"
-        f"capabilities_raw_json={json.dumps(raw_caps[:8], ensure_ascii=False)}\n\n"
+        f"capabilities_raw_json={json.dumps(raw_caps[:MAX_CAPABILITIES], ensure_ascii=False)}\n\n"
         f"Capability whitelist:\n{catalog.render_terms(capabilities, limit=None)}"
     )
 
@@ -685,6 +853,10 @@ def capabilities_schema() -> dict[str, Any]:
                     "additionalProperties": False,
                     "properties": {
                         "slug": {"type": "string"},
+                        "role": {
+                            "type": "string",
+                            "enum": ["core", "supporting", "integration"],
+                        },
                         "confidence": {"type": "number"},
                         "evidence": {
                             "type": "array",
@@ -699,7 +871,7 @@ def capabilities_schema() -> dict[str, Any]:
                             },
                         },
                     },
-                    "required": ["slug", "confidence", "evidence"],
+                    "required": ["slug", "role", "confidence", "evidence"],
                 },
             }
         },
@@ -904,7 +1076,7 @@ def parse_top2_l1(raw: dict[str, Any], catalog: TaxonomyCatalog) -> list[dict[st
             continue
         seen.add(slug)
         out.append({"term": roots[slug], "confidence": conf, "reason": reason})
-        if len(out) >= 2:
+        if len(out) >= MAX_L1_CANDIDATES:
             break
     return out
 
@@ -913,7 +1085,7 @@ def build_leaf_candidate_pool(
     l1_hits: list[dict[str, Any]],
     catalog: TaxonomyCatalog,
 ) -> list[TaxonomyTerm]:
-    """Merge children of Top-2 L1; include L1 itself when it is a leaf."""
+    """Merge children of recalled L1 markets; include L1 itself when it is a leaf."""
     pool: list[TaxonomyTerm] = []
     seen: set[int] = set()
     for hit in l1_hits:
@@ -937,6 +1109,7 @@ def parse_leaf_decision(
     catalog: TaxonomyCatalog,
     *,
     source_url: str = "",
+    source_text: str = "",
 ) -> dict[str, Any] | None:
     by_slug = {t.slug: t for t in pool}
     slug = clean_slug(raw.get("leaf_slug") or raw.get("category_l2") or raw.get("slug"))
@@ -948,7 +1121,11 @@ def parse_leaf_decision(
     conf = _as_confidence(raw.get("confidence"), 0.5)
     evidence = []
     for item in raw.get("evidence") or []:
-        norm = normalize_evidence_item(item, source_url=source_url)
+        norm = normalize_evidence_item(
+            item,
+            source_url=source_url,
+            source_text=source_text,
+        )
         if norm:
             evidence.append(norm)
     return {
@@ -959,13 +1136,68 @@ def parse_leaf_decision(
     }
 
 
+def parse_secondary_leaf_decisions(
+    raw: dict[str, Any],
+    pool: list[TaxonomyTerm],
+    catalog: TaxonomyCatalog,
+    *,
+    primary_slug: str = "",
+    source_url: str = "",
+    source_text: str = "",
+) -> list[dict[str, Any]]:
+    by_slug = {term.slug: term for term in pool}
+    items = raw.get("secondary_leaves") or raw.get("secondary_leaf_slugs") or []
+    if not isinstance(items, list):
+        return []
+    out: list[dict[str, Any]] = []
+    seen = {clean_slug(primary_slug)}
+    for item in items:
+        if isinstance(item, str):
+            slug = clean_slug(item)
+            confidence = 0.5
+            reason = ""
+            evidence: list[dict[str, Any]] = []
+        elif isinstance(item, dict):
+            slug = clean_slug(item.get("slug") or item.get("leaf_slug"))
+            confidence = _as_confidence(item.get("confidence"), 0.5)
+            reason = _clip(item.get("reason"), 300)
+            evidence = normalize_evidence_items(
+                item.get("evidence") or [],
+                source_url=source_url,
+                source_text=source_text,
+            )
+        else:
+            continue
+        term = by_slug.get(slug)
+        if not term or slug in seen or not catalog.is_leaf(term):
+            continue
+        if not evidence:
+            continue
+        seen.add(slug)
+        out.append(
+            {
+                "term": term,
+                "confidence": confidence,
+                "reason": reason,
+                "evidence": evidence[:5],
+            }
+        )
+        if len(out) >= MAX_SECONDARY_MARKETS:
+            break
+    return out
+
+
 def parse_capabilities(
     raw: dict[str, Any],
     catalog: TaxonomyCatalog,
     *,
     source_url: str = "",
+    source_text: str = "",
+    whitelist_terms: list[TaxonomyTerm] | None = None,
 ) -> list[dict[str, Any]]:
-    whitelist = {t.slug: t for t in catalog.capabilities()}
+    whitelist = {
+        term.slug: term for term in (whitelist_terms or catalog.capabilities())
+    }
     items = raw.get("capability_slugs") or raw.get("capabilities") or []
     if not isinstance(items, list):
         return []
@@ -975,13 +1207,21 @@ def parse_capabilities(
         if isinstance(item, str):
             slug = clean_slug(item)
             conf = 0.5
+            role = "supporting"
             evidence: list[dict[str, Any]] = []
         elif isinstance(item, dict):
             slug = clean_slug(item.get("slug") or item.get("capability"))
             conf = _as_confidence(item.get("confidence"), 0.5)
+            role = str(item.get("role") or "supporting").strip().lower()
+            if role not in CAPABILITY_ROLES:
+                role = "supporting"
             evidence = []
             for e in item.get("evidence") or []:
-                norm = normalize_evidence_item(e, source_url=source_url)
+                norm = normalize_evidence_item(
+                    e,
+                    source_url=source_url,
+                    source_text=source_text,
+                )
                 if norm:
                     evidence.append(norm)
         else:
@@ -993,7 +1233,14 @@ def parse_capabilities(
         if not evidence:
             continue
         seen.add(slug)
-        out.append({"term": whitelist[slug], "confidence": conf, "evidence": evidence[:5]})
+        out.append(
+            {
+                "term": whitelist[slug],
+                "role": role,
+                "confidence": conf,
+                "evidence": evidence[:5],
+            }
+        )
         if len(out) >= MAX_CAPABILITIES:
             break
     return out
@@ -1086,7 +1333,7 @@ async def load_shadow_tasks(
 ) -> list[dict[str, Any]]:
     """Select tools eligible for Shadow pipeline.
 
-    Default: active catalog tools with entity_kind = independent_product.
+    Default: active catalog tools with an eligible product entity kind.
     Explicit tool_ids always selected (for smoke), regardless of entity_kind.
     Incident rechecks may include auto-labeled non-products, but never manual labels.
     """
@@ -1158,7 +1405,9 @@ async def load_shadow_tasks(
         )
       )
     )"""
-    entity_predicates = ["t.entity_kind = 'independent_product'"]
+    entity_predicates = [
+        "t.entity_kind IN ('independent_product', 'app_or_extension')"
+    ]
     if allow_unresolved_entity:
         entity_predicates.append("""(
           t.entity_kind = 'unresolved'
@@ -1263,6 +1512,84 @@ async def load_shadow_tasks(
     return await d1.query(sql, params)
 
 
+async def load_capability_backfill_tasks(
+    d1: Any,
+    *,
+    limit: int,
+    after_tool_id: int = 0,
+    retry_model_name: str = "",
+) -> list[dict[str, Any]]:
+    """Load existing evidenced profiles that still have fewer than three capabilities."""
+    if limit <= 0:
+        return []
+    failed_model_clause = "AND failed_run.model_name = ?" if retry_model_name else ""
+    params: list[Any] = [int(after_tool_id or 0), SHADOW_PROMPT_VERSION]
+    if retry_model_name:
+        params.append(retry_model_name)
+    params.append(int(limit))
+    return await d1.query(
+        f"""
+        SELECT
+          t.id AS tool_id,
+          t.canonical_slug,
+          t.normalized_domain,
+          t.official_url,
+          COALESCE(json_extract(pp.profile_json, '$.source_url'), t.official_url)
+            AS taxonomy_evidence_url,
+          t.entity_kind,
+          t.entity_kind_source,
+          t.status,
+          pp.profile_json,
+          'capability_backfill' AS selection_reason
+        FROM tools t
+        JOIN product_profiles pp ON pp.tool_id = t.id
+        WHERE t.status IN ('pending_enrich', 'pending_review', 'published')
+          AND t.duplicate_of_tool_id IS NULL
+          AND t.entity_kind IN ('independent_product', 'app_or_extension')
+          AND t.id > ?
+          AND json_valid(pp.profile_json) = 1
+          AND COALESCE(
+            json_array_length(json_extract(pp.profile_json, '$.capabilities_raw')),
+            0
+          ) > 0
+          AND (
+            SELECT COUNT(*)
+            FROM product_taxonomy_assignments existing_cap
+            JOIN taxonomy_terms existing_term
+              ON existing_term.id = existing_cap.term_id
+             AND existing_term.dimension = 'capability'
+             AND existing_term.status = 'active'
+            WHERE existing_cap.tool_id = t.id
+              AND existing_cap.decision_status IN (
+                'verified', 'auto_accepted', 'provisional'
+              )
+          ) < 3
+          AND NOT EXISTS (
+            SELECT 1
+            FROM classification_runs completed_run
+            WHERE completed_run.tool_id = t.id
+              AND completed_run.prompt_version = ?
+              AND json_valid(completed_run.raw_output) = 1
+              AND json_extract(completed_run.raw_output, '$.capability_backfill') = 1
+              AND completed_run.run_status IN ('succeeded', 'partial', 'skipped')
+          )
+          AND (
+            SELECT COUNT(*)
+            FROM classification_runs failed_run
+            WHERE failed_run.tool_id = t.id
+              AND failed_run.prompt_version = '{SHADOW_PROMPT_VERSION}'
+              AND json_valid(failed_run.raw_output) = 1
+              AND json_extract(failed_run.raw_output, '$.capability_backfill') = 1
+              AND failed_run.run_status = 'failed'
+              {failed_model_clause}
+          ) < 3
+        ORDER BY t.id ASC
+        LIMIT ?
+        """,
+        params,
+    )
+
+
 async def upsert_product_profile(
     d1: Any,
     tool_id: int,
@@ -1302,6 +1629,8 @@ async def insert_classification_run(
     candidate_terms: Any = None,
     raw_output: Any = None,
     error: str | None = None,
+    prompt_version: str = SHADOW_PROMPT_VERSION,
+    extractor_version: str = SHADOW_EXTRACTOR_VERSION,
 ) -> int:
     now = utc_now_iso()
     if isinstance(raw_output, str):
@@ -1321,8 +1650,8 @@ async def insert_classification_run(
         [
             tool_id,
             taxonomy_version,
-            SHADOW_PROMPT_VERSION,
-            SHADOW_EXTRACTOR_VERSION,
+            prompt_version,
+            extractor_version,
             provider or None,
             model_name or None,
             json.dumps(candidate_terms, ensure_ascii=False, separators=(",", ":"))
@@ -1554,6 +1883,7 @@ class ShadowResult:
     run_id: int = 0
     primary_slug: str = ""
     primary_confidence: float = 0.0
+    secondary_slugs: list[str] = field(default_factory=list)
     entity_kind: str = "unresolved"
     entity_confidence: float = 0.0
     capability_slugs: list[str] = field(default_factory=list)
@@ -1577,6 +1907,209 @@ def trusted_taxonomy_custom_ai(custom_ai: Any) -> list[dict[str, Any]]:
     ]
 
 
+async def load_active_market_terms(
+    d1: Any,
+    tool_id: int,
+    catalog: TaxonomyCatalog,
+) -> list[TaxonomyTerm]:
+    rows = await d1.query(
+        """
+        SELECT a.term_id
+        FROM product_taxonomy_assignments a
+        JOIN taxonomy_terms t
+          ON t.id = a.term_id
+         AND t.dimension = 'primary_category'
+         AND t.status = 'active'
+        WHERE a.tool_id = ?
+          AND a.decision_status IN ('verified', 'auto_accepted', 'provisional')
+        ORDER BY a.is_primary DESC, a.confidence DESC, a.id DESC
+        LIMIT 4
+        """,
+        [tool_id],
+    )
+    return [
+        catalog.by_id[term_id]
+        for term_id in (int(row.get("term_id") or 0) for row in rows)
+        if term_id in catalog.by_id
+    ]
+
+
+async def classify_capability_profile_shadow(
+    *,
+    d1: Any,
+    browser_client: Any,
+    task: Any,
+    catalog: TaxonomyCatalog,
+    profile: dict[str, Any],
+    dry_run: bool = False,
+    capability_candidate_limit: int = DEFAULT_CAPABILITY_CANDIDATE_LIMIT,
+) -> ShadowResult:
+    """Backfill capabilities from a stored grounded profile using one model call."""
+    tool_id = int(getattr(task, "tool_id", 0) or 0)
+    result = ShadowResult(tool_id=tool_id, status="failed", profile=profile)
+    if tool_id <= 0:
+        result.error = "invalid_tool_id"
+        return result
+    if not dry_run:
+        result.legacy_before = await snapshot_legacy_category_state(d1, tool_id)
+
+    configured_custom_ai = browser_client.category_custom_ai()
+    custom_ai = trusted_taxonomy_custom_ai(configured_custom_ai)
+    model_chain = [
+        str(item.get("model") or "")
+        for item in custom_ai
+        if isinstance(item, dict) and item.get("model")
+    ]
+    source_url = str(
+        profile.get("source_url") or getattr(task, "official_url", "") or ""
+    )
+    raw_bundle: dict[str, Any] = {
+        "pipeline": SHADOW_PIPELINE_VERSION,
+        "prompt_version": SHADOW_PROMPT_VERSION,
+        "extractor_version": SHADOW_EXTRACTOR_VERSION,
+        "taxonomy_version": catalog.taxonomy_version,
+        "model_chain": model_chain,
+        "capability_backfill": 1,
+        "profile": profile,
+        "source_url": source_url,
+        "model_policy": {
+            "downstream_models": model_chain,
+            "workers_ai_allowed": False,
+        },
+    }
+    if not custom_ai:
+        result.error = "trusted_taxonomy_model_unavailable"
+    elif not profile.get("capabilities_raw"):
+        result.error = "profile_no_capability_evidence"
+
+    markets: list[TaxonomyTerm] = []
+    if not result.error:
+        markets = await load_active_market_terms(d1, tool_id, catalog)
+    candidates = (
+        recall_capability_candidates(
+            profile,
+            catalog,
+            markets=markets,
+            limit=capability_candidate_limit,
+        )
+        if not result.error
+        else []
+    )
+    raw_bundle["capability_candidate_recall"] = {
+        "catalog_count": len(catalog.capabilities()),
+        "candidate_count": len(candidates),
+        "candidate_limit": capability_candidate_limit,
+        "market_slugs": [market.slug for market in markets],
+        "slugs": [term.slug for term in candidates],
+    }
+    if not result.error and not candidates:
+        result.error = "capability_candidates_empty"
+
+    cap_raw: dict[str, Any] = {}
+    cap_decision: list[dict[str, Any]] = []
+    if not result.error:
+        try:
+            _, cap_raw = await fetch_cleaned_text_structured(
+                browser_client,
+                source_url=source_url,
+                stage="shadow_capabilities_backfill",
+                prompt=(
+                    "Capability-only backfill. Classify only the stored, evidence-backed "
+                    "product profile embedded below.\n\n"
+                    + capabilities_prompt(candidates, catalog, profile)
+                ),
+                json_schema=capabilities_schema(),
+                custom_ai=custom_ai,
+                allow_empty_required_arrays=True,
+                empty_object_means_empty_required_arrays=True,
+            )
+            cap_decision = parse_capabilities(
+                cap_raw if isinstance(cap_raw, dict) else {},
+                catalog,
+                source_url=source_url,
+                source_text=profile_evidence_text(
+                    profile,
+                    keys=("capabilities_raw",),
+                ),
+                whitelist_terms=candidates,
+            )
+            if not cap_decision:
+                result.error = "capability_empty"
+        except Exception as error:
+            result.error = f"capabilities_failed: {str(error)[:300]}"
+            cap_raw = {"error": str(error)[:300]}
+
+    raw_bundle["capabilities_raw_model"] = cap_raw
+    raw_bundle["capabilities_accepted"] = [
+        {
+            "slug": decision["term"].slug,
+            "role": decision["role"],
+            "confidence": decision["confidence"],
+        }
+        for decision in cap_decision
+    ]
+    result.capability_slugs = [decision["term"].slug for decision in cap_decision]
+    technical_failure = result.error.startswith(
+        ("trusted_taxonomy_model_unavailable", "capabilities_failed")
+    )
+    run_status = "failed" if technical_failure else (
+        "succeeded" if cap_decision else "partial"
+    )
+    raw_bundle["error"] = result.error or None
+    if dry_run:
+        result.status = run_status
+        result.raw = raw_bundle
+        return result
+
+    result.run_id = await insert_classification_run(
+        d1,
+        tool_id=tool_id,
+        taxonomy_version=catalog.taxonomy_version,
+        run_status="partial" if cap_decision else run_status,
+        provider="browser_rendering_cleaned_text_custom_ai",
+        model_name=(model_chain[0] if model_chain else ""),
+        candidate_terms={"capability_candidates": [term.slug for term in candidates]},
+        raw_output=raw_bundle,
+        error=result.error or None,
+    )
+    for decision in cap_decision:
+        await upsert_assignment(
+            d1,
+            tool_id=tool_id,
+            term_id=decision["term"].term_id,
+            run_id=result.run_id or None,
+            is_primary=False,
+            confidence=float(decision["confidence"]),
+            decision_status="provisional",
+            evidence={
+                "role": decision["role"],
+                "evidence": decision.get("evidence") or [],
+                "backfill": True,
+            },
+            source="auto",
+        )
+    if cap_decision:
+        await supersede_auto_assignments(
+            d1,
+            tool_id,
+            dimensions=["capability"],
+            exclude_run_id=result.run_id or None,
+        )
+        await update_classification_run_status(
+            d1,
+            result.run_id,
+            run_status=run_status,
+            error=result.error or None,
+        )
+    result.status = run_status
+    result.raw = raw_bundle
+    result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
+    if result.legacy_before != result.legacy_after:
+        result.error = (result.error + "; " if result.error else "") + "legacy_mutated"
+        result.status = "failed"
+    return result
+
+
 async def classify_tool_shadow(
     *,
     d1: Any,
@@ -1587,6 +2120,7 @@ async def classify_tool_shadow(
     existing_entity_kind: str = "unresolved",
     existing_entity_source: str = "",
     include_capabilities: bool = True,
+    capability_candidate_limit: int = DEFAULT_CAPABILITY_CANDIDATE_LIMIT,
     auto_accept_threshold: float = DEFAULT_AUTO_ACCEPT_PRIMARY_CONFIDENCE,
 ) -> ShadowResult:
     """Run Shadow pipeline for one tool. Never writes legacy category tables."""
@@ -1790,7 +2324,7 @@ async def classify_tool_shadow(
         result.raw = raw_bundle
         return result
 
-    if entity_decision.get("kind") != "independent_product":
+    if entity_decision.get("kind") not in PRODUCT_ENTITY_KINDS:
         accepted_non_product = bool(entity_decision.get("accepted"))
         result.status = "skipped" if accepted_non_product else "partial"
         result.error = (
@@ -1898,7 +2432,10 @@ async def classify_tool_shadow(
     pool = build_leaf_candidate_pool(l1_hits, catalog)
     raw_bundle["leaf_pool"] = [t.slug for t in pool]
     leaf_decision: dict[str, Any] | None = None
+    secondary_decisions: list[dict[str, Any]] = []
     leaf_raw: dict[str, Any] = {}
+    leaf_transport_error = ""
+    downstream_evidence_text = profile_source_text or profile_evidence_text(profile)
     if pool:
         try:
             _, leaf_raw = await fetch_cleaned_text_structured(
@@ -1919,11 +2456,36 @@ async def classify_tool_shadow(
                 pool,
                 catalog,
                 source_url=source_url,
+                source_text=downstream_evidence_text,
             )
         except Exception as error:
-            raw_bundle["leaf_error"] = str(error)[:300]
-            leaf_raw = {"error": str(error)[:300]}
+            leaf_transport_error = str(error)[:300]
+            raw_bundle["leaf_error"] = leaf_transport_error
+            leaf_raw = {"error": leaf_transport_error}
     raw_bundle["leaf_raw"] = leaf_raw
+    if leaf_transport_error:
+        result.status = "failed"
+        result.error = f"leaf_failed: {leaf_transport_error}"
+        raw_bundle["error"] = result.error
+        if not dry_run:
+            await upsert_product_profile(d1, tool_id, profile)
+            result.run_id = await insert_classification_run(
+                d1,
+                tool_id=tool_id,
+                taxonomy_version=catalog.taxonomy_version,
+                run_status="failed",
+                provider=provider,
+                model_name=(model_chain[0] if model_chain else ""),
+                candidate_terms={
+                    "l1": raw_bundle.get("l1_accepted"),
+                    "leaf_pool": raw_bundle.get("leaf_pool"),
+                },
+                raw_output=raw_bundle,
+                error=result.error,
+            )
+            result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
+        result.raw = raw_bundle
+        return result
     if leaf_decision:
         raw_bundle["leaf_accepted"] = {
             "slug": leaf_decision["term"].slug,
@@ -1932,90 +2494,89 @@ async def classify_tool_shadow(
         }
         result.primary_slug = leaf_decision["term"].slug
         result.primary_confidence = float(leaf_decision["confidence"])
+        secondary_decisions = parse_secondary_leaf_decisions(
+            leaf_raw if isinstance(leaf_raw, dict) else {},
+            pool,
+            catalog,
+            primary_slug=leaf_decision["term"].slug,
+            source_url=source_url,
+            source_text=downstream_evidence_text,
+        )
+    raw_bundle["secondary_markets_accepted"] = [
+        {
+            "slug": decision["term"].slug,
+            "confidence": decision["confidence"],
+            "reason": decision["reason"],
+        }
+        for decision in secondary_decisions
+    ]
+    result.secondary_slugs = [decision["term"].slug for decision in secondary_decisions]
 
     cap_decision: list[dict[str, Any]] = []
     cap_raw: dict[str, Any] = {}
-    try:
-        # Keep each whitelist request small enough for Browser Run while still
-        # evaluating every active capability term. An empty list is a valid
-        # result for an individual chunk.
-        chunk_records: list[dict[str, Any]] = []
-        chunk_decisions: list[list[dict[str, Any]]] = []
-        capability_chunks = (
-            capability_term_chunks(catalog.capabilities()) if include_capabilities else []
+    capability_call_succeeded = False
+    capability_candidates: list[TaxonomyTerm] = []
+    if not include_capabilities:
+        raw_bundle["capabilities_skipped"] = "primary_only"
+    elif not profile.get("capabilities_raw"):
+        raw_bundle["capabilities_skipped"] = "no_grounded_capability_evidence"
+    else:
+        market_terms = [
+            decision["term"]
+            for decision in ([leaf_decision] if leaf_decision else []) + secondary_decisions
+        ]
+        capability_candidates = recall_capability_candidates(
+            profile,
+            catalog,
+            markets=market_terms,
+            limit=capability_candidate_limit,
         )
-        if not include_capabilities:
-            raw_bundle["capabilities_skipped"] = "primary_only"
-        for chunk_index, capability_chunk in enumerate(capability_chunks, start=1):
-            _, chunk_raw = await fetch_cleaned_text_structured(
-                browser_client,
-                source_url=source_url,
-                stage=f"shadow_capabilities_{chunk_index}_of_{len(capability_chunks)}",
-                prompt=(
-                    "Ignore the neutral transport page. Classify only the evidenced product "
-                    "profile embedded below.\n\n"
-                    + capabilities_prompt(capability_chunk, catalog, profile)
-                ),
-                json_schema=capabilities_schema(),
-                custom_ai=downstream_custom_ai,
-                allow_empty_required_arrays=True,
-                empty_object_means_empty_required_arrays=True,
-            )
-            accepted = parse_capabilities(
-                chunk_raw if isinstance(chunk_raw, dict) else {},
-                catalog,
-                source_url=source_url,
-            )
-            retry_terms = capability_retry_terms(
-                chunk_raw if isinstance(chunk_raw, dict) else {},
-                catalog,
-            )
-            retry_raw: dict[str, Any] | None = None
-            if not accepted and retry_terms and profile.get("capabilities_raw"):
-                _, retry_raw = await fetch_cleaned_text_structured(
+        raw_bundle["capability_candidate_recall"] = {
+            "catalog_count": len(catalog.capabilities()),
+            "candidate_count": len(capability_candidates),
+            "candidate_limit": capability_candidate_limit,
+            "slugs": [term.slug for term in capability_candidates],
+        }
+        if not capability_candidates:
+            raw_bundle["capabilities_skipped"] = "no_deterministic_candidates"
+        else:
+            try:
+                _, cap_raw = await fetch_cleaned_text_structured(
                     browser_client,
                     source_url=source_url,
-                    stage=f"shadow_capabilities_evidence_retry_{chunk_index}",
+                    stage="shadow_capabilities",
                     prompt=(
-                        "Evidence retry: the prior response used invalid bare strings. "
-                        "For each retained capability, return an object with slug, confidence, "
-                        "and at least one verbatim homepage evidence quote. Drop any capability "
-                        "that cannot be supported by its own quote.\n\n"
-                        + capabilities_prompt(retry_terms, catalog, profile)
+                        "Ignore the neutral transport page. Classify only the evidenced product "
+                        "profile embedded below.\n\n"
+                        + capabilities_prompt(capability_candidates, catalog, profile)
                     ),
                     json_schema=capabilities_schema(),
                     custom_ai=downstream_custom_ai,
                     allow_empty_required_arrays=True,
                     empty_object_means_empty_required_arrays=True,
                 )
-                accepted = parse_capabilities(
-                    retry_raw if isinstance(retry_raw, dict) else {},
+                capability_call_succeeded = True
+                cap_decision = parse_capabilities(
+                    cap_raw if isinstance(cap_raw, dict) else {},
                     catalog,
                     source_url=source_url,
+                    source_text=profile_evidence_text(
+                        profile,
+                        keys=("capabilities_raw",),
+                    ),
+                    whitelist_terms=capability_candidates,
                 )
-            chunk_decisions.append(accepted)
-            chunk_records.append(
-                {
-                    "index": chunk_index,
-                    "term_count": len(capability_chunk),
-                    "first_slug": capability_chunk[0].slug if capability_chunk else "",
-                    "last_slug": capability_chunk[-1].slug if capability_chunk else "",
-                    "raw": chunk_raw,
-                    "retry_raw": retry_raw,
-                }
-            )
-        cap_decision = merge_capability_decisions(chunk_decisions)
-        cap_raw = {
-            "chunk_size": CAPABILITY_CHUNK_SIZE,
-            "chunk_count": len(capability_chunks),
-            "chunks": chunk_records,
-        }
-    except Exception as error:
-        raw_bundle["capabilities_error"] = str(error)[:300]
-        cap_raw = {"error": str(error)[:300]}
+            except Exception as error:
+                raw_bundle["capabilities_error"] = str(error)[:300]
+                cap_raw = {"error": str(error)[:300]}
     raw_bundle["capabilities_raw_model"] = cap_raw
     raw_bundle["capabilities_accepted"] = [
-        {"slug": c["term"].slug, "confidence": c["confidence"]} for c in cap_decision
+        {
+            "slug": c["term"].slug,
+            "role": c["role"],
+            "confidence": c["confidence"],
+        }
+        for c in cap_decision
     ]
     result.capability_slugs = [c["term"].slug for c in cap_decision]
 
@@ -2059,6 +2620,7 @@ async def classify_tool_shadow(
             auto_accept_threshold,
         )
         evidence = {
+            "role": "primary_market",
             "reason": leaf_decision.get("reason"),
             "l1_candidates": raw_bundle.get("l1_accepted"),
             "evidence": leaf_decision.get("evidence") or [],
@@ -2076,6 +2638,23 @@ async def classify_tool_shadow(
             source="auto",
         )
 
+    for secondary in secondary_decisions:
+        await upsert_assignment(
+            d1,
+            tool_id=tool_id,
+            term_id=secondary["term"].term_id,
+            run_id=result.run_id or None,
+            is_primary=False,
+            confidence=float(secondary["confidence"]),
+            decision_status="provisional",
+            evidence={
+                "role": "secondary_market",
+                "reason": secondary.get("reason"),
+                "evidence": secondary.get("evidence") or [],
+            },
+            source="auto",
+        )
+
     for cap in cap_decision:
         await upsert_assignment(
             d1,
@@ -2085,19 +2664,25 @@ async def classify_tool_shadow(
             is_primary=False,
             confidence=float(cap["confidence"]),
             decision_status="provisional",
-            evidence={"evidence": cap.get("evidence") or []},
+            evidence={
+                "role": cap.get("role") or "supporting",
+                "evidence": cap.get("evidence") or [],
+            },
             source="auto",
         )
 
-    dimensions_to_supersede = ["primary_category"]
-    if include_capabilities and not capabilities_failed:
+    dimensions_to_supersede: list[str] = []
+    if leaf_decision:
+        dimensions_to_supersede.append("primary_category")
+    if include_capabilities and capability_call_succeeded and cap_decision:
         dimensions_to_supersede.append("capability")
-    await supersede_auto_assignments(
-        d1,
-        tool_id,
-        dimensions=dimensions_to_supersede,
-        exclude_run_id=result.run_id or None,
-    )
+    if dimensions_to_supersede:
+        await supersede_auto_assignments(
+            d1,
+            tool_id,
+            dimensions=dimensions_to_supersede,
+            exclude_run_id=result.run_id or None,
+        )
     await update_classification_run_status(
         d1,
         result.run_id,
@@ -2127,6 +2712,8 @@ async def run_shadow_taxonomy(
     include_auto_non_product_recheck: bool = False,
     after_tool_id: int = 0,
     include_capabilities: bool = True,
+    include_capability_backfill: bool = True,
+    capability_candidate_limit: int = DEFAULT_CAPABILITY_CANDIDATE_LIMIT,
     concurrency: int = 1,
     auto_accept_threshold: float = DEFAULT_AUTO_ACCEPT_PRIMARY_CONFIDENCE,
 ) -> dict[str, int]:
@@ -2165,6 +2752,11 @@ async def run_shadow_taxonomy(
         "auto_non_product_recheck_failed": 0,
         "auto_non_product_recheck_skipped": 0,
         "auto_non_product_recheck_deferred": 0,
+        "capability_backfill_selected": 0,
+        "capability_backfill_succeeded": 0,
+        "capability_backfill_partial": 0,
+        "capability_backfill_failed": 0,
+        "capability_backfill_deferred": 0,
     }
 
     async with D1Client(config) as d1:
@@ -2238,6 +2830,25 @@ async def run_shadow_taxonomy(
             for row in normal_rows
             if int(row.get("tool_id") or 0) not in queued_tool_ids
         )
+        if (
+            include_capabilities
+            and include_capability_backfill
+            and tool_ids is None
+            and not dry_run
+            and len(rows) < batch_limit
+        ):
+            backfill_rows = await load_capability_backfill_tasks(
+                d1,
+                limit=batch_limit - len(rows),
+                after_tool_id=after_tool_id,
+                retry_model_name=(model_chain[0] if model_chain else ""),
+            )
+            selected_ids = {int(row.get("tool_id") or 0) for row in rows}
+            rows.extend(
+                row
+                for row in backfill_rows
+                if int(row.get("tool_id") or 0) not in selected_ids
+            )
         rows = rows[:batch_limit]
         counts["selected"] = len(rows)
         counts["reclassification_selected"] = len(queued_rows)
@@ -2245,6 +2856,11 @@ async def run_shadow_taxonomy(
             1
             for row in rows
             if str(row.get("selection_reason") or "") == "auto_non_product_recheck"
+        )
+        counts["capability_backfill_selected"] = sum(
+            1
+            for row in rows
+            if str(row.get("selection_reason") or "") == "capability_backfill"
         )
         batch_logger = log_info if rows else log_debug
         batch_logger(
@@ -2259,6 +2875,9 @@ async def run_shadow_taxonomy(
             prompt_version=SHADOW_PROMPT_VERSION,
             after_tool_id=after_tool_id,
             include_capabilities=include_capabilities,
+            include_capability_backfill=include_capability_backfill,
+            capability_backfill_selected=counts["capability_backfill_selected"],
+            capability_candidate_limit=capability_candidate_limit,
             concurrency=worker_limit,
             auto_accept_threshold=auto_accept_threshold,
             roots=len(catalog.primary_roots()),
@@ -2274,10 +2893,13 @@ async def run_shadow_taxonomy(
                 is_auto_non_product_recheck = (
                     selection_reason == "auto_non_product_recheck"
                 )
+                is_capability_backfill = selection_reason == "capability_backfill"
                 if provider_blocked.is_set():
                     counts["deferred"] += 1
                     if is_auto_non_product_recheck:
                         counts["auto_non_product_recheck_deferred"] += 1
+                    if is_capability_backfill:
+                        counts["capability_backfill_deferred"] += 1
                     return
                 tool_id = int(row.get("tool_id") or 0)
                 reclassification_request_id = int(
@@ -2300,7 +2922,7 @@ async def run_shadow_taxonomy(
                 if (
                     tool_ids is None
                     and reclassification_request_id <= 0
-                    and entity_kind != "independent_product"
+                    and entity_kind not in PRODUCT_ENTITY_KINDS
                     and not allow_unresolved_entity
                     and not is_auto_non_product_recheck
                 ):
@@ -2322,21 +2944,38 @@ async def run_shadow_taxonomy(
                     lease_token="shadow-taxonomy",
                 )
                 try:
-                    item = await classify_tool_shadow(
-                        d1=d1,
-                        browser_client=browser_client,
-                        task=task,
-                        catalog=catalog,
-                        dry_run=dry_run,
-                        existing_entity_kind=entity_kind,
-                        existing_entity_source=str(row.get("entity_kind_source") or ""),
-                        include_capabilities=include_capabilities,
-                        auto_accept_threshold=auto_accept_threshold,
-                    )
+                    if is_capability_backfill:
+                        stored_profile = json.loads(str(row.get("profile_json") or "{}"))
+                        item = await classify_capability_profile_shadow(
+                            d1=d1,
+                            browser_client=browser_client,
+                            task=task,
+                            catalog=catalog,
+                            profile=(
+                                stored_profile if isinstance(stored_profile, dict) else {}
+                            ),
+                            dry_run=dry_run,
+                            capability_candidate_limit=capability_candidate_limit,
+                        )
+                    else:
+                        item = await classify_tool_shadow(
+                            d1=d1,
+                            browser_client=browser_client,
+                            task=task,
+                            catalog=catalog,
+                            dry_run=dry_run,
+                            existing_entity_kind=entity_kind,
+                            existing_entity_source=str(row.get("entity_kind_source") or ""),
+                            include_capabilities=include_capabilities,
+                            capability_candidate_limit=capability_candidate_limit,
+                            auto_accept_threshold=auto_accept_threshold,
+                        )
                 except Exception as error:
                     counts["failed"] += 1
                     if is_auto_non_product_recheck:
                         counts["auto_non_product_recheck_failed"] += 1
+                    if is_capability_backfill:
+                        counts["capability_backfill_failed"] += 1
                     if reclassification_request_id > 0 and reclassification_lease_token:
                         try:
                             from classification_anomalies import fail_reclassification_request
@@ -2369,10 +3008,14 @@ async def run_shadow_taxonomy(
                     counts["succeeded"] += 1
                     if is_auto_non_product_recheck:
                         counts["auto_non_product_recheck_succeeded"] += 1
+                    if is_capability_backfill:
+                        counts["capability_backfill_succeeded"] += 1
                 elif item.status == "partial":
                     counts["partial"] += 1
                     if is_auto_non_product_recheck:
                         counts["auto_non_product_recheck_partial"] += 1
+                    if is_capability_backfill:
+                        counts["capability_backfill_partial"] += 1
                 elif item.status == "skipped":
                     counts["skipped"] += 1
                     if is_auto_non_product_recheck:
@@ -2381,6 +3024,8 @@ async def run_shadow_taxonomy(
                     counts["failed"] += 1
                     if is_auto_non_product_recheck:
                         counts["auto_non_product_recheck_failed"] += 1
+                    if is_capability_backfill:
+                        counts["capability_backfill_failed"] += 1
                 if item.error and PROVIDER_BLOCKED_RE.search(item.error):
                     counts["provider_blocked"] = 1
                     provider_blocked.set()

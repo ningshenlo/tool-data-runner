@@ -97,6 +97,16 @@ class SchedulerTick:
     maintenance: MaintenanceResult
 
 
+@dataclass(frozen=True, slots=True)
+class SiteReconciliation:
+    active_sites: int
+    inserted_sites: int
+    paused_sites: int
+    reactivated_sites: int
+    unchanged_sites: int
+    updated_sites: int
+
+
 class SitemapScheduler:
     """D1-backed due-site scheduler and idempotent durable job consumer.
 
@@ -116,14 +126,18 @@ class SitemapScheduler:
         lease_owner: str = "sitemap-monitor",
         policy: SchedulerPolicy | None = None,
         comparability_policy: ComparabilityPolicy | None = None,
+        execution_concurrency: int = 1,
     ):
         if batch_size <= 0:
             raise ValueError("batch_size must be positive.")
+        if execution_concurrency <= 0 or execution_concurrency > batch_size:
+            raise ValueError("execution_concurrency must be between 1 and batch_size.")
         if not lease_owner.strip():
             raise ValueError("lease_owner is required.")
         self.batch_size = batch_size
         self.clock_ms = clock_ms
         self.explicit_sitemaps = tuple(explicit_sitemaps)
+        self.execution_concurrency = execution_concurrency
         self.lease_owner = lease_owner
         self.monitor = monitor
         self.policy = policy or SchedulerPolicy()
@@ -232,6 +246,103 @@ class SitemapScheduler:
             self._registered_sites.pop(site_id, None)
             paused.append(site_id)
         return tuple(paused)
+
+    async def reconcile_sites(
+        self,
+        sites: Iterable[str],
+        *,
+        authoritative: bool,
+        paused_sites: Iterable[str] = (),
+    ) -> SiteReconciliation:
+        now_ms = self.clock_ms()
+        desired: dict[str, str] = {}
+        for homepage_url in dict.fromkeys(sites):
+            normalized = normalize_sitemap_url(
+                homepage_url,
+                max_length=self.monitor.limits.max_url_length,
+            )
+            desired.setdefault(site_id_for(normalized), normalized)
+
+        explicit_paused_ids: set[str] = set()
+        for homepage_url in dict.fromkeys(paused_sites):
+            normalized = normalize_sitemap_url(
+                homepage_url,
+                max_length=self.monitor.limits.max_url_length,
+            )
+            explicit_paused_ids.add(site_id_for(normalized))
+        for site_id in explicit_paused_ids:
+            desired.pop(site_id, None)
+
+        existing = {
+            site.site_id: site
+            for site in await self.store.list_registered_sites()
+        }
+        inserted = tuple(
+            (site_id, homepage_url)
+            for site_id, homepage_url in desired.items()
+            if site_id not in existing
+        )
+        updated = tuple(
+            (site_id, homepage_url)
+            for site_id, homepage_url in desired.items()
+            if site_id in existing
+            and (
+                existing[site_id].homepage_url != homepage_url
+                or existing[site_id].check_interval_sec
+                    != self.policy.check_interval_sec
+            )
+        )
+        await self.store.ensure_sites(
+            (*inserted, *updated),
+            now_ms,
+            check_interval_sec=self.policy.check_interval_sec,
+        )
+
+        reactivated = 0
+        for site_id in sorted(desired):
+            if existing.get(site_id) is not None and existing[site_id].status == "paused":
+                await self.store.set_site_status(
+                    site_id,
+                    "active",
+                    now_ms,
+                    from_status="paused",
+                )
+                reactivated += 1
+
+        to_pause = {
+            site_id
+            for site_id, site in existing.items()
+            if site.status == "active"
+            and (
+                site_id in explicit_paused_ids
+                or (authoritative and site_id not in desired)
+            )
+        }
+        for site_id in sorted(to_pause):
+            await self.store.set_site_status(
+                site_id,
+                "paused",
+                now_ms,
+                from_status="active",
+            )
+
+        self._registered_sites = {
+            site_id: (homepage_url, self.policy.check_interval_sec, now_ms)
+            for site_id, homepage_url in desired.items()
+        }
+        changed_ids = {site_id for site_id, _ in (*inserted, *updated)}
+        unchanged = sum(
+            site_id in existing and site_id not in changed_ids
+            for site_id in desired
+        )
+        return SiteReconciliation(
+            active_sites=len(desired),
+            inserted_sites=len(inserted),
+            paused_sites=len(to_pause),
+            reactivated_sites=reactivated,
+            unchanged_sites=unchanged,
+            updated_sites=len(updated),
+        )
 
     async def perform_maintenance(self) -> MaintenanceResult:
         now_ms = self.clock_ms()
@@ -417,8 +528,15 @@ class SitemapScheduler:
             now_ms=self.clock_ms(),
         )
         executions = []
-        for job in jobs:
-            executions.append(await self._execute(job))
+        for index in range(0, len(jobs), self.execution_concurrency):
+            executions.extend(
+                await asyncio.gather(
+                    *(
+                        self._execute(job)
+                        for job in jobs[index : index + self.execution_concurrency]
+                    )
+                )
+            )
         return len(jobs), tuple(executions)
 
     async def run_once(self, sites: Iterable[str]) -> SchedulerTick:

@@ -13,6 +13,7 @@ RunResult = Literal[
     "semantic_unchanged",
 ]
 JobStatus = Literal["pending", "running", "retry", "succeeded", "dead"]
+SiteStatus = Literal["active", "paused", "blocked"]
 DiscoveryMode = Literal["explicit", "fallback", "robots"]
 ComparabilityStatus = Literal[
     "baseline_invalid",
@@ -152,6 +153,14 @@ class DueSite:
     schedule_version: int
     scheduled_for: int
     site_id: str
+
+
+@dataclass(frozen=True, slots=True)
+class RegisteredSite:
+    check_interval_sec: int
+    homepage_url: str
+    site_id: str
+    status: SiteStatus
 
 
 @dataclass(frozen=True, slots=True)

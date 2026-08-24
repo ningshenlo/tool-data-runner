@@ -10,6 +10,7 @@ class DockerImageContractTests(unittest.TestCase):
         for module in (
             "runner.py",
             "taxonomy_shadow.py",
+            "taxonomy_batch.py",
             "anti_bot_signatures.py",
             "classification_anomalies.py",
         ):
