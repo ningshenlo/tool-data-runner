@@ -1316,6 +1316,35 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.connection.commit()
 
+    def seed_publishable_tool(self, tool_id: int, suffix: str) -> None:
+        self.seed_complete_enrichment(tool_id, suffix)
+        now = runner.utc_now_iso()
+        self.connection.execute(
+            """
+            INSERT INTO tool_assets (
+              tool_id, asset_kind, storage_bucket, storage_object_path, is_current
+            ) VALUES (?, 'screenshot', 'sitesimgs', ?, 1)
+            """,
+            [tool_id, f"{suffix}/screenshot.png"],
+        )
+        self.connection.execute(
+            """
+            INSERT INTO tool_sources (
+              tool_id, source_type, source_url, is_primary
+            ) VALUES (?, 'official_site', ?, 1)
+            """,
+            [tool_id, f"https://{suffix}.example"],
+        )
+        self.connection.execute(
+            """
+            INSERT INTO tool_enrichment_states (
+              tool_id, readiness, blocking_json, warnings_json, evaluated_at, updated_at
+            ) VALUES (?, 'ready', '[]', '[]', ?, ?)
+            """,
+            [tool_id, now, now],
+        )
+        self.connection.commit()
+
     def task_row(self, table: str, where: str, params: list[Any]) -> sqlite3.Row:
         row = self.connection.execute(f"SELECT * FROM {table} WHERE {where}", params).fetchone()
         self.assertIsNotNone(row)
@@ -3672,6 +3701,13 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             ("periodic-facts-worker", ("traffic", "domain_state")),
         )
 
+        assets_args = runner.parse_args(["--assets", "--loop"])
+        self.assertTrue(assets_args.assets)
+        self.assertEqual(
+            runner.runtime_profile_for_args(assets_args),
+            ("assets-worker", ("assets", "enrichment", "catalog_publish")),
+        )
+
         taxonomy_args = runner.parse_args(["--taxonomy", "--loop"])
         self.assertTrue(taxonomy_args.taxonomy)
         self.assertEqual(
@@ -5006,6 +5042,85 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertEqual(state["readiness"], "ready")
         self.assertEqual(state["blocking_json"], "[]")
+
+    async def test_catalog_auto_publish_publishes_ready_tool_with_audit_once(self) -> None:
+        tool_id = self.add_tool("catalog-auto-publish", status="pending_review")
+        self.seed_publishable_tool(tool_id, "catalog-auto-publish")
+        publisher = runner.D1CatalogPublisher(self.d1, "assets-worker-test")
+
+        result = await publisher.publish_ready(10)
+
+        self.assertEqual(result, {"selected": 1, "published": 1, "skipped": 0})
+        tool = self.connection.execute(
+            "SELECT status, first_published_at FROM tools WHERE id = ?",
+            [tool_id],
+        ).fetchone()
+        self.assertEqual(tool["status"], "published")
+        self.assertTrue(tool["first_published_at"])
+        changes = self.connection.execute(
+            """
+            SELECT change_type, old_value, new_value, verified_at, notes
+            FROM tool_change_log
+            WHERE tool_id = ?
+            """,
+            [tool_id],
+        ).fetchall()
+        self.assertEqual(len(changes), 1)
+        self.assertEqual(changes[0]["change_type"], "status_changed")
+        self.assertEqual(json.loads(changes[0]["old_value"]), {"status": "pending_review"})
+        self.assertEqual(json.loads(changes[0]["new_value"]), {"status": "published"})
+        self.assertTrue(changes[0]["verified_at"])
+        self.assertIn(runner.CATALOG_AUTO_PUBLISH_POLICY_VERSION, changes[0]["notes"])
+
+        replay = await publisher.publish_ready(10)
+        self.assertEqual(replay, {"selected": 0, "published": 0, "skipped": 0})
+        change_count = self.connection.execute(
+            "SELECT count(*) FROM tool_change_log WHERE tool_id = ?",
+            [tool_id],
+        ).fetchone()[0]
+        self.assertEqual(change_count, 1)
+
+    async def test_catalog_auto_publish_rechecks_safety_and_live_requirements(self) -> None:
+        unsafe_id = self.add_tool("catalog-auto-unsafe", status="pending_review")
+        self.seed_publishable_tool(unsafe_id, "catalog-auto-unsafe")
+        self.connection.execute(
+            "UPDATE tools SET content_safety_status = 'needs_review' WHERE id = ?",
+            [unsafe_id],
+        )
+        incomplete_id = self.add_tool("catalog-auto-incomplete", status="pending_review")
+        now = runner.utc_now_iso()
+        self.connection.execute(
+            """
+            INSERT INTO tool_enrichment_states (
+              tool_id, readiness, blocking_json, warnings_json, evaluated_at, updated_at
+            ) VALUES (?, 'ready', '[]', '[]', ?, ?)
+            """,
+            [incomplete_id, now, now],
+        )
+        self.connection.commit()
+
+        result = await runner.D1CatalogPublisher(
+            self.d1,
+            "assets-worker-test",
+        ).publish_ready(10)
+
+        self.assertEqual(result, {"selected": 0, "published": 0, "skipped": 0})
+        statuses = {
+            row["id"]: row["status"]
+            for row in self.connection.execute(
+                "SELECT id, status FROM tools WHERE id IN (?, ?)",
+                [unsafe_id, incomplete_id],
+            ).fetchall()
+        }
+        self.assertEqual(statuses[unsafe_id], "pending_review")
+        self.assertEqual(statuses[incomplete_id], "pending_review")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT count(*) FROM tool_change_log WHERE tool_id IN (?, ?)",
+                [unsafe_id, incomplete_id],
+            ).fetchone()[0],
+            0,
+        )
 
     async def test_enrichment_reconciliation_promotes_after_manual_category_fix(self) -> None:
         tool_id = self.add_tool("enrichment-reconcile")

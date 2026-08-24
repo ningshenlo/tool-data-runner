@@ -54,6 +54,8 @@ ASSET_DB_STORAGE_BUCKET = "sitesimgs"
 DEFAULT_R2_BUCKET = "sitesimgs"
 ASSET_REQUIREMENT_ORDER = ("content_safety", "screenshot", "favicon", "description", "key_features", "category")
 AUTO_APPROVE_TOOL_NAME_CONFIDENCE = 85
+CATALOG_AUTO_PUBLISH_POLICY_VERSION = "catalog-auto-publish-v1"
+CATALOG_AUTO_PUBLISH_MAX_LIMIT = 100
 REVIEW_TOOL_NAME_CONFIDENCE = 60
 # Retain a bounded model retry budget before deterministic taxonomy fallback.
 CATEGORY_CLASSIFICATION_MAX_ATTEMPTS = 3
@@ -235,6 +237,8 @@ class Config:
     traffic_release_probe_interval_seconds: int
     traffic_release_queue_limit: int
     asset_limit: int
+    catalog_auto_publish_enabled: bool
+    catalog_auto_publish_limit: int
     domain_state_limit: int
     domain_state_max_age_days: int
     domain_state_poll_interval_seconds: int
@@ -747,6 +751,11 @@ def load_config(require_brightdata: bool = True) -> Config:
         traffic_release_probe_interval_seconds=max(900, read_int_env("TRAFFIC_RELEASE_PROBE_INTERVAL_SECONDS", 21600)),
         traffic_release_queue_limit=max(1, read_int_env("TRAFFIC_RELEASE_QUEUE_LIMIT", 5000)),
         asset_limit=read_int_env("RUNNER_ASSET_LIMIT", 5),
+        catalog_auto_publish_enabled=read_bool_env("CATALOG_AUTO_PUBLISH_ENABLED", True),
+        catalog_auto_publish_limit=min(
+            CATALOG_AUTO_PUBLISH_MAX_LIMIT,
+            max(1, read_int_env("CATALOG_AUTO_PUBLISH_LIMIT", 25)),
+        ),
         domain_state_limit=read_int_env("RUNNER_DOMAIN_STATE_LIMIT", 50),
         domain_state_max_age_days=max(
             1, read_int_env("RUNNER_DOMAIN_STATE_MAX_AGE_DAYS", 30)
@@ -6847,7 +6856,14 @@ async def preview_market_snapshot(
 
 
 class RunnerTelemetry:
-    BASE_WORKLOADS = ["assets", "traffic", "domain_state", "pricing", "enrichment"]
+    BASE_WORKLOADS = [
+        "assets",
+        "traffic",
+        "domain_state",
+        "pricing",
+        "enrichment",
+        "catalog_publish",
+    ]
 
     def __init__(self, d1: D1Client, config: Config, workload: str | None = None):
         self.d1 = d1
@@ -6897,7 +6913,12 @@ class RunnerTelemetry:
         counts_json = json.dumps(counts, sort_keys=True)
         degraded_counts = {
             key: int(counts.get(key) or 0)
-            for key in ("failed", "materialization_failed", "stale")
+            for key in (
+                "failed",
+                "materialization_failed",
+                "stale",
+                "auto_publish_failed",
+            )
             if int(counts.get(key) or 0) > 0
         }
         health_error = error
@@ -6983,6 +7004,148 @@ class RunnerTelemetry:
             """,
             [now, self.workload, self.workload, now, now, self.instance_id],
         )
+
+
+def tool_live_ready_predicate(tool_alias: str) -> str:
+    if tool_alias not in {"t", "tools"}:
+        raise ValueError("Unsupported tools table alias")
+    return f"""
+      {tool_alias}.content_safety_status = 'safe'
+      AND EXISTS (
+        SELECT 1 FROM tool_enrichment_states state
+        WHERE state.tool_id = {tool_alias}.id AND state.readiness = 'ready'
+      )
+      AND EXISTS (
+        SELECT 1 FROM tool_assets asset
+        WHERE asset.tool_id = {tool_alias}.id
+          AND asset.asset_kind = 'screenshot'
+          AND asset.is_current = 1
+      )
+      AND EXISTS (
+        SELECT 1 FROM tool_localizations localization
+        WHERE localization.tool_id = {tool_alias}.id
+          AND localization.translation_status = 'published'
+          AND localization.published_at IS NOT NULL
+          AND trim(localization.name) <> ''
+          AND coalesce(localization.name_review_status, 'legacy_unreviewed')
+              NOT IN ('needs_review', 'rejected')
+          AND trim(coalesce(localization.short_description, '')) <> ''
+      )
+      AND (
+        EXISTS (
+          SELECT 1 FROM tool_key_features feature
+          WHERE feature.tool_id = {tool_alias}.id
+        )
+        OR EXISTS (
+          SELECT 1 FROM tool_localizations localization
+          WHERE localization.tool_id = {tool_alias}.id
+            AND localization.translation_status = 'published'
+            AND localization.published_at IS NOT NULL
+            AND json_array_length(coalesce(localization.feature_highlights, '[]')) > 0
+        )
+      )
+      AND (
+        {tool_alias}.primary_category_id IS NOT NULL
+        OR EXISTS (
+          SELECT 1 FROM tool_categories category
+          WHERE category.tool_id = {tool_alias}.id
+        )
+      )
+      AND EXISTS (
+        SELECT 1 FROM tool_sources source
+        WHERE source.tool_id = {tool_alias}.id
+      )
+    """
+
+
+class D1CatalogPublisher:
+    def __init__(
+        self,
+        d1: D1Client,
+        runner_instance_id: str,
+        policy_version: str = CATALOG_AUTO_PUBLISH_POLICY_VERSION,
+    ):
+        self.d1 = d1
+        self.runner_instance_id = runner_instance_id
+        self.policy_version = policy_version
+
+    async def publish_ready(self, limit: int) -> dict[str, int]:
+        effective_limit = min(CATALOG_AUTO_PUBLISH_MAX_LIMIT, max(1, int(limit)))
+        predicate = tool_live_ready_predicate("t")
+        rows = await self.d1.query(
+            f"""
+            SELECT t.id
+            FROM tools t
+            WHERE t.status = 'pending_review'
+              AND t.duplicate_of_tool_id IS NULL
+              AND ({predicate})
+            ORDER BY t.id
+            LIMIT ?
+            """,
+            [effective_limit],
+            operation="catalog.auto_publish.select",
+        )
+        tool_ids = [int(row["id"]) for row in rows if int(row.get("id") or 0) > 0]
+        if not tool_ids:
+            return {"selected": 0, "published": 0, "skipped": 0}
+
+        placeholders = ", ".join("?" for _ in tool_ids)
+        old_value = json.dumps({"status": "pending_review"}, separators=(",", ":"))
+        new_value = json.dumps({"status": "published"}, separators=(",", ":"))
+        notes = (
+            "Automated catalog publish"
+            f"; policy={self.policy_version}"
+            f"; instance={self.runner_instance_id}"
+        )
+        results = await self.d1.batch(
+            [
+                (
+                    f"""
+                    INSERT INTO tool_change_log (
+                      tool_id, change_type, old_value, new_value, verified_at, notes
+                    )
+                    SELECT
+                      t.id,
+                      'status_changed',
+                      ?,
+                      ?,
+                      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                      ?
+                    FROM tools t
+                    WHERE t.id IN ({placeholders})
+                      AND t.status = 'pending_review'
+                      AND t.duplicate_of_tool_id IS NULL
+                      AND ({predicate})
+                    """,
+                    [old_value, new_value, notes, *tool_ids],
+                ),
+                (
+                    f"""
+                    UPDATE tools
+                    SET status = 'published',
+                        first_published_at = coalesce(
+                          first_published_at,
+                          strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                        ),
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE id IN ({placeholders})
+                      AND status = 'pending_review'
+                      AND duplicate_of_tool_id IS NULL
+                      AND ({tool_live_ready_predicate('tools')})
+                    """,
+                    tool_ids,
+                ),
+            ],
+            operation="catalog.auto_publish.commit",
+        )
+        published = 0
+        if len(results) >= 2:
+            published = int((results[1].get("meta") or {}).get("changes") or 0)
+        return {
+            "selected": len(tool_ids),
+            "published": published,
+            "skipped": max(0, len(tool_ids) - published),
+        }
 
 
 class D1EnrichmentStore:
@@ -11874,6 +12037,23 @@ async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = Non
         category_fallback_model=config.category_classification_fallback_model,
         category_prompt_version=CATEGORY_CLASSIFICATION_PROMPT_VERSION,
     )
+    publication = {"selected": 0, "published": 0, "skipped": 0, "failed": 0}
+    if getattr(config, "catalog_auto_publish_enabled", True):
+        try:
+            publication.update(
+                await D1CatalogPublisher(
+                    d1,
+                    config.runner_instance_id,
+                ).publish_ready(
+                    getattr(config, "catalog_auto_publish_limit", 25)
+                )
+            )
+            log_info("catalog_auto_publish.batch.done", **publication)
+        except Exception as error:
+            publication["failed"] = 1
+            log_error("catalog_auto_publish.batch.failed", error=str(error)[:500])
+    else:
+        log_debug("catalog_auto_publish.disabled", kill_switch="CATALOG_AUTO_PUBLISH_ENABLED=0")
     browser_client = CloudflareBrowserRunAssetClient(config)
     uploader = R2AssetUploader(config)
     await uploader.check_access()
@@ -11897,6 +12077,10 @@ async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = Non
         "enrichment_ready": 0,
         "enrichment_blocked": 0,
         "enrichment_evaluated": 0,
+        "auto_publish_selected": publication["selected"],
+        "auto_publish_published": publication["published"],
+        "auto_publish_skipped": publication["skipped"],
+        "auto_publish_failed": publication["failed"],
     }
 
     async def guarded(task: AssetTask) -> None:
@@ -12816,7 +13000,7 @@ def runtime_profile_for_args(args: argparse.Namespace) -> tuple[str, tuple[str, 
     if args.periodic_facts:
         return "periodic-facts-worker", ("traffic", "domain_state")
     if args.assets:
-        return "assets-worker", ("assets", "enrichment")
+        return "assets-worker", ("assets", "enrichment", "catalog_publish")
     if args.pricing:
         return "pricing-monitor-worker", ("pricing",)
     if args.taxonomy:
@@ -12824,7 +13008,15 @@ def runtime_profile_for_args(args: argparse.Namespace) -> tuple[str, tuple[str, 
     if args.domain_state:
         return "domain-facts-worker", ("domain_state",)
     if args.all:
-        workloads = ["assets", "traffic", "domain_state", "pricing", "taxonomy", "enrichment"]
+        workloads = [
+            "assets",
+            "traffic",
+            "domain_state",
+            "pricing",
+            "taxonomy",
+            "enrichment",
+            "catalog_publish",
+        ]
         return "tool-data-runner-legacy-all", tuple(workloads)
     if any(
         (
