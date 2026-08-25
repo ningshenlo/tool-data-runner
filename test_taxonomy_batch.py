@@ -15,6 +15,7 @@ from taxonomy_batch import (
     extract_response_output_text,
     is_retryable_stage_error,
     parse_batch_output_line,
+    poll_active_batches,
     resume_due_model_retries,
     response_usage,
     schedule_source_retry,
@@ -825,6 +826,179 @@ class TaxonomyBatchStateMachineTests(unittest.IsolatedAsyncioTestCase):
             (item_id,),
         ).fetchone()
         self.assertEqual(tuple(item), ("pending", "model", 1))
+
+    async def test_large_batch_reserves_requests_in_d1_safe_chunks_before_openai(self):
+        request_count = 130
+        for offset in range(request_count):
+            tool_id = 1000 + offset
+            self.connection.execute(
+                "INSERT INTO tools VALUES (?, 'independent_product', 'auto')",
+                (tool_id,),
+            )
+            item_id = self.connection.execute(
+                """
+                INSERT INTO taxonomy_batch_items (
+                  tool_id, pipeline_version, prompt_version, taxonomy_version,
+                  status, current_stage, source_url, source_text,
+                  source_content_hash, existing_entity_kind,
+                  existing_entity_source
+                ) VALUES (?, ?, 'chunk-test', 2, 'running', 'l1',
+                          'https://example.com', 'Product evidence', 'hash',
+                          'independent_product', 'auto')
+                """,
+                [tool_id, f"chunk-test-{offset}"],
+            ).lastrowid
+            self.connection.execute(
+                """
+                INSERT INTO taxonomy_batch_requests (
+                  item_id, custom_id, stage, model, reasoning_effort,
+                  max_output_tokens, request_json
+                ) VALUES (?, ?, 'l1', 'gpt-5.6-luna', 'low', 2048, ?)
+                """,
+                [item_id, f"chunk-test-{offset}", json.dumps({"offset": offset})],
+            )
+        self.connection.commit()
+
+        class VariableLimitedD1(AsyncSqliteD1):
+            def __init__(self, connection):
+                super().__init__(connection)
+                self.max_bound_parameters = 0
+
+            async def run(self, sql, params=None, **kwargs):
+                bound = params or []
+                self.max_bound_parameters = max(
+                    self.max_bound_parameters, len(bound)
+                )
+                if len(bound) > 100:
+                    raise RuntimeError("too many SQL variables")
+                return await super().run(sql, bound, **kwargs)
+
+        limited_d1 = VariableLimitedD1(self.connection)
+        test_case = self
+
+        class SuccessfulOpenAI:
+            def __init__(self):
+                self.upload_calls = 0
+                self.create_calls = 0
+
+            async def upload_jsonl(self, *_args, **_kwargs):
+                self.upload_calls += 1
+                reserved = test_case.connection.execute(
+                    """
+                    SELECT COUNT(*) FROM taxonomy_batch_requests
+                    WHERE job_id IS NOT NULL AND status = 'queued'
+                    """
+                ).fetchone()[0]
+                test_case.assertEqual(reserved, request_count)
+                return {"id": "file-chunk-test"}
+
+            async def create_batch(self, *_args, **_kwargs):
+                self.create_calls += 1
+                return {"id": "batch-chunk-test", "status": "validating"}
+
+        openai = SuccessfulOpenAI()
+        counts = await submit_queued_batches(
+            limited_d1, self.config, self.catalog, openai
+        )
+        self.assertEqual(counts["batches_submitted"], 1)
+        self.assertEqual(counts["requests_submitted"], request_count)
+        self.assertEqual(counts["submit_failed"], 0)
+        self.assertEqual(openai.upload_calls, 1)
+        self.assertEqual(openai.create_calls, 1)
+        self.assertLessEqual(limited_d1.max_bound_parameters, 100)
+        submitted = self.connection.execute(
+            """
+            SELECT COUNT(*), COUNT(DISTINCT job_id)
+            FROM taxonomy_batch_requests WHERE status = 'submitted'
+            """
+        ).fetchone()
+        self.assertEqual(tuple(submitted), (request_count, 1))
+
+    async def test_post_create_checkpoint_failure_cannot_duplicate_submission(self):
+        item_id = self.connection.execute(
+            """
+            INSERT INTO taxonomy_batch_items (
+              tool_id, pipeline_version, prompt_version, taxonomy_version,
+              status, current_stage, source_url, source_text,
+              source_content_hash, existing_entity_kind, existing_entity_source
+            ) VALUES (
+              10, 'checkpoint-test', 'checkpoint-test', 2,
+              'running', 'profile', 'https://acme.example',
+              'Acme creates images.', 'hash', 'unresolved', 'auto'
+            )
+            """
+        ).lastrowid
+        self.connection.commit()
+        await enqueue_stage(
+            self.d1, self.config, self.catalog, item_id=item_id, stage="profile"
+        )
+
+        class CheckpointFailsOnceD1(AsyncSqliteD1):
+            def __init__(self, connection):
+                super().__init__(connection)
+                self.fail_submitted_checkpoint = True
+
+            async def run(self, sql, params=None, **kwargs):
+                normalized = " ".join(sql.split())
+                if (
+                    self.fail_submitted_checkpoint
+                    and "SET status = 'submitted'" in normalized
+                ):
+                    self.fail_submitted_checkpoint = False
+                    raise RuntimeError("temporary D1 checkpoint failure")
+                return await super().run(sql, params, **kwargs)
+
+        class SuccessfulOpenAI:
+            def __init__(self):
+                self.upload_calls = 0
+                self.create_calls = 0
+
+            async def upload_jsonl(self, *_args, **_kwargs):
+                self.upload_calls += 1
+                return {"id": "file-checkpoint-test"}
+
+            async def create_batch(self, *_args, **_kwargs):
+                self.create_calls += 1
+                return {"id": "batch-checkpoint-test", "status": "validating"}
+
+            async def retrieve_batch(self, *_args, **_kwargs):
+                return {
+                    "id": "batch-checkpoint-test",
+                    "status": "in_progress",
+                    "request_counts": {"completed": 0, "failed": 0},
+                }
+
+        d1 = CheckpointFailsOnceD1(self.connection)
+        first_openai = SuccessfulOpenAI()
+        counts = await submit_queued_batches(
+            d1, self.config, self.catalog, first_openai
+        )
+        self.assertEqual(counts["batches_submitted"], 1)
+        self.assertEqual(counts["submission_persist_failed"], 1)
+        reserved = self.connection.execute(
+            """
+            SELECT status, job_id FROM taxonomy_batch_requests
+            WHERE item_id = ?
+            """,
+            [item_id],
+        ).fetchone()
+        self.assertEqual(reserved["status"], "queued")
+        self.assertIsNotNone(reserved["job_id"])
+
+        second_openai = SuccessfulOpenAI()
+        second_counts = await submit_queued_batches(
+            d1, self.config, self.catalog, second_openai
+        )
+        self.assertEqual(second_counts["batches_submitted"], 0)
+        self.assertEqual(second_openai.upload_calls, 0)
+        self.assertEqual(second_openai.create_calls, 0)
+
+        await poll_active_batches(d1, self.config, self.catalog, first_openai)
+        recovered_status = self.connection.execute(
+            "SELECT status FROM taxonomy_batch_requests WHERE item_id = ?",
+            [item_id],
+        ).fetchone()[0]
+        self.assertEqual(recovered_status, "submitted")
 
 
 if __name__ == "__main__":

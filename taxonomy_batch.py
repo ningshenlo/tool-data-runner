@@ -7,6 +7,7 @@ writes the legacy ``tools.primary_category_id`` or ``tool_categories`` fields.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 from dataclasses import dataclass
@@ -60,6 +61,8 @@ STAGES = {
     "leaf_escalation",
     "capability",
 }
+D1_REQUEST_RESERVATION_CHUNK_SIZE = 50
+D1_SUBMISSION_PERSIST_ATTEMPTS = 3
 
 
 def _json(value: Any) -> str:
@@ -1330,6 +1333,120 @@ async def seed_batch_items(
     return counts
 
 
+def _request_id_chunks(requests: list[dict[str, Any]]) -> list[list[int]]:
+    request_ids = [int(row.get("id") or 0) for row in requests]
+    if any(request_id <= 0 for request_id in request_ids):
+        raise RuntimeError("taxonomy batch request reservation contains an invalid id")
+    return [
+        request_ids[offset : offset + D1_REQUEST_RESERVATION_CHUNK_SIZE]
+        for offset in range(0, len(request_ids), D1_REQUEST_RESERVATION_CHUNK_SIZE)
+    ]
+
+
+async def _reserve_requests_for_job(
+    d1: Any,
+    *,
+    job_id: int,
+    requests: list[dict[str, Any]],
+    now: str,
+) -> None:
+    """Fence requests before the irreversible OpenAI Batch creation call."""
+    try:
+        for request_ids in _request_id_chunks(requests):
+            placeholders = ",".join("?" for _ in request_ids)
+            await d1.run(
+                f"""
+                UPDATE taxonomy_batch_requests
+                SET job_id = ?, updated_at = ?
+                WHERE id IN ({placeholders})
+                  AND status = 'queued' AND job_id IS NULL
+                """,
+                [job_id, now, *request_ids],
+            )
+        rows = await d1.query(
+            """
+            SELECT COUNT(*) AS reserved_count
+            FROM taxonomy_batch_requests
+            WHERE job_id = ? AND status = 'queued'
+            """,
+            [job_id],
+        )
+        reserved_count = int(rows[0].get("reserved_count") or 0) if rows else 0
+        if reserved_count != len(requests):
+            raise RuntimeError(
+                "taxonomy_batch_request_reservation_incomplete: "
+                f"expected={len(requests)} reserved={reserved_count}"
+            )
+    except Exception:
+        await d1.run(
+            """
+            UPDATE taxonomy_batch_requests
+            SET job_id = NULL, updated_at = ?
+            WHERE job_id = ? AND status = 'queued'
+            """,
+            [now, job_id],
+        )
+        raise
+
+
+async def _mark_job_requests_submitted(d1: Any, job_id: int, now: str) -> None:
+    await d1.run(
+        """
+        UPDATE taxonomy_batch_requests
+        SET status = 'submitted', submitted_at = COALESCE(submitted_at, ?),
+            updated_at = ?
+        WHERE job_id = ? AND status = 'queued'
+        """,
+        [now, now, job_id],
+    )
+
+
+async def _persist_remote_batch_job(
+    d1: Any,
+    *,
+    job_id: int,
+    batch_id: str,
+    input_file_id: str,
+    status: str,
+    batch: dict[str, Any],
+    now: str,
+) -> None:
+    """Retry the idempotent local checkpoint after remote Batch creation."""
+    last_error: Exception | None = None
+    for attempt in range(D1_SUBMISSION_PERSIST_ATTEMPTS):
+        try:
+            await d1.run(
+                """
+                UPDATE taxonomy_batch_jobs
+                SET openai_batch_id = ?, input_file_id = ?, status = ?, raw_json = ?,
+                    submitted_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                [batch_id, input_file_id, status, _json(batch), now, now, job_id],
+            )
+            return
+        except Exception as error:
+            last_error = error
+            if attempt < D1_SUBMISSION_PERSIST_ATTEMPTS - 1:
+                await asyncio.sleep(0.25 * (2**attempt))
+    try:
+        await d1.run(
+            """
+            UPDATE taxonomy_batch_jobs
+            SET openai_batch_id = ?, input_file_id = ?, status = ?,
+                submitted_at = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            [batch_id, input_file_id, status, now, now, job_id],
+        )
+        return
+    except Exception as fallback_error:
+        raise RuntimeError(
+            "remote_batch_created_but_checkpoint_failed: "
+            f"batch_id={batch_id} error={_safe_error(fallback_error)}"
+        ) from (last_error or fallback_error)
+
+
 async def submit_queued_batches(
     d1: Any,
     config: Any,
@@ -1359,6 +1476,8 @@ async def submit_queued_batches(
         "requests_submitted": 0,
         "submit_failed": 0,
         "submit_retries_scheduled": 0,
+        "reservation_failed": 0,
+        "submission_persist_failed": 0,
         "provider_blocked": 0,
     }
     for (stage, model, effort), requests in grouped.items():
@@ -1373,6 +1492,34 @@ async def submit_queued_batches(
             [stage, model, effort, len(requests), now, now],
         )
         job_id = int(meta.get("last_row_id") or 0)
+        try:
+            await _reserve_requests_for_job(
+                d1, job_id=job_id, requests=requests, now=now
+            )
+        except Exception as error:
+            counts["submit_failed"] += len(requests)
+            counts["reservation_failed"] += len(requests)
+            await d1.run(
+                """
+                UPDATE taxonomy_batch_jobs
+                SET status = 'failed', error = ?, completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                [_safe_error(error), now, now, job_id],
+            )
+            from runner import log_error
+
+            log_error(
+                "taxonomy_batch.reservation_failed",
+                local_job_id=job_id,
+                stage=stage,
+                model=model,
+                request_count=len(requests),
+                error=str(error)[:500],
+            )
+            continue
+
+        remote_batch_created = False
         try:
             jsonl = "\n".join(str(row.get("request_json") or "") for row in requests) + "\n"
             uploaded = await openai.upload_jsonl(
@@ -1392,28 +1539,50 @@ async def submit_queued_batches(
             batch_id = str(batch.get("id") or "")
             if not batch_id:
                 raise RuntimeError("OpenAI batch creation returned no batch id")
+            remote_batch_created = True
             status = str(batch.get("status") or "validating")
-            await d1.run(
-                """
-                UPDATE taxonomy_batch_jobs
-                SET openai_batch_id = ?, input_file_id = ?, status = ?, raw_json = ?,
-                    submitted_at = ?, updated_at = ?
-                WHERE id = ?
-                """,
-                [batch_id, input_file_id, status, _json(batch), now, now, job_id],
-            )
-            placeholders = ",".join("?" for _ in requests)
-            await d1.run(
-                f"""
-                UPDATE taxonomy_batch_requests
-                SET job_id = ?, status = 'submitted', submitted_at = ?, updated_at = ?
-                WHERE id IN ({placeholders}) AND status = 'queued'
-                """,
-                [job_id, now, now, *[int(row["id"]) for row in requests]],
+            await _persist_remote_batch_job(
+                d1,
+                job_id=job_id,
+                batch_id=batch_id,
+                input_file_id=input_file_id,
+                status=status,
+                batch=batch,
+                now=now,
             )
             counts["batches_submitted"] += 1
             counts["requests_submitted"] += len(requests)
+            try:
+                await _mark_job_requests_submitted(d1, job_id, now)
+            except Exception as error:
+                counts["submission_persist_failed"] += len(requests)
+                from runner import log_error
+
+                log_error(
+                    "taxonomy_batch.request_checkpoint_deferred",
+                    local_job_id=job_id,
+                    openai_batch_id=batch_id,
+                    stage=stage,
+                    model=model,
+                    request_count=len(requests),
+                    error=str(error)[:500],
+                )
         except Exception as error:
+            if remote_batch_created:
+                counts["batches_submitted"] += 1
+                counts["requests_submitted"] += len(requests)
+                counts["submission_persist_failed"] += len(requests)
+                from runner import log_error
+
+                log_error(
+                    "taxonomy_batch.remote_checkpoint_failed",
+                    local_job_id=job_id,
+                    stage=stage,
+                    model=model,
+                    request_count=len(requests),
+                    error=str(error)[:500],
+                )
+                continue
             counts["submit_failed"] += len(requests)
             if is_provider_blocked_error(error):
                 counts["provider_blocked"] = 1
@@ -1425,16 +1594,25 @@ async def submit_queued_batches(
                 """,
                 [_safe_error(error), now, now, job_id],
             )
-            if not counts["provider_blocked"]:
+            if counts["provider_blocked"]:
+                await d1.run(
+                    """
+                    UPDATE taxonomy_batch_requests
+                    SET job_id = NULL, updated_at = ?
+                    WHERE job_id = ? AND status = 'queued'
+                    """,
+                    [now, job_id],
+                )
+            else:
+                await d1.run(
+                    """
+                    UPDATE taxonomy_batch_requests
+                    SET status = 'failed', error = ?, completed_at = ?, updated_at = ?
+                    WHERE job_id = ? AND status = 'queued'
+                    """,
+                    [_safe_error(error), now, now, job_id],
+                )
                 for request in requests:
-                    await d1.run(
-                        """
-                        UPDATE taxonomy_batch_requests
-                        SET status = 'failed', error = ?, completed_at = ?, updated_at = ?
-                        WHERE id = ? AND status = 'queued'
-                        """,
-                        [_safe_error(error), now, now, int(request.get("id") or 0)],
-                    )
                     outcome = await _handle_stage_failure(
                         d1, config, catalog, request, _safe_error(error)
                     )
@@ -2261,7 +2439,7 @@ async def poll_active_batches(
             OR EXISTS (
               SELECT 1 FROM taxonomy_batch_requests request
               WHERE request.job_id = taxonomy_batch_jobs.id
-                AND request.status = 'submitted'
+                AND request.status IN ('queued', 'submitted')
             )
           )
         ORDER BY id
@@ -2278,6 +2456,11 @@ async def poll_active_batches(
         job_id = int(job.get("id") or 0)
         batch_id = str(job.get("openai_batch_id") or "")
         try:
+            await _mark_job_requests_submitted(
+                d1,
+                job_id,
+                str(job.get("submitted_at") or utc_now_iso()),
+            )
             batch = await openai.retrieve_batch(batch_id)
             status = str(batch.get("status") or job.get("status") or "in_progress")
             request_counts = (
