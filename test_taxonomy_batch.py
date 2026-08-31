@@ -217,6 +217,114 @@ class TaxonomyBatchPureTests(unittest.TestCase):
         self.assertIn("next_retry_at", retry_migration)
         self.assertIn("idx_taxonomy_batch_items_retry_due", retry_migration)
 
+    def test_post_seed_legacy_backfill_preserves_trusted_primary_and_prefers_leaf(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.executescript(
+            """
+            CREATE TABLE tools (
+              id INTEGER PRIMARY KEY,
+              status TEXT NOT NULL,
+              duplicate_of_tool_id INTEGER,
+              primary_category_id INTEGER
+            );
+            CREATE TABLE categories (
+              id INTEGER PRIMARY KEY,
+              parent_category_id INTEGER
+            );
+            CREATE TABLE tool_categories (
+              tool_id INTEGER NOT NULL,
+              category_id INTEGER NOT NULL,
+              source TEXT NOT NULL,
+              UNIQUE(tool_id, category_id)
+            );
+            CREATE TABLE taxonomy_terms (
+              id INTEGER PRIMARY KEY,
+              dimension TEXT NOT NULL,
+              parent_id INTEGER,
+              source_category_id INTEGER,
+              status TEXT NOT NULL,
+              display_order INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE product_taxonomy_assignments (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              tool_id INTEGER NOT NULL,
+              term_id INTEGER NOT NULL,
+              run_id INTEGER,
+              is_primary INTEGER NOT NULL,
+              confidence REAL,
+              decision_status TEXT NOT NULL,
+              source TEXT NOT NULL,
+              evidence_json TEXT,
+              assigned_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              UNIQUE(tool_id, term_id)
+            );
+            CREATE TABLE taxonomy_change_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              actor TEXT,
+              action TEXT NOT NULL,
+              payload_json TEXT
+            );
+            INSERT INTO tools VALUES
+              (1, 'pending_enrich', NULL, 10),
+              (2, 'published', NULL, 10);
+            INSERT INTO categories VALUES (10, NULL), (20, 10);
+            INSERT INTO tool_categories VALUES
+              (1, 10, 'auto'), (1, 20, 'auto'),
+              (2, 10, 'auto'), (2, 20, 'auto');
+            INSERT INTO taxonomy_terms VALUES
+              (100, 'primary_category', NULL, 10, 'active', 10),
+              (200, 'primary_category', 100, 20, 'active', 20);
+            INSERT INTO product_taxonomy_assignments (
+              tool_id, term_id, run_id, is_primary, confidence,
+              decision_status, source, evidence_json, assigned_at, updated_at
+            ) VALUES (
+              2, 200, 99, 1, 0.95,
+              'verified', 'manual', '{}',
+              '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z'
+            );
+            """
+        )
+        migration = (
+            Path(__file__).resolve().parent.parent
+            / "sigpik"
+            / "d1"
+            / "migrations"
+            / "0089_backfill_post_seed_legacy_taxonomy.sql"
+        ).read_text(encoding="utf-8")
+        connection.executescript(migration)
+
+        tool_one = connection.execute(
+            """
+            SELECT term_id, decision_status, source
+            FROM product_taxonomy_assignments
+            WHERE tool_id = 1 AND is_primary = 1
+            """
+        ).fetchall()
+        self.assertEqual(
+            [(row["term_id"], row["decision_status"], row["source"]) for row in tool_one],
+            [(200, "legacy", "legacy")],
+        )
+        tool_two = connection.execute(
+            """
+            SELECT term_id, decision_status, source
+            FROM product_taxonomy_assignments
+            WHERE tool_id = 2 AND is_primary = 1
+            """
+        ).fetchall()
+        self.assertEqual(
+            [(row["term_id"], row["decision_status"], row["source"]) for row in tool_two],
+            [(200, "verified", "manual")],
+        )
+        self.assertEqual(
+            connection.execute(
+                "SELECT count(*) AS total FROM product_taxonomy_assignments WHERE tool_id = 2"
+            ).fetchone()["total"],
+            1,
+        )
+        connection.close()
+
 
 class OpenAIBatchClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_rest_endpoints_and_existing_key_are_used(self):

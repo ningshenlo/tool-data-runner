@@ -24,13 +24,11 @@ Shadow mode requires migration `0039_pricing_claims_pipeline.sql` and configured
 
 While Shadow is enabled, each pricing batch fills unused capacity with eligible legacy `manual_review` tasks that do not yet carry the V2 replay checkpoint. Normal queued/retry work remains first priority. `RUNNER_PRICING_MANUAL_REVIEW_REPLAY_LIMIT` caps the old backlog per batch (default `5`; `0` is the replay kill switch) independently of the normal pricing batch limit. The runner writes that checkpoint only after the V2 snapshot and artifacts persist successfully, including the zero-Claim outcome, so the backlog is resumable and cannot loop forever. Failed V2 capture reuses the task's existing bounded attempt budget. This replay never approves the legacy extraction and never publishes a Claim.
 
-Assets mode scans active catalog tools (`pending_enrich`, `pending_review`, and `published`) missing required catalog data, claims `asset_tasks`, captures homepage screenshots with Cloudflare Browser Run, uploads screenshots/favicons to R2, and writes assets, localization, categories, and key features. Every assets batch also refreshes the canonical readiness projection for the active catalog independently of whether an asset task was claimed, so manual fixes can advance a `pending_enrich` tool to `pending_review` and published records retain current quality signals. The same worker automatically publishes bounded batches of `pending_review` tools that still pass the complete live-readiness predicate at commit time. Content-safety, screenshot, localization/name, feature, category, source, duplicate, or readiness failures remain in review. Each successful transition writes a policy- and runner-stamped `tool_change_log` entry before the status change in the same D1 batch.
+Assets mode scans active catalog tools (`pending_enrich`, `pending_review`, and `published`) missing required asset or homepage facts, claims `asset_tasks`, captures homepage screenshots with Cloudflare Browser Run, uploads screenshots/favicons to R2, and writes assets, localization, content-safety, and key features. It does not classify or repair categories. Every assets batch also refreshes the canonical readiness projection for the active catalog independently of whether an asset task was claimed, so taxonomy or manual fixes can advance a `pending_enrich` tool to `pending_review` and published records retain current quality signals. The same worker automatically publishes bounded batches of `pending_review` tools that still pass the complete live-readiness predicate at commit time. Content-safety, screenshot, localization/name, feature, category, source, duplicate, or readiness failures remain in review. Each successful transition writes a policy- and runner-stamped `tool_change_log` entry before the status change in the same D1 batch.
 
-Asset retries are requirement-driven and bounded. Before every attempt the runner checks the current screenshot, favicon, published description, key features, and category state, then runs only the missing stages. Core metadata, key-feature extraction, and category classification use separate Browser Run requests, so a later retry never recaptures or re-uploads a screenshot or favicon that already succeeded. Missing AI output falls back to deterministic facts extracted from the verified homepage and to lexical matching against the active taxonomy. Incomplete dead letters are revived after a generation-based cooldown (24 hours, 7 days, then 30 days), while content-safety blocks are never revived automatically.
+Asset retries are requirement-driven and bounded. Before every attempt the runner checks the current screenshot, favicon, published description, key features, and content-safety state, then runs only the missing stages. Core metadata and key-feature extraction use separate Browser Run requests, so a later retry never recaptures or re-uploads a screenshot or favicon that already succeeded. Missing key-feature output falls back to deterministic facts extracted from the verified homepage. Incomplete dead letters are revived after a generation-based cooldown (24 hours, 7 days, then 30 days), while content-safety blocks are never revived automatically.
 
-Category classification first fetches rendered homepage HTML, removes navigation, footer, scripts, styles, templates, and SVG markup, prefers semantic `<main>` / `role=main`, and falls back to the cleaned body. Only this bounded main content is sent through Cloudflare Browser Rendering `/json` using inline HTML transport; the model-side request never navigates to the real product URL or a neutral external page. **DeepSeek V4 Flash** (`deepseek/deepseek-v4-flash`) is primary and Workers AI Llama 3.3 70B is fallback. DeepSeek custom-AI payloads request non-thinking mode and cap output tokens. Classification remains hierarchical: first choose one top-level category, then only among that parent's children. Stored raw results include the cleaned-input character count and content hash as well as the model chain, prompt version, and taxonomy hash. If the model chain is unavailable or returns an empty result, the runner assigns a deterministic taxonomy fallback from the official description and extracted features, records that provenance, and leaves the final catalog decision to the existing `pending_review` gate.
-
-Published-category backfill re-runs hierarchical classification for `status='published'` tools that still carry pre-hierarchical / unprovenanced category rows. It never selects `rejected` tools, never overwrites `source='manual'` assignments, and only replaces live categories after a successful classification. Failures keep the previous live categories and write audit/error only. Successful runs stamp `category_classification_raw.backfill = published-legacy-v1` so the job is resumable.
+The standalone taxonomy worker is the only production classification owner. It writes canonical `product_taxonomy_assignments` through the OpenAI Batch/Responses pipeline (`gpt-5.6-luna`, with selective `gpt-5.6-terra` escalation). After each pass, a separate deterministic compatibility projector mirrors the effective accepted primary into `tools.primary_category_id` and `tool_categories` for existing readers. The projector preserves human-created legacy links, records `legacy_category_materializations`, and never creates taxonomy assignments. Migration `0089_backfill_post_seed_legacy_taxonomy.sql` imports legacy links created after the original taxonomy seed without replacing a trusted primary.
 
 Domain-state mode refreshes each Ahrefs DR once every 30 days by default. Request starts are paced at 60 per minute: one request per second, matching Ahrefs' documented default limit. The domain queue polls every second instead of pausing for the former fixed 15-minute interval between batches. RDAP is independent and currently runs only once per domain; `done`, `no_data`, and `failed` outcomes are persisted so later DR refreshes never repeat the RDAP request. Tasks use expiring leases and fenced completion tokens before updating `domain_states`. Every workload writes D1-backed runner heartbeats and batch history to `runner_instances` and `runner_runs`.
 
@@ -56,7 +54,7 @@ Fill `.env` with:
 - Traffic release gate: `TRAFFIC_RELEASE_PROBE_DOMAIN` (default `chatgpt.com`), `TRAFFIC_RELEASE_PROBE_START_DAY` (default `7`), `TRAFFIC_RELEASE_PROBE_INTERVAL_SECONDS` (default `21600`), and `TRAFFIC_RELEASE_QUEUE_LIMIT` (default `5000`).
 - Optional pricing AI fallback: `OPENAI_API_KEY` or `OPENAI_API`, plus `OPENAI_PRICING_MODEL` and `OPENAI_PRICING_FALLBACK_MODEL`.
 - Optional rendered-page fallback: `CLOUDFLARE_BROWSER_RENDERING_ENABLED`, `CLOUDFLARE_BROWSER_RENDERING_API_TOKEN`, `CLOUDFLARE_BROWSER_RENDERING_TIMEOUT_SECONDS`.
-- Assets mode: `RUNNER_ASSET_LIMIT`, `CATALOG_AUTO_PUBLISH_ENABLED` (default `1`, emergency kill switch), `CATALOG_AUTO_PUBLISH_LIMIT` (default `25`, hard maximum `100`), `CLOUDFLARE_BROWSER_RENDERING_API_TOKEN`, `CLOUDFLARE_WORKERS_AI_API_TOKEN`, `DEEPSEEK_API_KEY` (for DeepSeek V4 Flash category classification), `CATEGORY_MAIN_CONTENT_MAX_CHARS` (default `10000`), `CATEGORY_DEEPSEEK_MAX_OUTPUT_TOKENS` (default `1024`), `CLOUDFLARE_R2_ACCESS_KEY_ID`, `CLOUDFLARE_R2_SECRET_ACCESS_KEY`, `CLOUDFLARE_R2_BUCKET`, and optional `R2_PUBLIC_BASE_URL`. The Workers AI token is used for the category fallback model.
+- Assets mode: `RUNNER_ASSET_LIMIT`, `CATALOG_AUTO_PUBLISH_ENABLED` (default `1`, emergency kill switch), `CATALOG_AUTO_PUBLISH_LIMIT` (default `25`, hard maximum `100`), `CLOUDFLARE_BROWSER_RENDERING_API_TOKEN`, `CLOUDFLARE_R2_ACCESS_KEY_ID`, `CLOUDFLARE_R2_SECRET_ACCESS_KEY`, `CLOUDFLARE_R2_BUCKET`, and optional `R2_PUBLIC_BASE_URL`.
   Use the real R2 bucket name for `CLOUDFLARE_R2_BUCKET` (for example `sitesimgs`) and the public/custom domain for `R2_PUBLIC_BASE_URL` (for example `https://img.sigpik.com`). The D1 `tool_assets.storage_bucket` value remains `sitesimgs` for compatibility with the existing frontend.
 
 `wrangler.toml` points at the same `ainav` D1 database used by the frontend. Keep `CLOUDFLARE_D1_DATABASE_ID` in `.env` aligned with that file.
@@ -259,19 +257,6 @@ Capture missing homepage screenshots and favicons:
 python runner.py --assets --once --limit 10
 ```
 
-Reclassify published tools with legacy category data (resumable; rejects are skipped):
-
-```bash
-# Dry-run one tool first
-python runner.py --backfill-published-categories --dry-run --task-id 12345
-
-# Small live batch
-python runner.py --backfill-published-categories --limit 20
-
-# Continue until candidates are exhausted (repeat; already-backfilled tools are skipped)
-python runner.py --backfill-published-categories --limit 100
-```
-
 Run assets as a polling worker:
 
 ```bash
@@ -307,9 +292,10 @@ the candidate's coverage summary from the build output before running it.
 
 ## Shadow taxonomy (P2A)
 
-Multidim Shadow Mode classifies products into **new tables only**
-(product_profiles, classification_runs, product_taxonomy_assignments).
-It does **not** dual-write legacy primary_category_id / 	ool_categories.
+Multidim Shadow Mode writes model results into the canonical taxonomy tables
+(`product_profiles`, `classification_runs`, `product_taxonomy_assignments`). It
+does not model-write legacy category fields; the deterministic compatibility
+projector performs that projection after accepted assignments exist.
 
 Admin review is exception-based in production: `auto_accepted` assignments stay
 out of the default queue. The queue contains provisional/unresolved primaries and

@@ -1430,7 +1430,6 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             store,
             "https://img.example.test",
             2,
-            [],
         )
 
         self.assertEqual(status, "failed")
@@ -1487,7 +1486,6 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             store,
             "https://img.example.test",
             0,
-            [],
         )
 
         self.assertEqual(status, "failed")
@@ -1513,7 +1511,7 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         uploader.put_object.assert_not_awaited()
 
-    async def test_asset_queue_includes_category_only_gap(self) -> None:
+    async def test_asset_queue_ignores_taxonomy_only_gap(self) -> None:
         tool_id = self.add_tool("asset-category-gap")
         self.connection.executemany(
             """
@@ -1540,10 +1538,13 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         store = runner.D1AssetStore(self.d1)
         queued = await store.queue_missing_asset_tasks(10)
 
-        self.assertEqual(queued, 1)
-        self.assertEqual(await store.missing_asset_requirements(tool_id), ["category"])
-        row = self.task_row("asset_tasks", "tool_id = ? AND source = ?", [tool_id, runner.ASSET_SOURCE])
-        self.assertEqual(row["status"], "queued")
+        self.assertEqual(queued, 0)
+        self.assertEqual(await store.missing_asset_requirements(tool_id), [])
+        row = self.connection.execute(
+            "SELECT * FROM asset_tasks WHERE tool_id = ? AND source = ?",
+            [tool_id, runner.ASSET_SOURCE],
+        ).fetchone()
+        self.assertIsNone(row)
 
     async def test_asset_processing_retries_only_requirements_that_remain_missing(self) -> None:
         tool_id = self.add_tool("asset-metadata-only")
@@ -1633,12 +1634,11 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 store,
                 "https://img.example.test",
                 1,
-                [category["parent_slug"], category["child_slug"]],
             )
 
         self.assertEqual(status, "done")
         self.assertEqual(browser_client.feature_calls, 1)
-        self.assertEqual(browser_client.category_calls, 1)
+        self.assertEqual(browser_client.category_calls, 0)
         self.assertEqual(uploader.calls, [])
         self.assertEqual(await store.missing_asset_requirements(tool_id), [])
         row = self.task_row("asset_tasks", "tool_id = ? AND source = ?", [tool_id, runner.ASSET_SOURCE])
@@ -1647,6 +1647,17 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_asset_fallbacks_advance_a_qualified_tool_to_pending_review(self) -> None:
         tool_id = self.add_tool("auto-publish-ready")
         now = runner.utc_now_iso()
+        category_id = self.connection.execute(
+            "SELECT id FROM categories WHERE status = 'active' ORDER BY id LIMIT 1"
+        ).fetchone()["id"]
+        self.connection.execute(
+            "INSERT INTO tool_categories (tool_id, category_id, source) VALUES (?, ?, 'auto')",
+            [tool_id, category_id],
+        )
+        self.connection.execute(
+            "UPDATE tools SET primary_category_id = ? WHERE id = ?",
+            [category_id, tool_id],
+        )
         self.connection.execute(
             """
             INSERT INTO tool_sources (
@@ -1712,7 +1723,6 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 store,
                 "https://img.example.test",
                 0,
-                await store.category_catalog(),
             )
 
         self.assertEqual(status, "done")
@@ -1761,7 +1771,6 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 store,
                 "https://img.example.test",
                 1,
-                [],
             )
 
         self.assertEqual(status, "done")
@@ -1795,7 +1804,6 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 store,
                 "https://img.example.test",
                 0,
-                [],
             )
 
         self.assertEqual(status, "failed")
@@ -2324,8 +2332,8 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "SELECT category_classification_status, category_classification_attempts FROM tools WHERE id = ?",
             [tool_id],
         ).fetchone()
-        self.assertEqual(tool["category_classification_status"], "auto_retry")
-        self.assertEqual(tool["category_classification_attempts"], 0)
+        self.assertEqual(tool["category_classification_status"], "needs_manual")
+        self.assertEqual(tool["category_classification_attempts"], 3)
 
     async def test_content_safety_dead_letter_is_not_automatically_revived(self) -> None:
         tool_id = self.add_tool("asset-unsafe")
@@ -3742,6 +3750,12 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             runner.runtime_profile_for_args(taxonomy_args),
             ("taxonomy-worker", ("taxonomy",)),
         )
+
+        with (
+            redirect_stderr(io.StringIO()),
+            self.assertRaises(SystemExit),
+        ):
+            runner.parse_args(["--backfill-published-categories", "--dry-run"])
 
         with (
             redirect_stderr(io.StringIO()),

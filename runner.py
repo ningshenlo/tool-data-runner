@@ -52,7 +52,7 @@ TRAFFIC_METRICS_SCHEMA_VERSION = 2
 ASSET_SOURCE = "site_scraper"
 ASSET_DB_STORAGE_BUCKET = "sitesimgs"
 DEFAULT_R2_BUCKET = "sitesimgs"
-ASSET_REQUIREMENT_ORDER = ("content_safety", "screenshot", "favicon", "description", "key_features", "category")
+ASSET_REQUIREMENT_ORDER = ("content_safety", "screenshot", "favicon", "description", "key_features")
 AUTO_APPROVE_TOOL_NAME_CONFIDENCE = 85
 CATALOG_AUTO_PUBLISH_POLICY_VERSION = "catalog-auto-publish-v1"
 CATALOG_AUTO_PUBLISH_MAX_LIMIT = 100
@@ -7009,6 +7009,7 @@ class RunnerTelemetry:
                 "materialization_failed",
                 "stale",
                 "auto_publish_failed",
+                "legacy_projection_failed",
             )
             if int(counts.get(key) or 0) > 0
         }
@@ -7550,23 +7551,6 @@ class D1AssetStore:
             )
             changed = int(meta.get("changes") or 0)
             revived += changed
-            if changed:
-                await self.d1.run(
-                    """
-                    UPDATE tools
-                    SET category_classification_status = CASE
-                          WHEN category_classification_status = 'needs_manual' THEN 'auto_retry'
-                          ELSE category_classification_status
-                        END,
-                        category_classification_attempts = CASE
-                          WHEN category_classification_status = 'needs_manual' THEN 0
-                          ELSE category_classification_attempts
-                        END,
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    [now, tool_id],
-                )
         return revived
 
     async def queue_missing_asset_tasks(self, limit: int) -> int:
@@ -7624,14 +7608,6 @@ class D1AssetStore:
                       AND tl.translation_status = 'published'
                       AND tl.published_at IS NOT NULL
                       AND json_array_length(coalesce(tl.feature_highlights, '[]')) > 0
-                  )
-                )
-                OR (
-                  t.primary_category_id IS NULL
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM tool_categories tc
-                    WHERE tc.tool_id = t.id
                   )
                 )
               )
@@ -8817,24 +8793,12 @@ class D1AssetStore:
                   AND tl.translation_status = 'published'
                   AND tl.published_at IS NOT NULL
                   AND json_array_length(coalesce(tl.feature_highlights, '[]')) > 0
-              ) THEN 1 ELSE 0 END AS has_key_features,
-              CASE WHEN EXISTS (
-                SELECT 1
-                FROM tools t
-                WHERE t.id = ?
-                  AND t.primary_category_id IS NOT NULL
-              ) OR EXISTS (
-                SELECT 1
-                FROM tool_categories tc
-                WHERE tc.tool_id = ?
-              ) THEN 1 ELSE 0 END AS has_category
+              ) THEN 1 ELSE 0 END AS has_key_features
             """,
             [
                 tool_id,
                 tool_id,
                 ASSET_DB_STORAGE_BUCKET,
-                tool_id,
-                tool_id,
                 tool_id,
                 tool_id,
                 tool_id,
@@ -8848,7 +8812,6 @@ class D1AssetStore:
             "favicon": "has_favicon",
             "description": "has_description",
             "key_features": "has_key_features",
-            "category": "has_category",
         }
         missing = [
             requirement
@@ -11429,7 +11392,6 @@ async def process_asset_task(
     store: D1AssetStore,
     public_base_url: str,
     max_retries: int,
-    category_options: list[str] | list[CategoryCatalogEntry],
 ) -> str:
     last_error = "not_started"
     last_retryable = True
@@ -11558,60 +11520,6 @@ async def process_asset_task(
                         )
                     else:
                         record_stage_error("key_features", error)
-
-            if "category" in missing_before:
-                try:
-                    category_result = await browser_client.fetch_homepage_categories(
-                        task,
-                        category_options,
-                    )
-                    if not await store.renew_lease(task):
-                        return "stale"
-                    if category_result.metadata_error or (
-                        not category_result.category_l1 and not category_result.category_l2
-                    ):
-                        fallback_saved = await store.save_deterministic_tool_category(
-                            task,
-                            category_options,
-                        )
-                        if fallback_saved:
-                            log_info(
-                                "assets.category.deterministic_fallback",
-                                tool_id=task.tool_id,
-                                slug=task.canonical_slug,
-                                model_error=(category_result.metadata_error or "category_empty")[:200],
-                            )
-                        else:
-                            await store.record_category_classification_failure(
-                                task.tool_id,
-                                category_result.metadata_error or "category_empty",
-                                raw_output=category_result.category_raw_output,
-                            )
-                            record_stage_error(
-                                "category",
-                                category_result.metadata_error or "category_empty",
-                                retryable=category_result.metadata_retryable,
-                            )
-                    else:
-                        await store.save_tool_categories(task, category_result)
-                except Exception as error:
-                    try:
-                        fallback_saved = await store.save_deterministic_tool_category(
-                            task,
-                            category_options,
-                        )
-                    except Exception:
-                        fallback_saved = False
-                    if fallback_saved:
-                        log_info(
-                            "assets.category.deterministic_fallback",
-                            tool_id=task.tool_id,
-                            slug=task.canonical_slug,
-                            model_error=str(error)[:200],
-                        )
-                    else:
-                        await store.record_category_classification_failure(task.tool_id, str(error)[:500])
-                        record_stage_error("category", error)
 
             if "screenshot" in missing_before:
                 try:
@@ -12200,9 +12108,7 @@ async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = Non
         "assets_runner.batch.start",
         limit=effective_limit,
         concurrency=concurrency,
-        category_model=config.category_classification_model,
-        category_fallback_model=config.category_classification_fallback_model,
-        category_prompt_version=CATEGORY_CLASSIFICATION_PROMPT_VERSION,
+        category_owner="taxonomy-worker",
     )
     publication = {"selected": 0, "published": 0, "skipped": 0, "failed": 0}
     if getattr(config, "catalog_auto_publish_enabled", True):
@@ -12225,7 +12131,6 @@ async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = Non
     uploader = R2AssetUploader(config)
     await uploader.check_access()
     store = D1AssetStore(d1)
-    category_options = await store.category_catalog()
     revived = await store.revive_incomplete_dead_letter_tasks(effective_limit)
     log_info("assets_runner.revive_incomplete_dead_letters.done", revived=revived)
     queued = await store.queue_missing_asset_tasks(effective_limit)
@@ -12260,7 +12165,6 @@ async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = Non
                     store,
                     config.r2_public_base_url,
                     config.max_retries,
-                    category_options,
                 )
             except Exception as error:
                 status = "failed"
@@ -12862,6 +12766,9 @@ def taxonomy_batch_has_activity(counts: dict[str, int]) -> bool:
         "model_retries_resumed",
         "source_retry_scheduled",
         "source_retry_exhausted",
+        "legacy_projection_selected",
+        "legacy_projection_succeeded",
+        "legacy_projection_failed",
     )
     return any(int(counts.get(field) or 0) > 0 for field in activity_fields)
 
@@ -13332,7 +13239,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--backfill-published-categories",
         action="store_true",
-        help="reclassify published tools that still have pre-hierarchical category data",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--shadow-taxonomy",
@@ -13400,6 +13307,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--interval-seconds", type=int, default=None)
     args = parser.parse_args(argv)
+    if args.backfill_published_categories:
+        parser.error(
+            "--backfill-published-categories is retired; use --taxonomy and "
+            "the canonical taxonomy compatibility projector"
+        )
     selected = [
         args.pricing,
         args.assets,

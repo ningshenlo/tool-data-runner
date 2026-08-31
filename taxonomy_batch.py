@@ -1,8 +1,9 @@
 """Persistent OpenAI Batch API runner for multidimensional taxonomy.
 
-The module submits Responses API JSONL batches, persists every stage in D1 and
-can resume after either the process or an OpenAI batch is interrupted. It never
-writes the legacy ``tools.primary_category_id`` or ``tool_categories`` fields.
+The module submits Responses API JSONL batches and persists every canonical
+taxonomy stage in D1. A separate compatibility projector mirrors accepted
+primaries into legacy category fields after model work; those fields are never
+used as taxonomy authority.
 """
 
 from __future__ import annotations
@@ -2634,5 +2635,13 @@ async def run_openai_taxonomy_batch_once(
             """
         )
         counts["active_batches"] = int(active_rows[0].get("count") or 0) if active_rows else 0
+        from taxonomy_materialize import materialize_effective_primary_assignments
+
+        counts.update(
+            await materialize_effective_primary_assignments(
+                d1,
+                limit=max(effective_limit, 100),
+            )
+        )
     log_info("taxonomy_batch.pass", **counts)
     return counts
