@@ -11,6 +11,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY runner.py .
 COPY taxonomy_shadow.py .
 COPY taxonomy_batch.py .
+COPY taxonomy_materialize.py .
 COPY anti_bot_signatures.py .
 COPY classification_anomalies.py .
 COPY pricing ./pricing
