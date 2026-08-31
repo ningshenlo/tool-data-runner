@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import os
 import random
@@ -93,6 +94,9 @@ PRICING_USER_AGENT = (
 _PRICING_UA_GENERATOR: Any | None = None
 MAX_PRICING_HTML_BYTES = 1_200_000
 MAX_PRICING_TEXT_CHARS = 180_000
+MAX_HOMEPAGE_HTML_BYTES = 1_200_000
+HOMEPAGE_MAX_REDIRECTS = 8
+HOMEPAGE_BROWSER_6000_RETRY_DELAY_SECONDS = 6 * 60 * 60
 COMMON_PRICING_PATHS = (
     "/pricing",
     "/pricing/",
@@ -465,9 +469,20 @@ class ContentSafetyAssessment:
 
 
 class AssetPipelineError(RuntimeError):
-    def __init__(self, message: str, *, retryable: bool = True):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        error_code: str = "",
+        max_attempts: int | None = None,
+        retry_after_seconds: int | None = None,
+    ):
         super().__init__(message)
         self.retryable = retryable
+        self.error_code = error_code
+        self.max_attempts = max_attempts
+        self.retry_after_seconds = retry_after_seconds
 
 
 class PageQualityError(AssetPipelineError):
@@ -1222,6 +1237,49 @@ def asset_page_url(task: AssetTask) -> str:
         if parsed.scheme in {"http", "https"} and parsed.netloc:
             return candidate
     return f"https://{task.normalized_domain}"
+
+
+def homepage_url_host(url: str) -> str:
+    try:
+        return (urlsplit(url).hostname or "").strip(".").lower()
+    except ValueError:
+        return ""
+
+
+def is_safe_homepage_url(url: str) -> bool:
+    """Reject local/private targets before the runner performs a direct fetch."""
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").strip(".").lower()
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or (port is not None and port not in {80, 443})
+        or host == "localhost"
+        or host.endswith((".localhost", ".local", ".internal"))
+    ):
+        return False
+    try:
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        return True
+
+
+def homepage_urls_share_site(source_url: str, final_url: str) -> bool:
+    source_host = homepage_url_host(source_url)
+    final_host = homepage_url_host(final_url)
+    if not source_host or not final_host:
+        return False
+    return (
+        source_host == final_host
+        or source_host.endswith(f".{final_host}")
+        or final_host.endswith(f".{source_host}")
+    )
 
 
 def read_html_attribute(tag: str, name: str) -> str:
@@ -2000,6 +2058,8 @@ def classify_page_state(
 
     if http_status in {401, 403}:
         return PageQualityAssessment("access_denied", f"http_{http_status}", title)
+    if http_status in {404, 410}:
+        return PageQualityAssessment("not_found", f"http_{http_status}", title)
     if http_status == 429:
         return PageQualityAssessment("anti_bot", "http_429", title)
     if http_status is not None and http_status >= 500 and not html_body.strip():
@@ -2046,6 +2106,22 @@ def classify_page_state(
     phrase = next((item for item in human_check_phrases if item in visible_lower), "")
     if phrase:
         return PageQualityAssessment("captcha", "human_verification_body", phrase)
+
+    parked_phrases = (
+        "this domain is for sale",
+        "this domain may be for sale",
+        "buy this domain",
+        "domain is parked",
+        "domain parking",
+        "make an offer on this domain",
+        "inquire about this domain",
+    )
+    parked_phrase = next(
+        (item for item in parked_phrases if item in f"{title.lower()} {visible_lower}"),
+        "",
+    )
+    if parked_phrase:
+        return PageQualityAssessment("parked_domain", "domain_parking_signature", parked_phrase)
 
     if len(visible) < 20:
         return PageQualityAssessment("empty_page", "insufficient_visible_content", visible[:120])
@@ -3305,7 +3381,11 @@ class CloudflareBrowserRunAssetClient:
         self.category_deepseek_max_output_tokens = config.category_deepseek_max_output_tokens
         self._validated_pages: dict[int, tuple[str, str, PageQualityAssessment]] = {}
 
-    async def call_quick_action(self, endpoint: str, body: dict[str, Any]) -> Any:
+    async def call_quick_action_envelope(
+        self,
+        endpoint: str,
+        body: dict[str, Any],
+    ) -> tuple[Any, dict[str, Any]]:
         async with httpx.AsyncClient(timeout=float(self.timeout_seconds)) as client:
             response = await client.post(f"{self.endpoint_base}/{endpoint}", headers=self.headers, json=body)
         text = response.text
@@ -3315,6 +3395,7 @@ class CloudflareBrowserRunAssetClient:
             parsed = None
         if response.status_code < 200 or response.status_code >= 300 or (isinstance(parsed, dict) and parsed.get("success") is False):
             messages: list[str] = []
+            error_codes: list[int] = []
             if isinstance(parsed, dict):
                 errors = parsed.get("errors")
                 if isinstance(errors, list):
@@ -3323,6 +3404,11 @@ class CloudflareBrowserRunAssetClient:
                             continue
                         code = error.get("code")
                         message = str(error.get("message") or "").strip()
+                        try:
+                            if code is not None:
+                                error_codes.append(int(code))
+                        except (TypeError, ValueError):
+                            pass
                         if message and code is not None:
                             messages.append(f"{code}: {message}")
                         elif message:
@@ -3340,11 +3426,31 @@ class CloudflareBrowserRunAssetClient:
                 or response.status_code >= 500
                 or (200 <= response.status_code < 300 and isinstance(parsed, dict) and parsed.get("success") is False)
             )
+            error_code = f"browser_run_{error_codes[0]}" if error_codes else f"browser_run_http_{response.status_code}"
+            max_attempts: int | None = None
+            retry_after_seconds: int | None = None
+            if endpoint == "content" and 6000 in error_codes:
+                # A second attempt may succeed after the target/CDN state changes,
+                # but immediate identical retries only amplify this high-volume error.
+                retryable = True
+                max_attempts = 2
+                retry_after_seconds = HOMEPAGE_BROWSER_6000_RETRY_DELAY_SECONDS
+            elif endpoint == "content" and any(code in {2001, 5006, 6002} for code in error_codes):
+                retryable = True
             raise AssetPipelineError(
                 f"browser_run_{endpoint}_api_error: {detail}",
                 retryable=retryable,
+                error_code=error_code,
+                max_attempts=max_attempts,
+                retry_after_seconds=retry_after_seconds,
             )
-        return parsed.get("result") if isinstance(parsed, dict) and "result" in parsed else parsed
+        result = parsed.get("result") if isinstance(parsed, dict) and "result" in parsed else parsed
+        meta = parsed.get("meta") if isinstance(parsed, dict) and isinstance(parsed.get("meta"), dict) else {}
+        return result, meta
+
+    async def call_quick_action(self, endpoint: str, body: dict[str, Any]) -> Any:
+        result, _ = await self.call_quick_action_envelope(endpoint, body)
+        return result
 
     async def fetch_structured_text_data(
         self,
@@ -3404,12 +3510,9 @@ class CloudflareBrowserRunAssetClient:
         return source_url, metadata
 
     def asset_candidate_urls(self, task: AssetTask) -> list[str]:
-        primary_url = asset_page_url(task)
-        parsed = urlsplit(primary_url)
-        candidates = [primary_url]
-        if parsed.scheme == "https":
-            candidates.append(f"http://{parsed.netloc}{parsed.path or '/'}")
-        return candidates
+        # Redirects are followed deliberately by the source fetcher. Do not send
+        # a second immediate Browser Run request to an invented HTTP downgrade.
+        return [asset_page_url(task)]
 
     def browser_payload(self, target_url: str, *, reject_heavy_resources: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -3652,30 +3755,206 @@ class CloudflareBrowserRunAssetClient:
             retryable=any(retryable_errors),
         )
 
-    async def fetch_homepage_content(self, task: AssetTask) -> tuple[str, str]:
-        errors: list[str] = []
-        retryable_errors: list[bool] = []
-        for target_url in self.asset_candidate_urls(task):
-            try:
-                content = await self.call_quick_action(
-                    "content",
-                    self.browser_payload(target_url, reject_heavy_resources=True),
-                )
-                if isinstance(content, dict):
-                    html_body = str(content.get("content") or content.get("html") or "")
-                else:
-                    html_body = str(content or "")
-                if html_body.strip():
-                    return target_url, html_body
-                raise RuntimeError("content returned no HTML")
-            except Exception as error:
-                errors.append(f"{target_url}: {str(error)[:220]}")
-                retryable_errors.append(bool(getattr(error, "retryable", True)))
+    async def fetch_static_homepage_content(self, task: AssetTask) -> tuple[str, str]:
+        target_url = asset_page_url(task)
+        if not is_safe_homepage_url(target_url):
+            raise AssetPipelineError(
+                f"homepage_static_unsafe_url:{target_url[:220]}",
+                retryable=False,
+                error_code="unsafe_homepage_url",
+            )
 
-        raise AssetPipelineError(
-            "Browser Run content extraction failed. " + " | ".join(errors),
-            retryable=any(retryable_errors),
+        current_url = target_url
+        started_at = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(
+                timeout=float(self.timeout_seconds),
+                follow_redirects=False,
+                headers=pricing_request_headers(target_url),
+            ) as client:
+                for redirect_count in range(HOMEPAGE_MAX_REDIRECTS + 1):
+                    response = await client.get(current_url)
+                    location = response.headers.get("location", "").strip()
+                    if response.status_code in {301, 302, 303, 307, 308} and location:
+                        next_url = urljoin(current_url, location)
+                        if not is_safe_homepage_url(next_url):
+                            raise AssetPipelineError(
+                                f"homepage_static_unsafe_redirect:{next_url[:220]}",
+                                retryable=False,
+                                error_code="unsafe_homepage_redirect",
+                            )
+                        if not homepage_urls_share_site(target_url, next_url):
+                            raise AssetPipelineError(
+                                f"homepage_static_unrelated_redirect:{target_url[:160]}->{next_url[:160]}",
+                                retryable=False,
+                                error_code="unrelated_homepage_redirect",
+                            )
+                        if redirect_count >= HOMEPAGE_MAX_REDIRECTS:
+                            raise AssetPipelineError(
+                                f"homepage_static_redirect_limit:{target_url[:220]}",
+                                retryable=True,
+                                error_code="homepage_redirect_limit",
+                            )
+                        current_url = next_url
+                        continue
+                    break
+                else:  # pragma: no cover - loop exits through a response or an exception
+                    raise AssetPipelineError("homepage_static_redirect_limit", retryable=True)
+        except AssetPipelineError:
+            raise
+        except Exception as error:
+            raise AssetPipelineError(
+                f"homepage_static_request_error:{str(error)[:300] or type(error).__name__}",
+                retryable=True,
+                error_code="homepage_static_request_error",
+            ) from error
+
+        final_url = str(response.url)
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        content_type = response.headers.get("content-type", "")
+        raw_body = response.content[:MAX_HOMEPAGE_HTML_BYTES]
+        looks_like_markup = raw_body.lstrip()[:200].lower().startswith((b"<!doctype html", b"<html", b"<?xml"))
+        html_body = ""
+        if any(kind in content_type.lower() for kind in ("html", "xml", "text")) or looks_like_markup:
+            html_body = raw_body.decode(response.encoding or "utf-8", errors="replace")
+        assessment = classify_page_state(
+            html_body,
+            page_title=read_html_title(html_body),
+            http_status=response.status_code,
         )
+        log_info(
+            "assets.homepage_static.response",
+            tool_id=task.tool_id,
+            url=target_url,
+            final_url=final_url,
+            status_code=response.status_code,
+            elapsed_ms=elapsed_ms,
+            content_type=content_type[:120],
+            page_state=assessment.state,
+        )
+
+        if assessment.state in {"not_found", "parked_domain"}:
+            raise AssetPipelineError(
+                f"homepage_static_terminal:{assessment.state}:{assessment.reason}",
+                retryable=False,
+                error_code=assessment.state,
+            )
+        if not 200 <= response.status_code < 300:
+            raise AssetPipelineError(
+                f"homepage_static_http_{response.status_code}:{assessment.state}:{assessment.reason}",
+                retryable=True,
+                error_code=f"homepage_static_http_{response.status_code}",
+            )
+        main_content = extract_homepage_main_text(html_body, limit=1000)
+        if not assessment.is_valid or len(main_content) < 80:
+            raise AssetPipelineError(
+                f"homepage_static_requires_browser:{assessment.state}:{assessment.reason}:main_chars={len(main_content)}",
+                retryable=True,
+                error_code="homepage_static_requires_browser",
+            )
+        return final_url, html_body
+
+    async def fetch_browser_homepage_content(self, task: AssetTask) -> tuple[str, str]:
+        target_url = asset_page_url(task)
+        content, meta = await self.call_quick_action_envelope(
+            "content",
+            self.browser_payload(target_url, reject_heavy_resources=True),
+        )
+        if isinstance(content, dict):
+            html_body = str(content.get("content") or content.get("html") or "")
+        else:
+            html_body = str(content or "")
+        final_url = str(meta.get("finalUrl") or target_url).strip() or target_url
+        try:
+            origin_status = int(meta.get("status")) if meta.get("status") is not None else None
+        except (TypeError, ValueError):
+            origin_status = None
+        assessment = classify_page_state(
+            html_body,
+            page_title=str(meta.get("title") or ""),
+            http_status=origin_status,
+        )
+        if not is_safe_homepage_url(final_url):
+            raise AssetPipelineError(
+                f"homepage_browser_unsafe_final_url:{final_url[:220]}",
+                retryable=False,
+                error_code="unsafe_homepage_final_url",
+            )
+        if not homepage_urls_share_site(target_url, final_url):
+            raise AssetPipelineError(
+                f"homepage_browser_unrelated_redirect:{target_url[:160]}->{final_url[:160]}",
+                retryable=False,
+                error_code="unrelated_homepage_redirect",
+            )
+        if assessment.state in {"not_found", "parked_domain"}:
+            raise AssetPipelineError(
+                f"homepage_browser_terminal:{assessment.state}:{assessment.reason}",
+                retryable=False,
+                error_code=assessment.state,
+            )
+        if not assessment.is_valid:
+            raise AssetPipelineError(
+                f"homepage_browser_invalid:{assessment.state}:{assessment.reason}",
+                retryable=assessment.state in {"anti_bot", "access_denied", "captcha", "empty_page", "error_page"},
+                error_code=f"homepage_browser_{assessment.state}",
+            )
+        log_info(
+            "assets.homepage_browser.success",
+            tool_id=task.tool_id,
+            url=target_url,
+            final_url=final_url,
+            origin_status=origin_status,
+            page_state=assessment.state,
+        )
+        return final_url, html_body
+
+    async def fetch_homepage_content(self, task: AssetTask) -> tuple[str, str]:
+        static_error: Exception | None = None
+        try:
+            final_url, html_body = await self.fetch_static_homepage_content(task)
+            log_info(
+                "assets.homepage_fetch.success",
+                tool_id=task.tool_id,
+                transport="static_http",
+                final_url=final_url,
+            )
+            return final_url, html_body
+        except AssetPipelineError as error:
+            static_error = error
+            if not error.retryable:
+                raise
+            log_info(
+                "assets.homepage_static.fallback",
+                tool_id=task.tool_id,
+                error=str(error)[:300],
+            )
+        except Exception as error:  # defensive: a static transport defect must not suppress Browser Run
+            static_error = error
+            log_info(
+                "assets.homepage_static.fallback",
+                tool_id=task.tool_id,
+                error=str(error)[:300] or type(error).__name__,
+            )
+
+        try:
+            final_url, html_body = await self.fetch_browser_homepage_content(task)
+            log_info(
+                "assets.homepage_fetch.success",
+                tool_id=task.tool_id,
+                transport="browser_run",
+                final_url=final_url,
+            )
+            return final_url, html_body
+        except Exception as browser_error:
+            static_detail = str(static_error)[:260] if static_error else "not_attempted"
+            browser_detail = str(browser_error)[:320] or type(browser_error).__name__
+            raise AssetPipelineError(
+                f"homepage_content_failed:static={static_detail};browser={browser_detail}",
+                retryable=bool(getattr(browser_error, "retryable", True)),
+                error_code=str(getattr(browser_error, "error_code", "") or "homepage_browser_failed"),
+                max_attempts=getattr(browser_error, "max_attempts", None),
+                retry_after_seconds=getattr(browser_error, "retry_after_seconds", None),
+            ) from browser_error
 
     async def preflight_homepage(self, task: AssetTask) -> PageQualityAssessment:
         cached = getattr(self, "_validated_pages", {}).get(task.tool_id)

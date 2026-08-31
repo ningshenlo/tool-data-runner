@@ -896,6 +896,80 @@ class TaxonomyBatchStateMachineTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertEqual(tuple(terminal), ("needs_review", "complete", 3))
 
+    async def test_non_retryable_source_failure_goes_to_review_immediately(self):
+        item_id = self.connection.execute(
+            """
+            INSERT INTO taxonomy_batch_items (
+              tool_id, pipeline_version, prompt_version, taxonomy_version,
+              source_url, existing_entity_kind, existing_entity_source
+            ) VALUES (
+              10, 'source-terminal-test', 'source-terminal-test', 2,
+              'https://acme.example', 'unresolved', 'auto'
+            )
+            """
+        ).lastrowid
+        self.connection.commit()
+
+        error = RuntimeError("parked domain")
+        error.retryable = False
+        self.assertFalse(
+            await schedule_source_retry(
+                self.d1, self.config, self.catalog, item_id, error
+            )
+        )
+        terminal = self.connection.execute(
+            "SELECT status, current_stage, retry_attempt, error "
+            "FROM taxonomy_batch_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        self.assertEqual(tuple(terminal[:3]), ("needs_review", "complete", 1))
+        self.assertIn("non_retryable", terminal[3])
+
+    async def test_browser_6000_source_failure_gets_one_long_retry(self):
+        item_id = self.connection.execute(
+            """
+            INSERT INTO taxonomy_batch_items (
+              tool_id, pipeline_version, prompt_version, taxonomy_version,
+              source_url, existing_entity_kind, existing_entity_source
+            ) VALUES (
+              10, 'source-6000-test', 'source-6000-test', 2,
+              'https://acme.example', 'unresolved', 'auto'
+            )
+            """
+        ).lastrowid
+        self.connection.commit()
+
+        error = RuntimeError("browser_run_content_api_error: 6000")
+        error.retryable = True
+        error.max_attempts = 2
+        error.retry_after_seconds = 21600
+        self.assertTrue(
+            await schedule_source_retry(
+                self.d1, self.config, self.catalog, item_id, error
+            )
+        )
+        scheduled = self.connection.execute(
+            """
+            SELECT status, retry_kind, retry_attempt,
+                   (julianday(next_retry_at) - julianday('now')) * 86400 AS delay_seconds
+            FROM taxonomy_batch_items WHERE id = ?
+            """,
+            (item_id,),
+        ).fetchone()
+        self.assertEqual(tuple(scheduled[:3]), ("pending", "source", 1))
+        self.assertGreater(float(scheduled[3]), 21500)
+
+        self.assertFalse(
+            await schedule_source_retry(
+                self.d1, self.config, self.catalog, item_id, error
+            )
+        )
+        terminal = self.connection.execute(
+            "SELECT status, current_stage, retry_attempt FROM taxonomy_batch_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        self.assertEqual(tuple(terminal), ("needs_review", "complete", 2))
+
     async def test_batch_submission_failure_is_persisted_and_retried(self):
         item_id = self.connection.execute(
             """

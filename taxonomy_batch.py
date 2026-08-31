@@ -749,10 +749,19 @@ async def schedule_source_retry(
     item = await load_batch_item(d1, item_id)
     if not item:
         return False
-    max_attempts, _ = taxonomy_retry_policy(config)
+    configured_max_attempts, _ = taxonomy_retry_policy(config)
+    error_max_attempts = getattr(error, "max_attempts", None)
+    try:
+        max_attempts = min(
+            configured_max_attempts,
+            max(1, int(error_max_attempts)),
+        ) if error_max_attempts is not None else configured_max_attempts
+    except (TypeError, ValueError):
+        max_attempts = configured_max_attempts
+    retryable = bool(getattr(error, "retryable", True))
     failed_attempt = int(item.get("retry_attempt") or 0) + 1
     safe_error = f"source_fetch_failed:{_safe_error(error)}"
-    if failed_attempt >= max_attempts:
+    if not retryable or failed_attempt >= max_attempts:
         await d1.run(
             """
             UPDATE taxonomy_batch_items
@@ -767,10 +776,20 @@ async def schedule_source_retry(
             item,
             catalog,
             status="needs_review",
-            error=f"{safe_error}:attempts_exhausted:{failed_attempt}",
+            error=(
+                f"{safe_error}:non_retryable"
+                if not retryable
+                else f"{safe_error}:attempts_exhausted:{failed_attempt}"
+            ),
         )
         return False
     delay = taxonomy_retry_delay_seconds(config, failed_attempt)
+    error_retry_after = getattr(error, "retry_after_seconds", None)
+    try:
+        if error_retry_after is not None:
+            delay = max(delay, min(86400, max(1, int(error_retry_after))))
+    except (TypeError, ValueError):
+        pass
     meta = await d1.run(
         """
         UPDATE taxonomy_batch_items

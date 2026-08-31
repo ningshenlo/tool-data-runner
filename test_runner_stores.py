@@ -242,6 +242,15 @@ class PageAndNameQualityTests(unittest.TestCase):
         )
         self.assertFalse(assessment.is_valid)
 
+    def test_parked_domain_is_not_a_valid_product_page(self) -> None:
+        assessment = runner.classify_page_state(
+            "<html><head><title>Buy this domain</title></head>"
+            "<body>This domain is for sale. Make an offer on this domain today.</body></html>",
+            http_status=200,
+        )
+        self.assertEqual(assessment.state, "parked_domain")
+        self.assertFalse(assessment.is_valid)
+
     def test_access_denied_and_home_are_invalid_names_but_home_assistant_is_valid(self) -> None:
         self.assertEqual(runner.invalid_tool_name_reason("Access Denied"), "access_denied_name")
         self.assertEqual(runner.invalid_tool_name_reason("Home"), "generic_page_name")
@@ -351,6 +360,204 @@ class PageAndNameQualityTests(unittest.TestCase):
             model_confidence=94,
         )
         self.assertEqual(result.status, "safe")
+
+
+class HomepageFetchStrategyTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def task() -> runner.AssetTask:
+        return runner.AssetTask(
+            tool_id=42,
+            canonical_slug="example",
+            normalized_domain="example.com",
+            official_url="https://example.com/",
+            attempts=1,
+            max_attempts=5,
+            generation=1,
+            lease_token="test",
+        )
+
+    @staticmethod
+    def client() -> runner.CloudflareBrowserRunAssetClient:
+        client = object.__new__(runner.CloudflareBrowserRunAssetClient)
+        client.endpoint_base = "https://api.cloudflare.com/client/v4/accounts/test/browser-rendering"
+        client.headers = {"Authorization": "Bearer test", "Content-Type": "application/json"}
+        client.timeout_seconds = 30
+        return client
+
+    @staticmethod
+    def valid_html(label: str = "Example") -> str:
+        return (
+            f"<html><head><title>{label}</title></head><body><main>"
+            "Example is an AI workspace for research, writing, analysis, and team collaboration. "
+            "Customers can organize sources, generate reports, and share completed projects."
+            "</main></body></html>"
+        )
+
+    @staticmethod
+    def async_client_factory(transport: httpx.MockTransport):
+        real_async_client = httpx.AsyncClient
+
+        def factory(*args: Any, **kwargs: Any) -> httpx.AsyncClient:
+            kwargs["transport"] = transport
+            return real_async_client(*args, **kwargs)
+
+        return factory
+
+    async def test_static_fetch_follows_same_site_redirect_and_preserves_final_url(self) -> None:
+        html_body = self.valid_html()
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.host == "example.com":
+                return httpx.Response(
+                    301,
+                    headers={"location": "https://www.example.com/product"},
+                    request=request,
+                )
+            return httpx.Response(
+                200,
+                headers={"content-type": "text/html; charset=utf-8"},
+                text=html_body,
+                request=request,
+            )
+
+        transport = httpx.MockTransport(handler)
+        with patch.object(
+            runner.httpx,
+            "AsyncClient",
+            new=self.async_client_factory(transport),
+        ):
+            final_url, captured_html = await self.client().fetch_homepage_content(self.task())
+
+        self.assertEqual(final_url, "https://www.example.com/product")
+        self.assertEqual(captured_html, html_body)
+
+    async def test_static_403_falls_back_to_browser_and_uses_browser_final_url(self) -> None:
+        calls: list[str] = []
+        html_body = self.valid_html("Example App")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.method)
+            if request.method == "GET":
+                return httpx.Response(403, text="Access denied", request=request)
+            return httpx.Response(
+                200,
+                json={
+                    "success": True,
+                    "result": html_body,
+                    "meta": {
+                        "finalUrl": "https://www.example.com/app",
+                        "status": 200,
+                        "title": "Example App",
+                    },
+                },
+                request=request,
+            )
+
+        transport = httpx.MockTransport(handler)
+        with patch.object(
+            runner.httpx,
+            "AsyncClient",
+            new=self.async_client_factory(transport),
+        ):
+            final_url, captured_html = await self.client().fetch_homepage_content(self.task())
+
+        self.assertEqual(calls, ["GET", "POST"])
+        self.assertEqual(final_url, "https://www.example.com/app")
+        self.assertEqual(captured_html, html_body)
+
+    async def test_browser_6000_keeps_only_one_six_hour_retry(self) -> None:
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "GET":
+                return httpx.Response(403, text="Access denied", request=request)
+            return httpx.Response(
+                422,
+                json={
+                    "success": False,
+                    "errors": [{"code": 6000, "message": "Unable to render the page"}],
+                },
+                request=request,
+            )
+
+        transport = httpx.MockTransport(handler)
+        with patch.object(
+            runner.httpx,
+            "AsyncClient",
+            new=self.async_client_factory(transport),
+        ):
+            with self.assertRaises(runner.AssetPipelineError) as raised:
+                await self.client().fetch_homepage_content(self.task())
+
+        self.assertTrue(raised.exception.retryable)
+        self.assertEqual(raised.exception.error_code, "browser_run_6000")
+        self.assertEqual(raised.exception.max_attempts, 2)
+        self.assertEqual(
+            raised.exception.retry_after_seconds,
+            runner.HOMEPAGE_BROWSER_6000_RETRY_DELAY_SECONDS,
+        )
+
+    async def test_browser_5006_and_6002_remain_retryable_as_transient(self) -> None:
+        for error_code in (5006, 6002):
+            with self.subTest(error_code=error_code):
+                def handler(request: httpx.Request) -> httpx.Response:
+                    return httpx.Response(
+                        422,
+                        json={
+                            "success": False,
+                            "errors": [
+                                {"code": error_code, "message": "Temporary browser failure"}
+                            ],
+                        },
+                        request=request,
+                    )
+
+                transport = httpx.MockTransport(handler)
+                with patch.object(
+                    runner.httpx,
+                    "AsyncClient",
+                    new=self.async_client_factory(transport),
+                ):
+                    with self.assertRaises(runner.AssetPipelineError) as raised:
+                        await self.client().call_quick_action_envelope(
+                            "content",
+                            {"url": "https://example.com/"},
+                        )
+
+                self.assertTrue(raised.exception.retryable)
+                self.assertEqual(
+                    raised.exception.error_code,
+                    f"browser_run_{error_code}",
+                )
+                self.assertIsNone(raised.exception.max_attempts)
+
+    async def test_cross_site_redirect_is_terminal_and_skips_browser(self) -> None:
+        calls: list[str] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request.method)
+            return httpx.Response(
+                302,
+                headers={"location": "https://unrelated.example.net/"},
+                request=request,
+            )
+
+        transport = httpx.MockTransport(handler)
+        with patch.object(
+            runner.httpx,
+            "AsyncClient",
+            new=self.async_client_factory(transport),
+        ):
+            with self.assertRaises(runner.AssetPipelineError) as raised:
+                await self.client().fetch_homepage_content(self.task())
+
+        self.assertFalse(raised.exception.retryable)
+        self.assertEqual(raised.exception.error_code, "unrelated_homepage_redirect")
+        self.assertEqual(calls, ["GET"])
+
+    def test_candidate_urls_do_not_invent_an_http_downgrade(self) -> None:
+        self.assertEqual(
+            self.client().asset_candidate_urls(self.task()),
+            ["https://example.com/"],
+        )
 
 
 class CategoryPromptHelperTests(unittest.TestCase):
