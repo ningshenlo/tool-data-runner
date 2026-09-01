@@ -123,6 +123,17 @@ def batch_failure_error(batch: dict[str, Any], status: str) -> str:
     return _safe_error(f"{base}: {' | '.join(details)}" if details else base)
 
 
+def is_batch_input_file_access_error(error: Any) -> bool:
+    """Detect the OpenAI Batch validator outage without masking other failures."""
+    text = str(error or "").strip().lower()
+    return bool(
+        "openai_batch_" in text
+        and "cannot find file" in text
+        and "does not have access" in text
+        and "file_id" in text
+    )
+
+
 def taxonomy_retry_policy(config: Any) -> tuple[int, int]:
     """Return total attempts (including the first) and exponential base delay."""
     max_attempts = min(
@@ -512,6 +523,10 @@ class OpenAIBatchClient:
                 "metadata": metadata,
             },
         )
+
+    async def create_response(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Execute one persisted Batch line through the synchronous Responses API."""
+        return await self._json_request("POST", OPENAI_BATCH_ENDPOINT, payload=payload)
 
     async def retrieve_batch(self, batch_id: str) -> dict[str, Any]:
         return await self._json_request("GET", f"/v1/batches/{batch_id}")
@@ -2519,6 +2534,112 @@ async def _fail_unreturned_requests(
     return failed
 
 
+async def execute_job_via_responses(
+    d1: Any,
+    config: Any,
+    catalog: TaxonomyCatalog,
+    openai: OpenAIBatchClient,
+    *,
+    job_id: int,
+    batch_error: str,
+) -> dict[str, int]:
+    """Recover a validator-level file outage through direct Responses calls.
+
+    The request JSON stored in D1 is the canonical payload for both transports.
+    Model calls run concurrently, while state-machine writes are applied in order
+    so a fallback uses the same result handling and retry rules as normal Batch
+    output.
+    """
+    rows = await d1.query(
+        """
+        SELECT * FROM taxonomy_batch_requests
+        WHERE job_id = ? AND status = 'submitted'
+        ORDER BY id
+        """,
+        [job_id],
+    )
+    counts = {
+        "sync_fallback_requests": len(rows),
+        "sync_fallback_completed": 0,
+        "sync_fallback_failed": 0,
+        "provider_blocked": 0,
+    }
+    if not rows:
+        return counts
+
+    concurrency = max(
+        1,
+        min(8, int(getattr(config, "taxonomy_concurrency", 3) or 3)),
+    )
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def execute(row: dict[str, Any]) -> ParsedBatchResult:
+        custom_id = str(row.get("custom_id") or "")
+        async with semaphore:
+            try:
+                line = _json_object(row.get("request_json"))
+                payload = line.get("body")
+                if not isinstance(payload, dict) or not payload:
+                    raise RuntimeError("sync_fallback_request_body_missing")
+                body = await openai.create_response(payload)
+                return parse_batch_output_line(
+                    {
+                        "custom_id": custom_id,
+                        "response": {"status_code": 200, "body": body},
+                    }
+                )
+            except Exception as error:
+                return ParsedBatchResult(
+                    custom_id=custom_id,
+                    ok=False,
+                    response_body={},
+                    structured_output={},
+                    usage={
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "cache_write_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_tokens": 0,
+                        "total_tokens": 0,
+                    },
+                    error=f"sync_responses_fallback_failed: {_safe_error(error)}",
+                )
+
+    results = await asyncio.gather(*(execute(dict(row)) for row in rows))
+    for result in results:
+        if is_provider_blocked_error(result.error):
+            counts["provider_blocked"] = 1
+        if not await apply_request_result(d1, config, catalog, result):
+            continue
+        key = "sync_fallback_completed" if result.ok else "sync_fallback_failed"
+        counts[key] += 1
+
+    now = utc_now_iso()
+    processed = counts["sync_fallback_completed"] + counts["sync_fallback_failed"]
+    final_status = "completed" if processed == len(rows) else "failed"
+    await d1.run(
+        """
+        UPDATE taxonomy_batch_jobs
+        SET status = ?, completed_count = ?, failed_count = ?,
+            error = ?, completed_at = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        [
+            final_status,
+            counts["sync_fallback_completed"],
+            counts["sync_fallback_failed"],
+            _safe_error(
+                f"{batch_error}; sync_responses_fallback="
+                f"{counts['sync_fallback_completed']}/{len(rows)}"
+            ),
+            now,
+            now,
+            job_id,
+        ],
+    )
+    return counts
+
+
 async def poll_active_batches(
     d1: Any,
     config: Any,
@@ -2545,6 +2666,10 @@ async def poll_active_batches(
         "batches_completed": 0,
         "batch_requests_completed": 0,
         "batch_requests_failed": 0,
+        "sync_fallback_jobs": 0,
+        "sync_fallback_requests": 0,
+        "sync_fallback_completed": 0,
+        "sync_fallback_failed": 0,
         "provider_blocked": 0,
     }
     for job in rows:
@@ -2624,14 +2749,43 @@ async def poll_active_batches(
                 )
                 counts["batches_completed"] += 1
             elif status in FAILED_BATCH_STATUSES:
-                counts["batch_requests_failed"] += await _fail_unreturned_requests(
-                    d1,
-                    config,
-                    catalog,
-                    job_id,
-                    set(),
-                    failure_error or f"openai_batch_{status}",
-                )
+                can_fallback = callable(getattr(openai, "create_response", None))
+                if can_fallback and is_batch_input_file_access_error(failure_error):
+                    fallback = await execute_job_via_responses(
+                        d1,
+                        config,
+                        catalog,
+                        openai,
+                        job_id=job_id,
+                        batch_error=failure_error or f"openai_batch_{status}",
+                    )
+                    counts["sync_fallback_jobs"] += 1
+                    for key in (
+                        "sync_fallback_requests",
+                        "sync_fallback_completed",
+                        "sync_fallback_failed",
+                    ):
+                        counts[key] += int(fallback.get(key) or 0)
+                    counts["batch_requests_completed"] += int(
+                        fallback.get("sync_fallback_completed") or 0
+                    )
+                    counts["batch_requests_failed"] += int(
+                        fallback.get("sync_fallback_failed") or 0
+                    )
+                    counts["provider_blocked"] = max(
+                        counts["provider_blocked"],
+                        int(fallback.get("provider_blocked") or 0),
+                    )
+                    counts["batches_completed"] += 1
+                else:
+                    counts["batch_requests_failed"] += await _fail_unreturned_requests(
+                        d1,
+                        config,
+                        catalog,
+                        job_id,
+                        set(),
+                        failure_error or f"openai_batch_{status}",
+                    )
         except Exception as error:
             from runner import log_error
 

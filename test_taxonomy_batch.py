@@ -1328,6 +1328,134 @@ class TaxonomyBatchStateMachineTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(item["next_retry_at"])
         self.assertIn("Cannot find file", item["error"])
 
+    async def test_batch_file_access_outage_falls_back_to_direct_responses(self):
+        source = "Acme creates images from text. Generate art from a written prompt."
+        item_id = self.connection.execute(
+            """
+            INSERT INTO taxonomy_batch_items (
+              tool_id, pipeline_version, prompt_version, taxonomy_version,
+              status, current_stage, source_url, source_text,
+              source_content_hash, existing_entity_kind, existing_entity_source
+            ) VALUES (
+              10, 'sync-fallback-test', 'sync-fallback-test', 2,
+              'running', 'profile', 'https://acme.example', ?,
+              'hash', 'unresolved', 'auto'
+            )
+            """,
+            [source],
+        ).lastrowid
+        self.connection.commit()
+        await enqueue_stage(
+            self.d1, self.config, self.catalog, item_id=item_id, stage="profile"
+        )
+
+        profile = {
+            "entity_kind": "independent_product",
+            "entity_confidence": 0.95,
+            "entity_reason": "Product homepage",
+            "entity_evidence": [{"quote": "Acme creates images from text."}],
+            "primary_job": {
+                "value": "Create images from text",
+                "evidence": [{"quote": "Acme creates images from text."}],
+            },
+            "primary_outputs": [
+                {
+                    "value": "Art",
+                    "evidence": [
+                        {"quote": "Generate art from a written prompt."}
+                    ],
+                }
+            ],
+            "capabilities_raw": [],
+        }
+
+        class OutageBatchOpenAI:
+            direct_calls = 0
+
+            async def upload_jsonl(self, *_args, **_kwargs):
+                return {"id": "file-outage"}
+
+            async def create_batch(self, *_args, **_kwargs):
+                return {"id": "batch-outage", "status": "validating"}
+
+            async def retrieve_batch(self, *_args, **_kwargs):
+                return {
+                    "id": "batch-outage",
+                    "status": "failed",
+                    "request_counts": {"total": 0, "completed": 0, "failed": 0},
+                    "errors": {
+                        "data": [
+                            {
+                                "code": "invalid_request",
+                                "param": "file_id",
+                                "message": (
+                                    "Cannot find file file-outage, or organization "
+                                    "org-example does not have access to it."
+                                ),
+                            }
+                        ]
+                    },
+                }
+
+            async def create_response(self, payload):
+                self.direct_calls += 1
+                self.assert_payload = payload
+                return {
+                    "output_text": json.dumps(profile),
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 30,
+                        "total_tokens": 130,
+                    },
+                }
+
+        openai = OutageBatchOpenAI()
+        submitted = await submit_queued_batches(
+            self.d1, self.config, self.catalog, openai
+        )
+        self.assertEqual(submitted["requests_submitted"], 1)
+
+        counts = await poll_active_batches(
+            self.d1, self.config, self.catalog, openai
+        )
+        self.assertEqual(openai.direct_calls, 1)
+        self.assertEqual(counts["sync_fallback_jobs"], 1)
+        self.assertEqual(counts["sync_fallback_completed"], 1)
+        self.assertEqual(counts["batch_requests_completed"], 1)
+
+        job = self.connection.execute(
+            """
+            SELECT status, completed_count, failed_count, error
+            FROM taxonomy_batch_jobs ORDER BY id DESC LIMIT 1
+            """
+        ).fetchone()
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(job["completed_count"], 1)
+        self.assertEqual(job["failed_count"], 0)
+        self.assertIn("sync_responses_fallback=1/1", job["error"])
+
+        request = self.connection.execute(
+            """
+            SELECT status, input_tokens, output_tokens
+            FROM taxonomy_batch_requests
+            WHERE item_id = ? AND stage = 'profile'
+            """,
+            [item_id],
+        ).fetchone()
+        self.assertEqual(request["status"], "succeeded")
+        self.assertEqual(request["input_tokens"], 100)
+        self.assertEqual(request["output_tokens"], 30)
+        item = self.connection.execute(
+            """
+            SELECT status, current_stage, profile_json
+            FROM taxonomy_batch_items WHERE id = ?
+            """,
+            [item_id],
+        ).fetchone()
+        self.assertEqual(item["status"], "running")
+        self.assertEqual(item["current_stage"], "l1")
+        self.assertTrue(item["profile_json"])
+
 
 if __name__ == "__main__":
     unittest.main()
