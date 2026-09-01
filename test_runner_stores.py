@@ -4023,6 +4023,42 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             60,
         )
 
+    def test_assets_batches_continue_immediately_while_backlogged(self) -> None:
+        self.assertEqual(
+            runner.assets_next_delay_seconds(
+                {"claimed": 25},
+                batch_limit=25,
+                idle_interval_seconds=30,
+            ),
+            0,
+        )
+        self.assertEqual(
+            runner.assets_next_delay_seconds(
+                {"claimed": 0, "enrichment_has_more": 1},
+                batch_limit=25,
+                idle_interval_seconds=30,
+            ),
+            0,
+        )
+
+    def test_assets_batches_back_off_only_after_backlog_drains(self) -> None:
+        self.assertEqual(
+            runner.assets_next_delay_seconds(
+                {"claimed": 4, "asset_queued": 4},
+                batch_limit=25,
+                idle_interval_seconds=30,
+            ),
+            5,
+        )
+        self.assertEqual(
+            runner.assets_next_delay_seconds(
+                {"claimed": 0, "asset_queued": 0, "asset_revived": 0},
+                batch_limit=25,
+                idle_interval_seconds=30,
+            ),
+            30,
+        )
+
     async def test_telemetry_health_checks_only_the_latest_run_per_workload(self) -> None:
         class TelemetryConfig:
             runner_instance_id = "telemetry-latest-workload-health"
@@ -5409,6 +5445,17 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(counts["ready"], 1)
         tool = self.connection.execute("SELECT status FROM tools WHERE id = ?", [tool_id]).fetchone()
         self.assertEqual(tool["status"], "pending_review")
+
+    async def test_enrichment_reconciliation_reports_remaining_dirty_backlog(self) -> None:
+        self.add_tool("enrichment-backlog-one")
+        self.add_tool("enrichment-backlog-two")
+        counts = await runner.D1EnrichmentStore(self.d1).reconcile_active_tools(
+            1,
+            concurrency=2,
+        )
+
+        self.assertEqual(counts["evaluated"], 1)
+        self.assertEqual(counts["has_more"], 1)
 
     async def test_telemetry_marks_partial_failure_batch_degraded(self) -> None:
         class TelemetryConfig:

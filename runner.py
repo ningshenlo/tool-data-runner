@@ -241,6 +241,8 @@ class Config:
     traffic_release_probe_interval_seconds: int
     traffic_release_queue_limit: int
     asset_limit: int
+    enrichment_reconcile_limit: int
+    enrichment_reconcile_concurrency: int
     catalog_auto_publish_enabled: bool
     catalog_auto_publish_limit: int
     domain_state_limit: int
@@ -783,7 +785,15 @@ def load_config(require_brightdata: bool = True) -> Config:
         traffic_release_probe_start_day=min(max(read_int_env("TRAFFIC_RELEASE_PROBE_START_DAY", 7), 1), 28),
         traffic_release_probe_interval_seconds=max(900, read_int_env("TRAFFIC_RELEASE_PROBE_INTERVAL_SECONDS", 21600)),
         traffic_release_queue_limit=max(1, read_int_env("TRAFFIC_RELEASE_QUEUE_LIMIT", 5000)),
-        asset_limit=read_int_env("RUNNER_ASSET_LIMIT", 5),
+        asset_limit=max(1, read_int_env("RUNNER_ASSET_LIMIT", 25)),
+        enrichment_reconcile_limit=min(
+            500,
+            max(1, read_int_env("RUNNER_ENRICHMENT_RECONCILE_LIMIT", 100)),
+        ),
+        enrichment_reconcile_concurrency=min(
+            10,
+            max(1, read_int_env("RUNNER_ENRICHMENT_RECONCILE_CONCURRENCY", 5)),
+        ),
         catalog_auto_publish_enabled=read_bool_env("CATALOG_AUTO_PUBLISH_ENABLED", True),
         catalog_auto_publish_limit=min(
             CATALOG_AUTO_PUBLISH_MAX_LIMIT,
@@ -7744,7 +7754,30 @@ class D1EnrichmentStore:
             )
         return readiness
 
-    async def reconcile_active_tools(self, limit: int) -> dict[str, int]:
+    async def evaluate_tools(
+        self,
+        tool_ids: list[int],
+        concurrency: int = 1,
+    ) -> dict[str, int]:
+        counts = {"evaluated": 0, "ready": 0, "blocked": 0, "missing": 0}
+        semaphore = asyncio.Semaphore(max(1, concurrency))
+
+        async def evaluate(tool_id: int) -> str:
+            async with semaphore:
+                return await self.evaluate_tool(tool_id)
+
+        results = await asyncio.gather(*(evaluate(tool_id) for tool_id in tool_ids))
+        for readiness in results:
+            counts["evaluated"] += 1
+            counts[readiness] = counts.get(readiness, 0) + 1
+        return counts
+
+    async def reconcile_active_tools(
+        self,
+        limit: int,
+        concurrency: int = 1,
+    ) -> dict[str, int]:
+        effective_limit = max(1, limit)
         rows = await self.d1.query(
             """
             SELECT t.id AS tool_id
@@ -7752,19 +7785,33 @@ class D1EnrichmentStore:
             LEFT JOIN tool_enrichment_states state ON state.tool_id = t.id
             WHERE t.status IN ('pending_enrich', 'pending_review', 'published')
               AND t.duplicate_of_tool_id IS NULL
+              AND (
+                state.evaluated_at IS NULL
+                OR t.updated_at > state.evaluated_at
+                OR (
+                  instr(coalesce(state.blocking_json, ''), '"category"') > 0
+                  AND (
+                    t.primary_category_id IS NOT NULL
+                    OR EXISTS (
+                      SELECT 1 FROM tool_categories tc WHERE tc.tool_id = t.id
+                    )
+                  )
+                )
+              )
             ORDER BY CASE WHEN t.status = 'pending_enrich' THEN 0 ELSE 1 END,
                      CASE WHEN state.evaluated_at IS NULL THEN 0 ELSE 1 END,
                      state.evaluated_at,
                      t.id
             LIMIT ?
             """,
-            [max(1, limit)],
+            [effective_limit + 1],
         )
-        counts = {"evaluated": 0, "ready": 0, "blocked": 0, "missing": 0}
-        for row in rows:
-            readiness = await self.evaluate_tool(int(row.get("tool_id") or 0))
-            counts["evaluated"] += 1
-            counts[readiness] = counts.get(readiness, 0) + 1
+        has_more = len(rows) > effective_limit
+        counts = await self.evaluate_tools(
+            [int(row.get("tool_id") or 0) for row in rows[:effective_limit]],
+            concurrency,
+        )
+        counts["has_more"] = int(has_more)
         return counts
 
     async def reconcile_pending_tools(self, limit: int) -> dict[str, int]:
@@ -12383,10 +12430,18 @@ async def process_pricing_task(
 async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = None) -> dict[str, int]:
     effective_limit = limit or config.asset_limit
     concurrency = getattr(config, "asset_concurrency", config.concurrency)
+    reconciliation_limit = getattr(config, "enrichment_reconcile_limit", 100)
+    reconciliation_concurrency = getattr(
+        config,
+        "enrichment_reconcile_concurrency",
+        min(5, concurrency),
+    )
     log_info(
         "assets_runner.batch.start",
         limit=effective_limit,
         concurrency=concurrency,
+        enrichment_reconcile_limit=reconciliation_limit,
+        enrichment_reconcile_concurrency=reconciliation_concurrency,
         category_owner="taxonomy-worker",
     )
     publication = {"selected": 0, "published": 0, "skipped": 0, "failed": 0}
@@ -12428,6 +12483,7 @@ async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = Non
         "enrichment_ready": 0,
         "enrichment_blocked": 0,
         "enrichment_evaluated": 0,
+        "enrichment_has_more": 0,
         "auto_publish_selected": publication["selected"],
         "auto_publish_published": publication["published"],
         "auto_publish_skipped": publication["skipped"],
@@ -12467,15 +12523,22 @@ async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = Non
     enrichment = D1EnrichmentStore(d1)
     if tasks:
         await asyncio.gather(*(guarded(task) for task in tasks))
-        for tool_id in dict.fromkeys(task.tool_id for task in tasks):
-            readiness = await enrichment.evaluate_tool(tool_id)
-            if readiness in ("ready", "blocked"):
-                counts[f"enrichment_{readiness}"] += 1
+        task_reconciliation = await enrichment.evaluate_tools(
+            list(dict.fromkeys(task.tool_id for task in tasks)),
+            reconciliation_concurrency,
+        )
+        counts["enrichment_evaluated"] += task_reconciliation["evaluated"]
+        counts["enrichment_ready"] += task_reconciliation["ready"]
+        counts["enrichment_blocked"] += task_reconciliation["blocked"]
 
-    reconciliation = await enrichment.reconcile_active_tools(effective_limit)
+    reconciliation = await enrichment.reconcile_active_tools(
+        reconciliation_limit,
+        reconciliation_concurrency,
+    )
     counts["enrichment_evaluated"] += reconciliation["evaluated"]
     counts["enrichment_ready"] += reconciliation["ready"]
     counts["enrichment_blocked"] += reconciliation["blocked"]
+    counts["enrichment_has_more"] = reconciliation["has_more"]
 
     return counts
 
@@ -12824,20 +12887,56 @@ async def run_pricing_once(
         )
 
 
+def assets_next_delay_seconds(
+    counts: dict[str, int],
+    batch_limit: int,
+    idle_interval_seconds: int,
+) -> int:
+    """Drain known backlog immediately and poll briefly only after a partial batch."""
+    claimed = max(0, int(counts.get("claimed") or 0))
+    queued = max(0, int(counts.get("asset_queued") or 0))
+    revived = max(0, int(counts.get("asset_revived") or 0))
+    effective_limit = max(1, int(batch_limit))
+
+    if claimed >= effective_limit or int(counts.get("enrichment_has_more") or 0):
+        return 0
+    if claimed > 0 or queued > 0 or revived > 0:
+        return min(max(1, int(idle_interval_seconds)), 5)
+    return max(1, int(idle_interval_seconds))
+
+
 async def run_assets_loop(config: Config, limit: int | None, interval_seconds: int) -> None:
-    log_info("assets_runner.loop.start", interval_seconds=interval_seconds)
+    effective_limit = limit or config.asset_limit
+    log_info(
+        "assets_runner.loop.start",
+        interval_seconds=interval_seconds,
+        batch_limit=effective_limit,
+        concurrency=getattr(config, "asset_concurrency", config.concurrency),
+        enrichment_reconcile_limit=getattr(config, "enrichment_reconcile_limit", 100),
+    )
     while True:
         started_at = time.monotonic()
+        next_delay = interval_seconds
         try:
-            counts = await run_assets_once(config, limit)
+            counts = await run_assets_once(config, effective_limit)
             log_info(
                 "assets_runner.batch.summary",
                 duration_ms=round((time.monotonic() - started_at) * 1000),
                 **counts,
             )
+            next_delay = assets_next_delay_seconds(
+                counts,
+                effective_limit,
+                interval_seconds,
+            )
+        except asyncio.CancelledError:
+            raise
         except Exception as error:
             log_error("assets_runner.batch.failed", error=str(error)[:500])
-        await asyncio.sleep(interval_seconds)
+        if next_delay == 0:
+            await asyncio.sleep(0)
+            continue
+        await asyncio.sleep(next_delay)
 
 
 async def run_loop(config: Config, limit: int | None, interval_seconds: int) -> None:
