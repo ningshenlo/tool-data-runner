@@ -10,6 +10,7 @@ from taxonomy_batch import (
     OpenAIBatchClient,
     ParsedBatchResult,
     apply_request_result,
+    batch_failure_error,
     build_responses_batch_line,
     enqueue_stage,
     extract_response_output_text,
@@ -44,6 +45,27 @@ class AsyncSqliteD1:
 
 
 class TaxonomyBatchPureTests(unittest.TestCase):
+    def test_batch_failure_error_preserves_file_validation_details(self):
+        error = batch_failure_error(
+            {
+                "errors": {
+                    "data": [
+                        {
+                            "code": "invalid_request",
+                            "param": "file_id",
+                            "message": "Cannot find file file-input.",
+                        }
+                    ]
+                }
+            },
+            "failed",
+        )
+
+        self.assertEqual(
+            error,
+            "openai_batch_failed: invalid_request:file_id: Cannot find file file-input.",
+        )
+
     def test_build_line_uses_responses_structured_outputs(self):
         line = build_responses_batch_line(
             custom_id="taxonomy-12-leaf-1",
@@ -329,11 +351,24 @@ class TaxonomyBatchPureTests(unittest.TestCase):
 class OpenAIBatchClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_rest_endpoints_and_existing_key_are_used(self):
         seen = []
+        file_retrievals = 0
 
         def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal file_retrievals
             seen.append((request.method, request.url.path, request.headers))
             if request.url.path == "/v1/files":
-                return httpx.Response(200, json={"id": "file-input"})
+                return httpx.Response(
+                    200, json={"id": "file-input", "status": "uploaded"}
+                )
+            if request.url.path == "/v1/files/file-input":
+                file_retrievals += 1
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "file-input",
+                        "status": "uploaded" if file_retrievals == 1 else "processed",
+                    },
+                )
             if request.url.path == "/v1/batches" and request.method == "POST":
                 return httpx.Response(
                     200, json={"id": "batch-1", "status": "validating"}
@@ -346,7 +381,11 @@ class OpenAIBatchClientTests(unittest.IsolatedAsyncioTestCase):
 
         transport = httpx.MockTransport(handler)
         async with httpx.AsyncClient(transport=transport) as http_client:
-            client = OpenAIBatchClient("existing-env-key", client=http_client)
+            client = OpenAIBatchClient(
+                "existing-env-key",
+                file_ready_poll_seconds=0,
+                client=http_client,
+            )
             uploaded = await client.upload_jsonl(b"{}\n", "test.jsonl")
             batch = await client.create_batch(
                 uploaded["id"], metadata={"pipeline": "test"}
@@ -358,6 +397,8 @@ class OpenAIBatchClientTests(unittest.IsolatedAsyncioTestCase):
             [path for _, path, _ in seen],
             [
                 "/v1/files",
+                "/v1/files/file-input",
+                "/v1/files/file-input",
                 "/v1/batches",
                 "/v1/batches/batch-1",
                 "/v1/files/file-output/content",
@@ -366,6 +407,27 @@ class OpenAIBatchClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             all(headers.get("authorization") == "Bearer existing-env-key" for _, _, headers in seen)
         )
+
+    async def test_upload_stops_when_file_processing_fails(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/v1/files":
+                return httpx.Response(200, json={"id": "file-bad"})
+            if request.url.path == "/v1/files/file-bad":
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "file-bad",
+                        "status": "error",
+                        "status_details": "invalid JSONL",
+                    },
+                )
+            return httpx.Response(404, text="missing")
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as http_client:
+            client = OpenAIBatchClient("existing-env-key", client=http_client)
+            with self.assertRaisesRegex(RuntimeError, "invalid JSONL"):
+                await client.upload_jsonl(b"not-jsonl\n", "bad.jsonl")
 
 
 class TaxonomyBatchStateMachineTests(unittest.IsolatedAsyncioTestCase):
@@ -1181,6 +1243,90 @@ class TaxonomyBatchStateMachineTests(unittest.IsolatedAsyncioTestCase):
             [item_id],
         ).fetchone()[0]
         self.assertEqual(recovered_status, "submitted")
+
+    async def test_failed_batch_persists_provider_detail_and_retries_request(self):
+        item_id = self.connection.execute(
+            """
+            INSERT INTO taxonomy_batch_items (
+              tool_id, pipeline_version, prompt_version, taxonomy_version,
+              status, current_stage, source_url, source_text,
+              source_content_hash, existing_entity_kind, existing_entity_source
+            ) VALUES (
+              10, 'failed-batch-test', 'failed-batch-test', 2,
+              'running', 'profile', 'https://acme.example',
+              'Acme creates images.', 'hash', 'unresolved', 'auto'
+            )
+            """
+        ).lastrowid
+        self.connection.commit()
+        await enqueue_stage(
+            self.d1, self.config, self.catalog, item_id=item_id, stage="profile"
+        )
+
+        class FailedBatchOpenAI:
+            async def upload_jsonl(self, *_args, **_kwargs):
+                return {"id": "file-failed-batch"}
+
+            async def create_batch(self, *_args, **_kwargs):
+                return {"id": "batch-failed-batch", "status": "validating"}
+
+            async def retrieve_batch(self, *_args, **_kwargs):
+                return {
+                    "id": "batch-failed-batch",
+                    "status": "failed",
+                    "request_counts": {"total": 0, "completed": 0, "failed": 0},
+                    "errors": {
+                        "data": [
+                            {
+                                "code": "invalid_request",
+                                "param": "file_id",
+                                "message": "Cannot find file file-failed-batch.",
+                            }
+                        ]
+                    },
+                }
+
+        openai = FailedBatchOpenAI()
+        submitted = await submit_queued_batches(
+            self.d1, self.config, self.catalog, openai
+        )
+        self.assertEqual(submitted["requests_submitted"], 1)
+
+        counts = await poll_active_batches(
+            self.d1, self.config, self.catalog, openai
+        )
+        self.assertEqual(counts["batch_requests_failed"], 1)
+
+        job = self.connection.execute(
+            "SELECT status, error FROM taxonomy_batch_jobs ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("invalid_request:file_id", job["error"])
+        attempts = self.connection.execute(
+            """
+            SELECT attempt, status, error
+            FROM taxonomy_batch_requests
+            WHERE item_id = ? ORDER BY attempt
+            """,
+            [item_id],
+        ).fetchall()
+        self.assertEqual(
+            [(row["attempt"], row["status"]) for row in attempts],
+            [(1, "failed")],
+        )
+        self.assertIn("Cannot find file", attempts[0]["error"])
+        item = self.connection.execute(
+            """
+            SELECT status, retry_kind, retry_attempt, next_retry_at, error
+            FROM taxonomy_batch_items WHERE id = ?
+            """,
+            [item_id],
+        ).fetchone()
+        self.assertEqual(item["status"], "pending")
+        self.assertEqual(item["retry_kind"], "model")
+        self.assertEqual(item["retry_attempt"], 1)
+        self.assertIsNotNone(item["next_retry_at"])
+        self.assertIn("Cannot find file", item["error"])
 
 
 if __name__ == "__main__":

@@ -54,6 +54,8 @@ BATCH_PIPELINE_VERSION = "openai-batch-p2a-v1-2026-08-24"
 BATCH_PROMPT_VERSION = "openai-batch-markets-capabilities-v1-2026-08-24"
 OPENAI_BATCH_ENDPOINT = "/v1/responses"
 FAILED_BATCH_STATUSES = {"failed", "expired", "cancelled"}
+OPENAI_FILE_READY_STATUS = "processed"
+OPENAI_FILE_FAILED_STATUS = "error"
 STAGES = {
     "profile",
     "l1",
@@ -100,6 +102,25 @@ def is_provider_blocked_error(error: Any) -> bool:
         or "(401)" in text
         or "(403)" in text
     )
+
+
+def batch_failure_error(batch: dict[str, Any], status: str) -> str:
+    """Preserve provider validation details instead of a generic batch failure."""
+    details: list[str] = []
+    errors = batch.get("errors")
+    rows = errors.get("data") if isinstance(errors, dict) else None
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        code = str(row.get("code") or "").strip()
+        param = str(row.get("param") or "").strip()
+        message = str(row.get("message") or "").strip()
+        prefix = ":".join(value for value in (code, param) if value)
+        detail = f"{prefix}: {message}" if prefix and message else prefix or message
+        if detail:
+            details.append(detail)
+    base = f"openai_batch_{status}"
+    return _safe_error(f"{base}: {' | '.join(details)}" if details else base)
 
 
 def taxonomy_retry_policy(config: Any) -> tuple[int, int]:
@@ -370,6 +391,8 @@ class OpenAIBatchClient:
         *,
         base_url: str = "https://api.openai.com",
         timeout_seconds: int = 60,
+        file_ready_timeout_seconds: float | None = None,
+        file_ready_poll_seconds: float = 1.0,
         client: httpx.AsyncClient | None = None,
     ):
         key = str(api_key or "").strip()
@@ -377,6 +400,15 @@ class OpenAIBatchClient:
             raise RuntimeError("OPENAI_API_KEY or OPENAI_API is required for taxonomy Batch API")
         self.headers = {"Authorization": f"Bearer {key}"}
         self.base_url = str(base_url or "https://api.openai.com").rstrip("/")
+        self.file_ready_timeout_seconds = max(
+            1.0,
+            float(
+                timeout_seconds
+                if file_ready_timeout_seconds is None
+                else file_ready_timeout_seconds
+            ),
+        )
+        self.file_ready_poll_seconds = max(0.0, float(file_ready_poll_seconds))
         self.client = client or httpx.AsyncClient(timeout=float(timeout_seconds))
         self._owns_client = client is None
 
@@ -422,7 +454,50 @@ class OpenAIBatchClient:
                 f"{_safe_error(response.text, 600)}"
             )
         data = response.json()
-        return data if isinstance(data, dict) else {}
+        uploaded = data if isinstance(data, dict) else {}
+        file_id = str(uploaded.get("id") or "")
+        if not file_id:
+            raise RuntimeError("OpenAI file upload returned no file id")
+        return await self.wait_for_file_ready(file_id)
+
+    async def retrieve_file(self, file_id: str) -> dict[str, Any]:
+        return await self._json_request("GET", f"/v1/files/{file_id}")
+
+    async def wait_for_file_ready(self, file_id: str) -> dict[str, Any]:
+        """Wait until a Batch input file is visible and processed by OpenAI."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.file_ready_timeout_seconds
+        last_status = "unknown"
+        last_error = ""
+        while True:
+            try:
+                file_object = await self.retrieve_file(file_id)
+            except RuntimeError as error:
+                if is_provider_blocked_error(error):
+                    raise
+                last_error = _safe_error(error)
+            else:
+                last_error = ""
+                last_status = str(file_object.get("status") or "").strip().lower()
+                # The status field is deprecated. A successfully retrieved object
+                # without it is therefore considered ready for forward compatibility.
+                if not last_status or last_status == OPENAI_FILE_READY_STATUS:
+                    return file_object
+                if last_status == OPENAI_FILE_FAILED_STATUS:
+                    detail = file_object.get("status_details") or file_object.get("error")
+                    raise RuntimeError(
+                        "OpenAI batch input file processing failed: "
+                        f"file_id={file_id} detail={_safe_error(detail)}"
+                    )
+
+            remaining = deadline - loop.time()
+            if remaining <= 0:
+                suffix = f" error={last_error}" if last_error else ""
+                raise RuntimeError(
+                    "OpenAI batch input file was not ready before timeout: "
+                    f"file_id={file_id} status={last_status}{suffix}"
+                )
+            await asyncio.sleep(min(self.file_ready_poll_seconds, remaining))
 
     async def create_batch(
         self, input_file_id: str, *, metadata: dict[str, str]
@@ -2483,6 +2558,11 @@ async def poll_active_batches(
             )
             batch = await openai.retrieve_batch(batch_id)
             status = str(batch.get("status") or job.get("status") or "in_progress")
+            failure_error = (
+                batch_failure_error(batch, status)
+                if status in FAILED_BATCH_STATUSES
+                else None
+            )
             request_counts = (
                 batch.get("request_counts")
                 if isinstance(batch.get("request_counts"), dict)
@@ -2494,6 +2574,7 @@ async def poll_active_batches(
                 UPDATE taxonomy_batch_jobs
                 SET status = ?, output_file_id = ?, error_file_id = ?,
                     completed_count = ?, failed_count = ?, raw_json = ?,
+                    error = ?,
                     completed_at = CASE WHEN ? IN ('completed','failed','expired','cancelled')
                       THEN ? ELSE completed_at END,
                     updated_at = ?
@@ -2506,6 +2587,7 @@ async def poll_active_batches(
                     int(request_counts.get("completed") or 0),
                     int(request_counts.get("failed") or 0),
                     _json(batch),
+                    failure_error,
                     status,
                     now,
                     now,
@@ -2548,7 +2630,7 @@ async def poll_active_batches(
                     catalog,
                     job_id,
                     set(),
-                    f"openai_batch_{status}",
+                    failure_error or f"openai_batch_{status}",
                 )
         except Exception as error:
             from runner import log_error
