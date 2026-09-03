@@ -1003,7 +1003,13 @@ async def load_due_source_retry_tasks(
               AND COALESCE(t.entity_kind_source, '') <> 'manual'
             )
           )
-        ORDER BY item.next_retry_at, item.id
+        ORDER BY CASE
+                   WHEN t.status = 'pending_enrich' THEN 0
+                   WHEN t.status = 'pending_review' THEN 1
+                   ELSE 2
+                 END,
+                 item.next_retry_at,
+                 item.id
         LIMIT ?
         """,
         [
@@ -1080,7 +1086,12 @@ async def load_new_batch_tasks(
               AND completed.prompt_version = ?
               AND completed.run_status IN ('succeeded', 'partial', 'skipped')
           )
-        ORDER BY t.id ASC
+        ORDER BY CASE
+                   WHEN t.status = 'pending_enrich' THEN 0
+                   WHEN t.status = 'pending_review' THEN 1
+                   ELSE 2
+                 END,
+                 t.id ASC
         LIMIT ?
         """,
         [
@@ -1189,6 +1200,11 @@ async def load_capability_only_batch_tasks(
     )
 
 
+def source_retry_seed_limit(limit: int) -> int:
+    """Reserve at least half of each taxonomy pass for fresh work."""
+    return max(1, int(limit) // 2)
+
+
 async def seed_batch_items(
     d1: Any,
     config: Any,
@@ -1203,8 +1219,12 @@ async def seed_batch_items(
         extract_homepage_main_text,
     )
 
+    # Keep retry storms from consuming the entire pass. Fresh pending_enrich
+    # tools must continue entering the taxonomy pipeline while failed source
+    # fetches work through their bounded retry budget.
+    source_retry_limit = source_retry_seed_limit(limit)
     source_retry_rows = await load_due_source_retry_tasks(
-        d1, catalog=catalog, limit=limit
+        d1, catalog=catalog, limit=source_retry_limit
     )
     remaining = max(0, int(limit) - len(source_retry_rows))
     full_rows = await load_new_batch_tasks(d1, catalog=catalog, limit=remaining)

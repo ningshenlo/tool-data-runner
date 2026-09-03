@@ -15,6 +15,8 @@ from taxonomy_batch import (
     enqueue_stage,
     extract_response_output_text,
     is_retryable_stage_error,
+    load_due_source_retry_tasks,
+    load_new_batch_tasks,
     parse_batch_output_line,
     poll_active_batches,
     resume_due_model_retries,
@@ -22,6 +24,7 @@ from taxonomy_batch import (
     schedule_source_retry,
     should_escalate_l1,
     should_escalate_leaf,
+    source_retry_seed_limit,
     stage_policy,
     strict_json_schema,
     submit_queued_batches,
@@ -1491,6 +1494,111 @@ class TaxonomyBatchStateMachineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["status"], "running")
         self.assertEqual(item["current_stage"], "l1")
         self.assertTrue(item["profile_json"])
+
+
+class TaxonomyBatchSelectionTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.connection = sqlite3.connect(":memory:")
+        self.connection.executescript(
+            """
+            CREATE TABLE tools (
+              id INTEGER PRIMARY KEY,
+              canonical_slug TEXT,
+              normalized_domain TEXT,
+              official_url TEXT,
+              entity_kind TEXT,
+              entity_kind_source TEXT,
+              status TEXT,
+              duplicate_of_tool_id INTEGER
+            );
+            CREATE TABLE tool_sources (
+              id INTEGER PRIMARY KEY,
+              tool_id INTEGER,
+              source_url TEXT,
+              source_type TEXT,
+              verification_status TEXT,
+              raw_payload TEXT,
+              confidence_score REAL
+            );
+            CREATE TABLE product_profiles (
+              tool_id INTEGER PRIMARY KEY,
+              profile_json TEXT
+            );
+            CREATE TABLE taxonomy_terms (
+              id INTEGER PRIMARY KEY,
+              dimension TEXT,
+              status TEXT,
+              parent_id INTEGER
+            );
+            CREATE TABLE product_taxonomy_assignments (
+              tool_id INTEGER,
+              term_id INTEGER,
+              is_primary INTEGER,
+              decision_status TEXT
+            );
+            CREATE TABLE taxonomy_batch_items (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              tool_id INTEGER,
+              pipeline_version TEXT,
+              prompt_version TEXT,
+              taxonomy_version INTEGER,
+              status TEXT,
+              retry_kind TEXT,
+              next_retry_at TEXT
+            );
+            CREATE TABLE classification_runs (
+              tool_id INTEGER,
+              prompt_version TEXT,
+              run_status TEXT
+            );
+            """
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO tools (
+              id, canonical_slug, normalized_domain, official_url,
+              entity_kind, entity_kind_source, status
+            ) VALUES (?, ?, ?, ?, 'independent_product', 'auto', ?)
+            """,
+            [
+                (10, "published", "published.example", "https://published.example", "published"),
+                (20, "pending-a", "pending-a.example", "https://pending-a.example", "pending_enrich"),
+                (30, "review", "review.example", "https://review.example", "pending_review"),
+                (40, "pending-b", "pending-b.example", "https://pending-b.example", "pending_enrich"),
+            ],
+        )
+        self.connection.commit()
+        self.d1 = AsyncSqliteD1(self.connection)
+        self.catalog = SimpleNamespace(taxonomy_version=2)
+
+    def tearDown(self):
+        self.connection.close()
+
+    def test_source_retry_quota_reserves_fresh_capacity(self):
+        self.assertEqual(source_retry_seed_limit(50), 25)
+        self.assertEqual(source_retry_seed_limit(2), 1)
+        self.assertEqual(source_retry_seed_limit(1), 1)
+
+    async def test_new_and_retry_selection_prioritize_pending_enrich(self):
+        new_rows = await load_new_batch_tasks(self.d1, catalog=self.catalog, limit=4)
+        self.assertEqual([row["tool_id"] for row in new_rows], [20, 40, 30, 10])
+
+        self.connection.executemany(
+            """
+            INSERT INTO taxonomy_batch_items (
+              tool_id, pipeline_version, prompt_version, taxonomy_version,
+              status, retry_kind, next_retry_at
+            ) VALUES (?, 'openai-batch-p2a-v1-2026-08-24',
+                      'openai-batch-markets-capabilities-v2-security-precision-2026-08-27',
+                      2, 'pending', 'source', '2000-01-01T00:00:00Z')
+            """,
+            [(10,), (20,), (30,), (40,)],
+        )
+        self.connection.commit()
+        retry_rows = await load_due_source_retry_tasks(
+            self.d1, catalog=self.catalog, limit=4
+        )
+        self.assertEqual([row["tool_id"] for row in retry_rows], [20, 40, 30, 10])
 
 
 if __name__ == "__main__":
