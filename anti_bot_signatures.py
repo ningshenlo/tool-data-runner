@@ -112,6 +112,10 @@ ANTI_BOT_SIGNATURES: tuple[AntiBotSignature, ...] = (
 )
 
 
+_ADVISORY_HTML_SIGNATURE_CODES = frozenset({"cf_challenge_platform"})
+_ADVISORY_MIN_VISIBLE_CHARS = 500
+
+
 def _visible_text(html_body: str, limit: int = 20000) -> str:
     value = re.sub(r"<(?:script|style)\b[\s\S]*?</(?:script|style)>", " ", html_body or "", flags=re.I)
     value = re.sub(r"<[^>]+>", " ", value)
@@ -155,6 +159,18 @@ def detect_anti_bot_page(
         matches.append(
             (_signature("http_429", "http", "anti_bot", 100, r"$", "title"), "HTTP 429")
         )
+
+    # Cloudflare can include the challenge-platform bootstrap on an otherwise
+    # normal product page. Treat the bare script path as advisory when a 2xx
+    # page exposes substantial visible content; real challenge copy, cf-chl
+    # state, or an HTTP block remains independently decisive.
+    content_status = http_status is None or 200 <= http_status < 300
+    if content_status and len(visible) >= _ADVISORY_MIN_VISIBLE_CHARS:
+        matches = [
+            item
+            for item in matches
+            if item[0].code not in _ADVISORY_HTML_SIGNATURE_CODES
+        ]
 
     if not matches:
         return None

@@ -1864,7 +1864,6 @@ def classify_page_state(
     challenge_signatures = (
         "cf_chl_opt",
         "cf-chl-",
-        "/cdn-cgi/challenge-platform",
         "datadome-captcha",
         "_incapsula_resource",
         "imperva captcha",

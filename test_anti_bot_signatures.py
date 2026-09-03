@@ -25,6 +25,33 @@ class AntiBotSignatureTests(unittest.TestCase):
         self.assertEqual(detected.provider, "cloudflare")
         self.assertIn("cf_checking_browser", detected.matched_codes)
 
+    def test_cloudflare_bootstrap_is_advisory_on_content_rich_product_page(self):
+        product_copy = " ".join(
+            [
+                "Build, deploy, and manage trusted data science and AI applications.",
+                "Create reproducible environments, collaborate with teams, and ship models.",
+            ]
+            * 8
+        )
+        detected = detect_anti_bot_page(
+            "<html><head><title>AI development platform</title>"
+            '<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>'
+            f"</head><body><main>{product_copy}</main></body></html>",
+            http_status=200,
+        )
+        self.assertIsNone(detected)
+
+    def test_cloudflare_bootstrap_does_not_override_http_block(self):
+        product_copy = "Product documentation and feature descriptions. " * 20
+        detected = detect_anti_bot_page(
+            '<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>'
+            f"<main>{product_copy}</main>",
+            http_status=403,
+        )
+        self.assertIsNotNone(detected)
+        assert detected is not None
+        self.assertIn("http_403", detected.matched_codes)
+
     def test_detects_vendor_html_markers(self):
         fixtures = {
             "cloudflare": '<script src="/cdn-cgi/challenge-platform/h/g/orchestrate/chl_page/v1"></script>',

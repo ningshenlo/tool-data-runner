@@ -229,6 +229,23 @@ class PageAndNameQualityTests(unittest.TestCase):
         )
         self.assertEqual(assessment.state, "anti_bot")
 
+    def test_cloudflare_bootstrap_with_product_content_is_valid(self) -> None:
+        product_copy = " ".join(
+            [
+                "Build, deploy, and manage trusted data science and AI applications.",
+                "Create reproducible environments, collaborate with teams, and ship models.",
+            ]
+            * 8
+        )
+        assessment = runner.classify_page_state(
+            "<html><head><title>AI development platform</title>"
+            '<script src="/cdn-cgi/challenge-platform/scripts/jsd/main.js"></script>'
+            f"</head><body><main>{product_copy}</main></body></html>",
+            http_status=200,
+        )
+        self.assertEqual(assessment.state, "valid_product_page")
+        self.assertTrue(assessment.is_valid)
+
     def test_neutral_example_transport_is_not_a_valid_product_page(self) -> None:
         assessment = runner.classify_page_state(
             "<html><head><title>Example Domain</title></head>"
