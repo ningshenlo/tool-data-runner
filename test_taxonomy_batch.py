@@ -27,7 +27,12 @@ from taxonomy_batch import (
     submit_queued_batches,
     taxonomy_retry_delay_seconds,
 )
-from taxonomy_shadow import TaxonomyCatalog, TaxonomyTerm
+from taxonomy_shadow import (
+    TaxonomyCatalog,
+    TaxonomyTerm,
+    leaf_adjudication_prompt,
+    top2_l1_prompt,
+)
 
 
 class AsyncSqliteD1:
@@ -65,6 +70,37 @@ class TaxonomyBatchPureTests(unittest.TestCase):
             error,
             "openai_batch_failed: invalid_request:file_id: Cannot find file file-input.",
         )
+
+    def test_security_market_prompts_require_primary_job_evidence(self):
+        roots = [
+            TaxonomyTerm(
+                term_id=28,
+                dimension="primary_category",
+                slug="ai-security-compliance",
+                name="AI Detection, Security, and Compliance",
+                parent_id=None,
+            )
+        ]
+        catalog = TaxonomyCatalog(roots)
+        profile = {
+            "primary_job": {
+                "value": "Build enterprise AI assistants securely",
+                "evidence": [{"quote": "Build enterprise AI assistants securely"}],
+            }
+        }
+
+        l1_prompt = top2_l1_prompt(roots, catalog, profile)
+        leaf_prompt = leaf_adjudication_prompt(
+            roots,
+            ["ai-security-compliance"],
+            catalog,
+            profile,
+        )
+
+        self.assertIn("HIGH-PRECISION SECURITY RULE", l1_prompt)
+        self.assertIn("supporting attributes", l1_prompt)
+        self.assertIn("main sold workflow", leaf_prompt)
+        self.assertIn("incidental security", leaf_prompt)
 
     def test_build_line_uses_responses_structured_outputs(self):
         line = build_responses_batch_line(

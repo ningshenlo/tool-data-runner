@@ -1,9 +1,8 @@
 """Persistent OpenAI Batch API runner for multidimensional taxonomy.
 
 The module submits Responses API JSONL batches and persists every canonical
-taxonomy stage in D1. A separate compatibility projector mirrors accepted
-primaries into legacy category fields after model work; those fields are never
-used as taxonomy authority.
+taxonomy stage in D1. Accepted primary terms remain canonical taxonomy records;
+the batch runner never mirrors them into the retired category schema.
 """
 
 from __future__ import annotations
@@ -51,7 +50,7 @@ from taxonomy_shadow import (
 )
 
 BATCH_PIPELINE_VERSION = "openai-batch-p2a-v1-2026-08-24"
-BATCH_PROMPT_VERSION = "openai-batch-markets-capabilities-v1-2026-08-24"
+BATCH_PROMPT_VERSION = "openai-batch-markets-capabilities-v2-security-precision-2026-08-27"
 OPENAI_BATCH_ENDPOINT = "/v1/responses"
 FAILED_BATCH_STATUSES = {"failed", "expired", "cancelled"}
 OPENAI_FILE_READY_STATUS = "processed"
@@ -1382,7 +1381,7 @@ async def seed_batch_items(
                 )
             source_text = extract_homepage_main_text(
                 html_body,
-                limit=int(getattr(config, "category_main_content_max_chars", 10000)),
+                limit=int(getattr(config, "taxonomy_main_content_max_chars", 10000)),
             )
             if not source_text.strip():
                 raise RuntimeError("homepage content contained no usable main content")
@@ -2890,13 +2889,5 @@ async def run_openai_taxonomy_batch_once(
             """
         )
         counts["active_batches"] = int(active_rows[0].get("count") or 0) if active_rows else 0
-        from taxonomy_materialize import materialize_effective_primary_assignments
-
-        counts.update(
-            await materialize_effective_primary_assignments(
-                d1,
-                limit=max(effective_limit, 100),
-            )
-        )
     log_info("taxonomy_batch.pass", **counts)
     return counts

@@ -121,18 +121,17 @@ class CatalogVersionTests(unittest.TestCase):
               excludes TEXT,
               examples TEXT,
               taxonomy_version INTEGER NOT NULL,
-              source_category_id INTEGER,
               status TEXT NOT NULL,
               display_order INTEGER NOT NULL
             );
 
             INSERT INTO taxonomy_terms VALUES
               (1, 'primary_category', 'legacy-root', 'Legacy', NULL,
-               NULL, NULL, NULL, NULL, 1, NULL, 'active', 10),
+               NULL, NULL, NULL, NULL, 1, 'active', 10),
               (2, 'primary_category', 'current-root', 'Current', NULL,
-               NULL, NULL, NULL, NULL, 2, NULL, 'active', 10),
+               NULL, NULL, NULL, NULL, 2, 'active', 10),
               (3, 'capability', 'current-capability', 'Current capability', NULL,
-               NULL, NULL, NULL, NULL, 2, NULL, 'active', 20);
+               NULL, NULL, NULL, NULL, 2, 'active', 20);
             """
         )
 
@@ -558,7 +557,7 @@ class CapabilityBackfillPipelineTests(unittest.IsolatedAsyncioTestCase):
                 return [{"term_id": 2}]
 
         class FakeBrowser:
-            def category_custom_ai(self):
+            def taxonomy_custom_ai(self):
                 return [{"model": "candidate-model"}]
 
             async def fetch_homepage_content(self, task):
@@ -619,7 +618,7 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
         content_urls: list[str] = []
 
         class FakeBrowser:
-            def category_custom_ai(self):
+            def taxonomy_custom_ai(self):
                 return [{"model": "fake-model"}]
 
             async def fetch_homepage_content(self, task):
@@ -709,7 +708,7 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
         stages: list[str] = []
 
         class FakeBrowser:
-            def category_custom_ai(self):
+            def taxonomy_custom_ai(self):
                 return [{"model": "fake-model"}]
 
             async def fetch_homepage_content(self, task):
@@ -801,7 +800,7 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
         stages: list[str] = []
 
         class FakeBrowser:
-            def category_custom_ai(self):
+            def taxonomy_custom_ai(self):
                 return [{"model": "fake-model"}]
 
             async def fetch_homepage_content(self, task):
@@ -868,7 +867,7 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
         stages: list[str] = []
 
         class FakeBrowser:
-            def category_custom_ai(self):
+            def taxonomy_custom_ai(self):
                 return [{"model": "fake-model"}]
 
             async def fetch_homepage_content(self, task):
@@ -930,7 +929,7 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
         asset_calls: list[str] = []
 
         class FakeBrowser:
-            def category_custom_ai(self):
+            def taxonomy_custom_ai(self):
                 return [{"model": "fake-model"}]
 
             async def fetch_homepage_content(self, task):
@@ -968,7 +967,7 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
         calls: list[tuple[str, str]] = []
 
         class FakeBrowser:
-            def category_custom_ai(self):
+            def taxonomy_custom_ai(self):
                 return [{"model": "fake-model"}]
 
             async def fetch_homepage_content(self, task):
@@ -1006,7 +1005,7 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_auto_non_product_fetch_failure_demotes_once_without_retry_status(self):
         class FakeBrowser:
-            def category_custom_ai(self):
+            def taxonomy_custom_ai(self):
                 return [{"model": "fake-model"}]
 
             async def fetch_homepage_content(self, task):
@@ -1040,21 +1039,16 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_auto_non_product_safe_demotion_is_persisted_as_partial(self):
         class FakeBrowser:
-            def category_custom_ai(self):
+            def taxonomy_custom_ai(self):
                 return [{"model": "fake-model"}]
 
             async def fetch_homepage_content(self, task):
                 raise RuntimeError("network connection closed")
 
-        before = {"primary_category_id": 10}
         d1 = object()
         update_entity = AsyncMock()
         insert_run = AsyncMock(return_value=901)
         with (
-            patch(
-                "taxonomy_shadow.snapshot_legacy_category_state",
-                new=AsyncMock(side_effect=[before, before]),
-            ),
             patch("taxonomy_shadow.update_tool_entity_kind", new=update_entity),
             patch("taxonomy_shadow.upsert_product_profile", new=AsyncMock()),
             patch("taxonomy_shadow.insert_classification_run", new=insert_run),
@@ -1088,7 +1082,7 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
         stage_models: dict[str, list[str]] = {}
 
         class FakeBrowser:
-            def category_custom_ai(self):
+            def taxonomy_custom_ai(self):
                 return [
                     {"model": "deepseek/deepseek-v4-flash"},
                     {"model": "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"},
@@ -1168,7 +1162,7 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
         stages: list[str] = []
 
         class FakeBrowser:
-            def category_custom_ai(self):
+            def taxonomy_custom_ai(self):
                 return [
                     {"model": "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"}
                 ]
@@ -1211,7 +1205,7 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
         calls: list[str] = []
 
         class FakeBrowser:
-            def category_custom_ai(self):
+            def taxonomy_custom_ai(self):
                 return [{"model": "fake-model"}]
 
             async def fetch_homepage_content(self, task):

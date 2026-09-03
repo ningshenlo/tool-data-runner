@@ -53,15 +53,11 @@ def create_store() -> sqlite3.Connection:
     connection.execute("PRAGMA foreign_keys = ON")
     connection.executescript(
         """
-        CREATE TABLE categories (id INTEGER PRIMARY KEY, canonical_slug TEXT NOT NULL);
         CREATE TABLE tools (
           id INTEGER PRIMARY KEY,
           canonical_slug TEXT NOT NULL,
           normalized_domain TEXT NOT NULL,
           official_url TEXT NOT NULL,
-          primary_category_id INTEGER,
-          category_classification_status TEXT,
-          category_classification_raw TEXT,
           entity_kind TEXT,
           entity_kind_source TEXT,
           status TEXT NOT NULL,
@@ -132,20 +128,18 @@ class ClassificationAnomalyStoreTests(unittest.IsolatedAsyncioTestCase):
         self.d1 = SQLiteD1(self.connection)
         self.connection.executescript(
             """
-            INSERT INTO categories (id, canonical_slug) VALUES (28, 'ai-security-compliance');
             INSERT INTO taxonomy_terms (id, dimension, slug)
               VALUES (280, 'primary_category', 'ai-security-compliance');
             INSERT INTO tools (
-              id, canonical_slug, normalized_domain, official_url, primary_category_id,
-              category_classification_status, category_classification_raw,
+              id, canonical_slug, normalized_domain, official_url,
               entity_kind, entity_kind_source, status, duplicate_of_tool_id
             ) VALUES (
-              318, 'janitorai', 'janitorai.com', 'https://janitorai.com/', 28,
-              'legacy', NULL, 'unresolved', 'auto', 'published', NULL
+              318, 'janitorai', 'janitorai.com', 'https://janitorai.com/',
+              'unresolved', 'auto', 'published', NULL
             );
             INSERT INTO product_taxonomy_assignments (
               tool_id, term_id, is_primary, decision_status, source
-            ) VALUES (318, 280, 1, 'legacy', 'legacy');
+            ) VALUES (318, 280, 1, 'auto_accepted', 'auto');
             INSERT INTO tool_localizations (
               tool_id, locale_code, name, tagline, short_description,
               long_description, feature_highlights, translation_status
@@ -335,12 +329,11 @@ class ClassificationAnomalyStoreTests(unittest.IsolatedAsyncioTestCase):
         self.connection.executescript(
             """
             INSERT INTO tools (
-              id, canonical_slug, normalized_domain, official_url, primary_category_id,
-              category_classification_status, category_classification_raw,
+              id, canonical_slug, normalized_domain, official_url,
               entity_kind, entity_kind_source, status, duplicate_of_tool_id
             ) VALUES (
-              319, 'second-blocked', 'second.example', 'https://second.example/', 28,
-              'legacy', NULL, 'unresolved', 'auto', 'published', NULL
+              319, 'second-blocked', 'second.example', 'https://second.example/',
+              'unresolved', 'auto', 'published', NULL
             );
             INSERT INTO tool_localizations (
               tool_id, locale_code, name, tagline, short_description,

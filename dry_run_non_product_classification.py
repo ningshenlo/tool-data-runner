@@ -40,8 +40,6 @@ WITH cohort AS (
     t.official_url,
     t.entity_kind,
     t.entity_kind_source,
-    t.primary_category_id,
-    t.category_classification_status,
     COALESCE((
       SELECT localized.name
       FROM tool_localizations localized
@@ -59,9 +57,9 @@ WITH cohort AS (
        AND assigned_term.dimension = 'primary_category'
       WHERE assigned.tool_id = t.id
         AND assigned.is_primary = 1
-        AND assigned.decision_status IN ('verified', 'auto_accepted', 'legacy')
+        AND assigned.decision_status IN ('verified', 'auto_accepted')
       ORDER BY
-        CASE assigned.decision_status WHEN 'verified' THEN 0 WHEN 'auto_accepted' THEN 1 ELSE 2 END,
+        CASE assigned.decision_status WHEN 'verified' THEN 0 ELSE 1 END,
         assigned.id DESC
       LIMIT 1
     ), '') AS assignment_decision_status,
@@ -73,9 +71,9 @@ WITH cohort AS (
        AND assigned_term.dimension = 'primary_category'
       WHERE assigned.tool_id = t.id
         AND assigned.is_primary = 1
-        AND assigned.decision_status IN ('verified', 'auto_accepted', 'legacy')
+        AND assigned.decision_status IN ('verified', 'auto_accepted')
       ORDER BY
-        CASE assigned.decision_status WHEN 'verified' THEN 0 WHEN 'auto_accepted' THEN 1 ELSE 2 END,
+        CASE assigned.decision_status WHEN 'verified' THEN 0 ELSE 1 END,
         assigned.id DESC
       LIMIT 1
     ), '') AS assignment_source,
@@ -87,9 +85,9 @@ WITH cohort AS (
        AND assigned_term.dimension = 'primary_category'
       WHERE assigned.tool_id = t.id
         AND assigned.is_primary = 1
-        AND assigned.decision_status IN ('verified', 'auto_accepted', 'legacy')
+        AND assigned.decision_status IN ('verified', 'auto_accepted')
       ORDER BY
-        CASE assigned.decision_status WHEN 'verified' THEN 0 WHEN 'auto_accepted' THEN 1 ELSE 2 END,
+        CASE assigned.decision_status WHEN 'verified' THEN 0 ELSE 1 END,
         assigned.id DESC
       LIMIT 1
     ), 0) AS current_primary_term_id,
@@ -100,12 +98,12 @@ WITH cohort AS (
       WHERE assigned.tool_id = t.id
         AND assigned.is_primary = 1
         AND assigned_term.dimension = 'primary_category'
-        AND assigned.decision_status IN ('verified', 'auto_accepted', 'legacy')
+        AND assigned.decision_status IN ('verified', 'auto_accepted')
       ORDER BY
-        CASE assigned.decision_status WHEN 'verified' THEN 0 WHEN 'auto_accepted' THEN 1 ELSE 2 END,
+        CASE assigned.decision_status WHEN 'verified' THEN 0 ELSE 1 END,
         assigned.id DESC
       LIMIT 1
-    ), legacy_category.canonical_slug, '') AS current_primary_slug,
+    ), '') AS current_primary_slug,
     latest_run.id AS latest_run_id,
     latest_run.run_status AS latest_run_status,
     latest_run.error AS latest_run_error,
@@ -126,7 +124,6 @@ WITH cohort AS (
     ORDER BY run.created_at DESC, run.id DESC
     LIMIT 1
   )
-  LEFT JOIN categories legacy_category ON legacy_category.id = t.primary_category_id
   WHERE t.status = 'published'
     AND t.duplicate_of_tool_id IS NULL
     AND t.entity_kind = 'non_product'
@@ -147,7 +144,6 @@ EVIDENCE_SQL = COHORT_CTE + """,
 candidate_text AS (
   SELECT
     cohort.*,
-    COALESCE(substr(t.category_classification_raw, 1, 16000), '') AS category_classification_raw,
     COALESCE((
       SELECT substr(
         COALESCE(localized.tagline, '') || ' ' ||
@@ -178,13 +174,12 @@ candidate_text AS (
       LIMIT 1
     ), '') AS source_text
   FROM cohort
-  JOIN tools t ON t.id = cohort.tool_id
   JOIN classification_runs latest_run ON latest_run.id = cohort.latest_run_id
   LEFT JOIN product_profiles profile ON profile.tool_id = cohort.tool_id
 ), matched AS (
   SELECT *, lower(
     localization_text || ' ' || feature_text || ' ' || profile_text || ' ' ||
-    category_classification_raw || ' ' || latest_run_text || ' ' || source_text
+    latest_run_text || ' ' || source_text
   ) AS detection_text
   FROM candidate_text
 )

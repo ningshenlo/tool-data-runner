@@ -18,9 +18,6 @@ WITH candidates AS (
     t.id AS tool_id,
     t.canonical_slug,
     t.official_url,
-    t.primary_category_id,
-    t.category_classification_status,
-    t.category_classification_raw,
     COALESCE((
       SELECT assigned.decision_status
       FROM product_taxonomy_assignments assigned
@@ -29,9 +26,9 @@ WITH candidates AS (
        AND assigned_term.dimension = 'primary_category'
       WHERE assigned.tool_id = t.id
         AND assigned.is_primary = 1
-        AND assigned.decision_status IN ('verified', 'auto_accepted', 'legacy')
+        AND assigned.decision_status IN ('verified', 'auto_accepted')
       ORDER BY
-        CASE assigned.decision_status WHEN 'verified' THEN 0 WHEN 'auto_accepted' THEN 1 ELSE 2 END,
+        CASE assigned.decision_status WHEN 'verified' THEN 0 ELSE 1 END,
         assigned.id DESC
       LIMIT 1
     ), '') AS assignment_decision_status,
@@ -43,9 +40,9 @@ WITH candidates AS (
        AND assigned_term.dimension = 'primary_category'
       WHERE assigned.tool_id = t.id
         AND assigned.is_primary = 1
-        AND assigned.decision_status IN ('verified', 'auto_accepted', 'legacy')
+        AND assigned.decision_status IN ('verified', 'auto_accepted')
       ORDER BY
-        CASE assigned.decision_status WHEN 'verified' THEN 0 WHEN 'auto_accepted' THEN 1 ELSE 2 END,
+        CASE assigned.decision_status WHEN 'verified' THEN 0 ELSE 1 END,
         assigned.id DESC
       LIMIT 1
     ), '') AS assignment_source,
@@ -57,9 +54,9 @@ WITH candidates AS (
        AND assigned_term.dimension = 'primary_category'
       WHERE assigned.tool_id = t.id
         AND assigned.is_primary = 1
-        AND assigned.decision_status IN ('verified', 'auto_accepted', 'legacy')
+        AND assigned.decision_status IN ('verified', 'auto_accepted')
       ORDER BY
-        CASE assigned.decision_status WHEN 'verified' THEN 0 WHEN 'auto_accepted' THEN 1 ELSE 2 END,
+        CASE assigned.decision_status WHEN 'verified' THEN 0 ELSE 1 END,
         assigned.id DESC
       LIMIT 1
     ), 0) AS current_primary_term_id,
@@ -70,12 +67,12 @@ WITH candidates AS (
       WHERE assigned.tool_id = t.id
         AND assigned.is_primary = 1
         AND assigned_term.dimension = 'primary_category'
-        AND assigned.decision_status IN ('verified', 'auto_accepted', 'legacy')
+        AND assigned.decision_status IN ('verified', 'auto_accepted')
       ORDER BY
-        CASE assigned.decision_status WHEN 'verified' THEN 0 WHEN 'auto_accepted' THEN 1 ELSE 2 END,
+        CASE assigned.decision_status WHEN 'verified' THEN 0 ELSE 1 END,
         assigned.id DESC
       LIMIT 1
-    ), legacy_category.canonical_slug, '') AS current_primary_slug,
+    ), '') AS current_primary_slug,
     COALESCE((
       SELECT substr(
         COALESCE(localized.tagline, '') || ' ' ||
@@ -109,7 +106,6 @@ WITH candidates AS (
       LIMIT 1
     ), '') AS source_text
   FROM tools t
-  LEFT JOIN categories legacy_category ON legacy_category.id = t.primary_category_id
   LEFT JOIN product_profiles profile ON profile.tool_id = t.id
   LEFT JOIN classification_runs latest_run ON latest_run.id = (
     SELECT run.id
@@ -123,7 +119,7 @@ WITH candidates AS (
 ), matched AS (
   SELECT *, lower(
     localization_text || ' ' || feature_text || ' ' || profile_text || ' ' ||
-    COALESCE(category_classification_raw, '') || ' ' || latest_run_text || ' ' || source_text
+    latest_run_text || ' ' || source_text
   ) AS detection_text
   FROM candidates
 )
@@ -185,7 +181,6 @@ def build_classification_pollution_matches(row: dict[str, Any]) -> list[dict[str
         ("localization", "localization_text"),
         ("features", "feature_text"),
         ("product_profile", "profile_text"),
-        ("legacy_classification", "category_classification_raw"),
         ("classification_run", "latest_run_text"),
         ("official_source", "source_text"),
     ):
@@ -226,28 +221,14 @@ def build_anti_bot_anomaly_candidate(row: dict[str, Any]) -> dict[str, Any] | No
             }
         ]
     else:
-        score = 55
+        score = 60
         signals = [
             {
                 "code": "anti_bot_product_fact_pollution",
-                "score": 55,
+                "score": 60,
                 "reason": "Stored product or classification evidence contains a known WAF/challenge signature.",
             }
         ]
-
-    legacy_without_provenance = (
-        str(row.get("assignment_decision_status") or "") == "legacy"
-        or str(row.get("assignment_source") or "") == "legacy"
-    ) and not str(row.get("category_classification_raw") or "").strip()
-    if legacy_without_provenance:
-        score += 20
-        signals.append(
-            {
-                "code": "legacy_category_without_provenance",
-                "score": 20,
-                "reason": "Effective category is legacy and has no raw model output or evidence.",
-            }
-        )
 
     latest_error = str(row.get("latest_run_error") or "").lower()
     if "entity_unresolved" in latest_error or "page_invalid" in latest_error:

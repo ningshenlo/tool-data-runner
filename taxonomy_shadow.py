@@ -1,8 +1,7 @@
 """P2A Shadow Mode taxonomy pipeline.
 
-Writes multidim Shadow tables and the entity eligibility fields on ``tools``.
-Never dual-writes ``tools.primary_category_id`` or ``tool_categories``. See
-ADR-001 and docs/2026-08-06-multidim-taxonomy-roadmap.md.
+Writes canonical taxonomy tables and the entity eligibility fields on ``tools``.
+The legacy category projection path has been removed.
 """
 
 from __future__ import annotations
@@ -18,7 +17,7 @@ from typing import Any
 
 from anti_bot_signatures import detect_anti_bot_text
 
-SHADOW_PROMPT_VERSION = "shadow-markets-capabilities-v5-2026-08-24"
+SHADOW_PROMPT_VERSION = "shadow-markets-capabilities-v6-security-precision-2026-08-27"
 SHADOW_EXTRACTOR_VERSION = "cleaned-main-content-v2-evidence-grounded-2026-08-14"
 SHADOW_PIPELINE_VERSION = "p2a-markets-capabilities-v4-2026-08-24"
 DEFAULT_TAXONOMY_VERSION = 1
@@ -94,7 +93,6 @@ class TaxonomyTerm:
     excludes: str = ""
     examples: str = ""
     taxonomy_version: int = DEFAULT_TAXONOMY_VERSION
-    source_category_id: int | None = None
 
 
 @dataclass
@@ -164,8 +162,6 @@ def catalog_from_rows(rows: list[dict[str, Any]]) -> TaxonomyCatalog:
             continue
         parent_raw = row.get("parent_id")
         parent_id = int(parent_raw) if parent_raw not in (None, "") else None
-        source_raw = row.get("source_category_id")
-        source_category_id = int(source_raw) if source_raw not in (None, "") else None
         terms.append(
             TaxonomyTerm(
                 term_id=term_id,
@@ -179,7 +175,6 @@ def catalog_from_rows(rows: list[dict[str, Any]]) -> TaxonomyCatalog:
                 excludes=_clip(row.get("excludes"), 400),
                 examples=_clip(row.get("examples"), 300),
                 taxonomy_version=int(row.get("taxonomy_version") or DEFAULT_TAXONOMY_VERSION),
-                source_category_id=source_category_id,
             )
         )
     return TaxonomyCatalog(terms=terms)
@@ -693,6 +688,11 @@ def top2_l1_prompt(
         "Return the top 1 to 3 best-matching L1 (top-level) category slugs from the catalog. "
         "Order by fit (best first). Use exact slugs only. "
         "Prefer the product's main market positioning, not incidental features. "
+        "HIGH-PRECISION SECURITY RULE: choose ai-security-compliance only when the "
+        "product's primary job and real competitor set is content authenticity detection, "
+        "cybersecurity, AI/model security, governance, risk, or compliance. Generic claims "
+        "such as safe, secure, private, trusted, responsible AI, guardrails, enterprise-grade, "
+        "or compliant are supporting attributes and MUST NOT justify this market. "
         "Definitions and excludes are binding. Do not invent slugs.\n\n"
         f"Product facts: {profile_classification_context(profile)}\n\n"
         f"L1 catalog:\n{catalog.render_terms(roots)}"
@@ -739,6 +739,10 @@ def leaf_adjudication_prompt(
         "represent another real competitor set for the product, not a feature or integration. "
         "A leaf is the most specific market category. Prefer child (L2) when one fits; "
         "only pick an L1 slug if that L1 has no children or no child is supported. "
+        "For the ai-security-compliance family, require evidence that detection, threat "
+        "prevention/response, AI security, governance, risk, or compliance is the product's "
+        "main sold workflow. Do not classify a product there from incidental security, "
+        "privacy, safety, policy, or responsible-AI language. "
         "Definitions and excludes are binding. Empty leaf_slug only if none fit. "
         "secondary_leaves must exclude leaf_slug and use exact candidate slugs.\n\n"
         f"Product facts: {profile_classification_context(profile)}\n\n"
@@ -1299,8 +1303,7 @@ SELECT
   t.includes,
   t.excludes,
   t.examples,
-  t.taxonomy_version,
-  t.source_category_id
+  t.taxonomy_version
 FROM taxonomy_terms t
 LEFT JOIN taxonomy_terms parent ON parent.id = t.parent_id
 WHERE t.status = 'active'
@@ -1789,6 +1792,32 @@ async def upsert_assignment(
         if evidence is not None
         else None
     )
+    if is_primary:
+        # The canonical taxonomy permits exactly one primary row per tool. This
+        # also retires the temporary legacy primary when a new accepted leaf is
+        # written, so no compatibility projection is needed afterward.
+        await d1.run(
+            """
+            UPDATE product_taxonomy_assignments
+            SET is_primary = 0,
+                decision_status = CASE
+                  WHEN decision_status IN (
+                    'legacy', 'auto_accepted', 'provisional', 'unresolved'
+                  ) THEN 'superseded'
+                  ELSE decision_status
+                END,
+                updated_at = ?
+            WHERE tool_id = ?
+              AND term_id <> ?
+              AND is_primary = 1
+              AND term_id IN (
+                SELECT id
+                FROM taxonomy_terms
+                WHERE dimension = 'primary_category'
+              )
+            """,
+            [now, tool_id, term_id],
+        )
     await d1.run(
         """
         INSERT INTO product_taxonomy_assignments (
@@ -1848,34 +1877,6 @@ async def upsert_assignment(
     )
 
 
-async def snapshot_legacy_category_state(d1: Any, tool_id: int) -> dict[str, Any]:
-    """For ADR acceptance: prove Shadow did not touch legacy tables."""
-    tool_rows = await d1.query(
-        """
-        SELECT id, primary_category_id, category_classification_status
-        FROM tools WHERE id = ? LIMIT 1
-        """,
-        [tool_id],
-    )
-    cat_rows = await d1.query(
-        """
-        SELECT category_id, source
-        FROM tool_categories
-        WHERE tool_id = ?
-        ORDER BY category_id
-        """,
-        [tool_id],
-    )
-    tool = tool_rows[0] if tool_rows else {}
-    return {
-        "primary_category_id": tool.get("primary_category_id"),
-        "category_classification_status": tool.get("category_classification_status"),
-        "tool_categories": [
-            {"category_id": r.get("category_id"), "source": r.get("source")} for r in cat_rows
-        ],
-    }
-
-
 @dataclass
 class ShadowResult:
     tool_id: int
@@ -1888,8 +1889,6 @@ class ShadowResult:
     entity_confidence: float = 0.0
     capability_slugs: list[str] = field(default_factory=list)
     error: str = ""
-    legacy_before: dict[str, Any] | None = None
-    legacy_after: dict[str, Any] | None = None
     profile: dict[str, Any] | None = None
     raw: dict[str, Any] = field(default_factory=dict)
 
@@ -1950,10 +1949,8 @@ async def classify_capability_profile_shadow(
     if tool_id <= 0:
         result.error = "invalid_tool_id"
         return result
-    if not dry_run:
-        result.legacy_before = await snapshot_legacy_category_state(d1, tool_id)
 
-    configured_custom_ai = browser_client.category_custom_ai()
+    configured_custom_ai = browser_client.taxonomy_custom_ai()
     custom_ai = trusted_taxonomy_custom_ai(configured_custom_ai)
     model_chain = [
         str(item.get("model") or "")
@@ -2103,10 +2100,6 @@ async def classify_capability_profile_shadow(
         )
     result.status = run_status
     result.raw = raw_bundle
-    result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
-    if result.legacy_before != result.legacy_after:
-        result.error = (result.error + "; " if result.error else "") + "legacy_mutated"
-        result.status = "failed"
     return result
 
 
@@ -2135,8 +2128,6 @@ async def classify_tool_shadow(
         and str(existing_entity_source or "").strip().lower() == "auto"
     )
 
-    if not dry_run:
-        result.legacy_before = await snapshot_legacy_category_state(d1, tool_id)
 
     if isinstance(task, dict):
         from runner import AssetTask
@@ -2156,7 +2147,7 @@ async def classify_tool_shadow(
     else:
         task_obj = task
 
-    configured_custom_ai = browser_client.category_custom_ai()
+    configured_custom_ai = browser_client.taxonomy_custom_ai()
     # Entity and taxonomy decisions are catalog-critical. Workers AI remains useful
     # elsewhere in the asset pipeline, but is intentionally excluded from every
     # Shadow taxonomy stage (including provider fallback).
@@ -2207,7 +2198,6 @@ async def classify_tool_shadow(
                 raw_output=raw_bundle,
                 error=result.error,
             )
-            result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
         result.raw = raw_bundle
         return result
 
@@ -2246,7 +2236,7 @@ async def classify_tool_shadow(
         else:
             main_content = extract_homepage_main_text(
                 html_body,
-                limit=int(getattr(browser_client, "category_main_content_max_chars", 10000)),
+                limit=int(getattr(browser_client, "taxonomy_main_content_max_chars", 10000)),
             )
             if not main_content.strip():
                 raise RuntimeError("homepage content contained no usable main content")
@@ -2320,7 +2310,6 @@ async def classify_tool_shadow(
                 raw_output=raw_bundle,
                 error=result.error,
             )
-            result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
         result.raw = raw_bundle
         return result
 
@@ -2346,7 +2335,6 @@ async def classify_tool_shadow(
                 raw_output=raw_bundle,
                 error=result.error,
             )
-            result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
         result.raw = raw_bundle
         return result
 
@@ -2370,7 +2358,6 @@ async def classify_tool_shadow(
                 raw_output=raw_bundle,
                 error=result.error,
             )
-            result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
         return result
 
     roots = catalog.primary_roots()
@@ -2398,7 +2385,6 @@ async def classify_tool_shadow(
                 raw_output=raw_bundle,
                 error=result.error,
             )
-            result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
         result.status = "failed"
         return result
 
@@ -2426,7 +2412,6 @@ async def classify_tool_shadow(
                 raw_output=raw_bundle,
                 error=result.error,
             )
-            result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
         return result
 
     pool = build_leaf_candidate_pool(l1_hits, catalog)
@@ -2483,7 +2468,6 @@ async def classify_tool_shadow(
                 raw_output=raw_bundle,
                 error=result.error,
             )
-            result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
         result.raw = raw_bundle
         return result
     if leaf_decision:
@@ -2692,13 +2676,6 @@ async def classify_tool_shadow(
 
     result.status = run_status
     result.raw = raw_bundle
-    result.legacy_after = await snapshot_legacy_category_state(d1, tool_id)
-
-    if result.legacy_before is not None and result.legacy_after is not None:
-        if result.legacy_before != result.legacy_after:
-            result.error = (result.error + "; " if result.error else "") + "legacy_mutated"
-            result.status = "failed"
-
     return result
 
 
@@ -2736,7 +2713,6 @@ async def run_shadow_taxonomy(
         "partial": 0,
         "failed": 0,
         "skipped": 0,
-        "legacy_mutated": 0,
         "provider_blocked": 0,
         "deferred": 0,
         "anomaly_scanned": 0,
@@ -2766,7 +2742,7 @@ async def run_shadow_taxonomy(
             return counts
 
         browser_client = CloudflareBrowserRunAssetClient(config)
-        custom_ai = trusted_taxonomy_custom_ai(browser_client.category_custom_ai())
+        custom_ai = trusted_taxonomy_custom_ai(browser_client.taxonomy_custom_ai())
         model_chain = [
             str(item.get("model") or "")
             for item in custom_ai
@@ -3029,8 +3005,6 @@ async def run_shadow_taxonomy(
                 if item.error and PROVIDER_BLOCKED_RE.search(item.error):
                     counts["provider_blocked"] = 1
                     provider_blocked.set()
-                if item.error and "legacy_mutated" in item.error:
-                    counts["legacy_mutated"] += 1
 
                 if reclassification_request_id > 0 and reclassification_lease_token:
                     try:

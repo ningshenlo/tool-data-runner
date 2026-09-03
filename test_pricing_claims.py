@@ -26,7 +26,7 @@ from pricing.snapshot import build_snapshot_artifact, plan_snapshot_capture
 from pricing.validate import validate_raw_claim
 
 
-MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "ainav" / "d1" / "migrations"
+MIGRATIONS_DIR = Path(__file__).resolve().parent.parent / "sigpik" / "d1" / "migrations"
 SKIPPED_DATA_MIGRATIONS = {"0026_reject_catalog_fit_mismatches.sql"}
 
 

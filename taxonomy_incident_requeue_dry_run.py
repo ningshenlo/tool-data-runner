@@ -141,78 +141,45 @@ WITH RECURSIVE category_scope(id) AS (
 ), effective AS (
   SELECT
     tool.id AS tool_id,
-    COALESCE(
-      (
-        SELECT assignment.term_id
-        FROM product_taxonomy_assignments assignment
-        JOIN taxonomy_terms term ON term.id = assignment.term_id
-        WHERE assignment.tool_id = tool.id
-          AND assignment.is_primary = 1
-          AND assignment.decision_status IN ('verified', 'auto_accepted', 'legacy')
-          AND term.dimension = 'primary_category'
-          AND term.status = 'active'
-        ORDER BY
-          CASE assignment.decision_status
-            WHEN 'verified' THEN 0 WHEN 'auto_accepted' THEN 1 WHEN 'legacy' THEN 2 ELSE 3
-          END,
-          CASE assignment.source WHEN 'manual' THEN 0 WHEN 'auto' THEN 1 ELSE 2 END,
-          assignment.id DESC
-        LIMIT 1
-      ),
-      (
-        SELECT term.id
-        FROM taxonomy_terms term
-        WHERE term.dimension = 'primary_category'
-          AND term.status = 'active'
-          AND term.source_category_id = tool.primary_category_id
-        ORDER BY term.taxonomy_version DESC, term.id DESC
-        LIMIT 1
-      )
+    (
+      SELECT assignment.term_id
+      FROM product_taxonomy_assignments assignment
+      JOIN taxonomy_terms term ON term.id = assignment.term_id
+      WHERE assignment.tool_id = tool.id
+        AND assignment.is_primary = 1
+        AND assignment.decision_status IN ('verified', 'auto_accepted')
+        AND term.dimension = 'primary_category'
+        AND term.status = 'active'
+      ORDER BY
+        CASE assignment.decision_status WHEN 'verified' THEN 0 ELSE 1 END,
+        CASE assignment.source WHEN 'manual' THEN 0 ELSE 1 END,
+        assignment.id DESC
+      LIMIT 1
     ) AS current_term_id,
-    COALESCE(
-      (
-        SELECT assignment.term_id
-        FROM product_taxonomy_assignments assignment
-        JOIN taxonomy_terms term ON term.id = assignment.term_id
-        WHERE assignment.tool_id = tool.id
-          AND assignment.is_primary = 1
-          AND assignment.decision_status IN ('verified', 'auto_accepted', 'legacy')
-          AND term.dimension = 'primary_category'
-          AND term.status = 'active'
-          AND (
-            assignment.decision_status != 'legacy'
-            OR NOT EXISTS (
-              SELECT 1
-              FROM classification_anomaly_candidates candidate
-              WHERE candidate.tool_id = tool.id
-                AND candidate.detector_code = 'anti_bot_classification_pollution_v1'
-                AND candidate.status IN ('pending', 'approved')
-            )
-          )
-        ORDER BY
-          CASE assignment.decision_status
-            WHEN 'verified' THEN 0 WHEN 'auto_accepted' THEN 1 WHEN 'legacy' THEN 2 ELSE 3
-          END,
-          CASE assignment.source WHEN 'manual' THEN 0 WHEN 'auto' THEN 1 ELSE 2 END,
-          assignment.id DESC
-        LIMIT 1
-      ),
-      (
-        SELECT term.id
-        FROM taxonomy_terms term
-        WHERE term.dimension = 'primary_category'
-          AND term.status = 'active'
-          AND term.source_category_id = tool.primary_category_id
-          AND NOT EXISTS (
+    (
+      SELECT assignment.term_id
+      FROM product_taxonomy_assignments assignment
+      JOIN taxonomy_terms term ON term.id = assignment.term_id
+      WHERE assignment.tool_id = tool.id
+        AND assignment.is_primary = 1
+        AND assignment.decision_status IN ('verified', 'auto_accepted')
+        AND term.dimension = 'primary_category'
+        AND term.status = 'active'
+        AND (
+          assignment.decision_status = 'verified'
+          OR NOT EXISTS (
             SELECT 1
             FROM classification_anomaly_candidates candidate
             WHERE candidate.tool_id = tool.id
               AND candidate.detector_code = 'anti_bot_classification_pollution_v1'
               AND candidate.status IN ('pending', 'approved')
           )
-        ORDER BY term.taxonomy_version DESC, term.id DESC
-        LIMIT 1
-      )
+        )
+      ORDER BY
+        CASE assignment.decision_status WHEN 'verified' THEN 0 ELSE 1 END,
+        CASE assignment.source WHEN 'manual' THEN 0 ELSE 1 END,
+        assignment.id DESC
+      LIMIT 1
     ) AS projected_term_id
   FROM tools tool
   WHERE tool.status = 'published'
@@ -296,7 +263,6 @@ def repair_scopes(row: dict[str, Any]) -> list[str]:
         "localization": "localization",
         "features": "features",
         "product_profile": "product_profile",
-        "legacy_classification": "legacy_classification",
         "classification_run": "classification",
         "official_source": "official_source",
     }
@@ -365,7 +331,7 @@ def build_report(
                     for scope in scopes
                 ),
                 "needs_classification_reprocess": any(
-                    scope in {"classification", "legacy_classification", "product_profile"}
+                    scope in {"classification", "product_profile"}
                     for scope in scopes
                 ) or not str(row.get("accepted_primary_status") or ""),
                 "entity_kind": str(row.get("entity_kind") or ""),

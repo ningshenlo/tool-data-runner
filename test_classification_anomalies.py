@@ -19,9 +19,8 @@ class ClassificationAnomalyScoringTests(unittest.TestCase):
                 "latest_run_status": "partial",
                 "latest_run_error": "entity_unresolved",
                 "latest_run_text": '{"error":"entity_unresolved","entity_reason":"Access Restricted"}',
-                "assignment_decision_status": "legacy",
-                "assignment_source": "legacy",
-                "category_classification_raw": None,
+                "assignment_decision_status": "auto_accepted",
+                "assignment_source": "auto",
                 "current_primary_term_id": 28,
                 "current_primary_slug": "ai-security-compliance",
                 "source_text": '{"page_metadata":{"title":"janitor - Build, share, and explore","description":"A platform for creators building immersive worlds and readers seeking living stories."}}',
@@ -32,7 +31,6 @@ class ClassificationAnomalyScoringTests(unittest.TestCase):
         self.assertEqual(candidate["severity"], "high")
         self.assertEqual(candidate["score"], 100)
         signal_codes = {item["code"] for item in candidate["evidence"]["signals"]}
-        self.assertIn("legacy_category_without_provenance", signal_codes)
         self.assertIn("new_pipeline_unresolved", signal_codes)
         self.assertIn("valid_discovery_metadata_conflicts_with_block_page", signal_codes)
         self.assertIn("security_category_may_reflect_waf_copy", signal_codes)
@@ -58,16 +56,15 @@ class ClassificationAnomalyScoringTests(unittest.TestCase):
                 "feature_text": "",
                 "profile_text": "",
                 "latest_run_text": "",
-                "assignment_decision_status": "legacy",
-                "assignment_source": "legacy",
-                "category_classification_raw": None,
+                "assignment_decision_status": "auto_accepted",
+                "assignment_source": "auto",
                 "current_primary_slug": "writing-text",
                 "source_text": '{"page_metadata":{"title":"Just a moment...","description":"Checking your browser before accessing the site"}}',
             }
         )
         self.assertIsNotNone(candidate)
         assert candidate is not None
-        self.assertEqual(candidate["score"], 75)
+        self.assertEqual(candidate["score"], 60)
         matches = candidate["evidence"]["matches"]
         self.assertEqual(matches[0]["source"], "official_source")
         self.assertEqual(matches[0]["provider"], "cloudflare")
@@ -80,15 +77,14 @@ class ClassificationAnomalyScoringTests(unittest.TestCase):
                     '{"entity_decision":{"kind":"non_product","evidence":['
                     '{"quote":"This domain is for use in documentation examples without needing permission."}]}}'
                 ),
-                "assignment_decision_status": "legacy",
-                "assignment_source": "legacy",
-                "category_classification_raw": None,
+                "assignment_decision_status": "auto_accepted",
+                "assignment_source": "auto",
                 "current_primary_slug": "coding-development",
             }
         )
         self.assertIsNotNone(candidate)
         assert candidate is not None
-        self.assertEqual(candidate["score"], 100)
+        self.assertEqual(candidate["score"], 85)
         self.assertEqual(candidate["severity"], "high")
         self.assertEqual(
             candidate["evidence"]["matches"][0]["code"],

@@ -11,7 +11,6 @@ class DockerImageContractTests(unittest.TestCase):
             "runner.py",
             "taxonomy_shadow.py",
             "taxonomy_batch.py",
-            "taxonomy_materialize.py",
             "anti_bot_signatures.py",
             "classification_anomalies.py",
         ):

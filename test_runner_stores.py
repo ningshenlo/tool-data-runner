@@ -600,19 +600,6 @@ class CategoryPromptHelperTests(unittest.TestCase):
             "AI spreadsheet assistant\nBuild formulas from plain language.",
         )
 
-    def test_deterministic_category_fallback_prefers_matching_taxonomy_leaf(self) -> None:
-        result = runner.deterministic_fallback_category(
-            "AI writing assistant for blog content generation and editing",
-            [
-                runner.CategoryCatalogEntry(slug="writing-text"),
-                runner.CategoryCatalogEntry(slug="content-generation", parent_slug="writing-text"),
-                runner.CategoryCatalogEntry(slug="coding-development"),
-            ],
-        )
-        self.assertEqual(result.category_l1, "writing-text")
-        self.assertEqual(result.category_l2, "content-generation")
-        self.assertIn("deterministic_fallback", result.category_raw_output)
-
     def test_normalize_structured_json_payload_unwraps_openai_chat_content(self) -> None:
         payload = {
             "choices": [
@@ -643,57 +630,17 @@ class CategoryPromptHelperTests(unittest.TestCase):
         payload = {"category_l1": "writing-text", "category_l2": "content-generation"}
         self.assertEqual(runner.normalize_structured_json_payload(payload), payload)
 
-    def test_build_category_prompt_includes_definitions_when_present(self) -> None:
-        entries = [
-            runner.CategoryCatalogEntry(
-                slug="code-assistant",
-                parent_slug="developer-tools",
-                definition="Helps write or review code",
-                excludes="Low-code website builders",
-                examples="Cursor",
-            ),
-            runner.CategoryCatalogEntry(slug="image-editing"),
-        ]
-        prompt = runner.build_category_classification_prompt(entries)
-        self.assertIn("code-assistant", prompt)
-        self.assertIn("def=Helps write or review code", prompt)
-        self.assertIn("excludes=Low-code website builders", prompt)
-        self.assertIn("image-editing", prompt)
-        self.assertIn("exact slugs", prompt)
-
-    def test_normalize_category_catalog_accepts_string_slugs(self) -> None:
-        entries = runner.normalize_category_catalog(["Image Editing", "code-assistant", ""])
-        self.assertEqual([entry.slug for entry in entries], ["image-editing", "code-assistant"])
-
-    def test_l1_prompt_contains_only_supplied_top_level_boundaries(self) -> None:
-        prompt = runner.build_category_l1_prompt([
-            runner.CategoryCatalogEntry(
-                slug="writing-text",
-                definition="Written text outcomes",
-                excludes="Marketing operations",
-            ),
-            runner.CategoryCatalogEntry(
-                slug="coding-development",
-                definition="Software development outcomes",
-            ),
-        ])
-
-        self.assertIn("writing-text | def=Written text outcomes", prompt)
-        self.assertIn("excludes=Marketing operations", prompt)
-        self.assertIn("coding-development", prompt)
-        self.assertNotIn("content-generation", prompt)
-
-    def test_normalize_category_model_id_expands_deepseek_short_names(self) -> None:
+    def test_normalize_taxonomy_model_id_expands_deepseek_short_names(self) -> None:
         self.assertEqual(
-            runner.normalize_category_model_id("deepseek-v4-flash"),
+            runner.normalize_taxonomy_model_id("deepseek-v4-flash"),
             "deepseek/deepseek-v4-flash",
         )
         self.assertEqual(
-            runner.normalize_category_model_id("deepseek/deepseek-v4-flash"),
+            runner.normalize_taxonomy_model_id("deepseek/deepseek-v4-flash"),
             "deepseek/deepseek-v4-flash",
         )
         self.assertEqual(
-            runner.normalize_category_model_id("workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
+            runner.normalize_taxonomy_model_id("workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"),
             "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
         )
 
@@ -719,27 +666,27 @@ class CategoryPromptHelperTests(unittest.TestCase):
         self.assertEqual(workers_format["json_schema"]["schema"], schema)
         self.assertEqual(workers_format["json_schema"]["name"], "category_l1")
 
-    def test_category_model_auth_uses_openai_key_for_luna(self) -> None:
+    def test_taxonomy_model_auth_uses_openai_key_for_luna(self) -> None:
         config = SimpleNamespace(
-            category_openai_api_key="openai-test-key",
-            category_api_token="workers-ai-token",
+            taxonomy_openai_api_key="openai-test-key",
+            taxonomy_api_token="workers-ai-token",
         )
 
         self.assertEqual(
-            runner.category_model_auth_token("openai/gpt-5.6-luna", config),
+            runner.taxonomy_model_auth_token("openai/gpt-5.6-luna", config),
             "openai-test-key",
         )
 
-    def test_category_custom_ai_excludes_workers_ai_even_when_configured(self) -> None:
+    def test_taxonomy_custom_ai_excludes_workers_ai_even_when_configured(self) -> None:
         client = SimpleNamespace(
-            category_model="deepseek/deepseek-v4-flash",
-            category_fallback_model="workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
-            category_deepseek_api_key="deepseek-test-key",
-            category_api_token="workers-ai-token",
-            category_deepseek_max_output_tokens=1024,
+            taxonomy_model="deepseek/deepseek-v4-flash",
+            taxonomy_fallback_model="workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+            taxonomy_deepseek_api_key="deepseek-test-key",
+            taxonomy_api_token="workers-ai-token",
+            taxonomy_deepseek_max_output_tokens=1024,
         )
 
-        configs = runner.CloudflareBrowserRunAssetClient.category_custom_ai(client)
+        configs = runner.CloudflareBrowserRunAssetClient.taxonomy_custom_ai(client)
 
         self.assertEqual(
             [item["model"] for item in configs],
@@ -762,209 +709,6 @@ class CategoryPromptHelperTests(unittest.TestCase):
 
 
 class AssetExtractionContractTests(unittest.IsolatedAsyncioTestCase):
-    async def test_category_classification_is_hierarchical_and_uses_deepseek_v4_flash(self) -> None:
-        class RecordingClient(runner.CloudflareBrowserRunAssetClient):
-            def __init__(self) -> None:
-                self.timeout_seconds = 30
-                self.category_api_token = "workers-ai-token"
-                self.category_deepseek_api_key = "deepseek-test-key"
-                self.category_model = runner.DEFAULT_CATEGORY_CLASSIFICATION_MODEL
-                self.category_fallback_model = runner.DEFAULT_CATEGORY_CLASSIFICATION_FALLBACK_MODEL
-                self.calls: list[dict[str, Any]] = []
-
-            async def call_quick_action(self, endpoint: str, body: dict[str, Any]) -> Any:
-                self.assert_json_endpoint(endpoint)
-                self.calls.append(body)
-                response_format = body.get("response_format") or {}
-                if response_format.get("type") == "json_object":
-                    # DeepSeek path: schema keys are described in the prompt.
-                    if "category_l2" in str(body.get("prompt") or "") and "Required keys: category_l2" in str(
-                        body.get("prompt") or ""
-                    ):
-                        return {"category_l2": "content-generation"}
-                    return {"category_l1": "writing-text"}
-                schema = response_format.get("json_schema") or {}
-                if isinstance(schema.get("schema"), dict):
-                    properties = schema["schema"].get("properties") or {}
-                else:
-                    properties = schema.get("properties") or {}
-                return (
-                    {"category_l1": "writing-text"}
-                    if "category_l1" in properties
-                    else {"category_l2": "content-generation"}
-                )
-
-            @staticmethod
-            def assert_json_endpoint(endpoint: str) -> None:
-                if endpoint != "json":
-                    raise AssertionError(endpoint)
-
-        client = RecordingClient()
-        task = runner.AssetTask(1, "example", "example.com", "https://example.com", 1, 5, 1, "lease")
-        catalog = [
-            runner.CategoryCatalogEntry(slug="writing-text", definition="Written text outcomes"),
-            runner.CategoryCatalogEntry(slug="coding-development", definition="Software development"),
-            runner.CategoryCatalogEntry(slug="content-generation", parent_slug="writing-text"),
-            runner.CategoryCatalogEntry(slug="text-editing", parent_slug="writing-text"),
-            runner.CategoryCatalogEntry(slug="code-generation-understanding", parent_slug="coding-development"),
-        ]
-
-        result = await client.fetch_homepage_categories(
-            task,
-            catalog,
-            main_content="Generate and edit written content with an AI writing assistant.",
-            source_url="https://example.com",
-        )
-
-        self.assertEqual((result.category_l1, result.category_l2), ("writing-text", "content-generation"))
-        self.assertEqual(len(client.calls), 2)
-        # Models are tried one-by-one; first successful attempt uses DeepSeek only.
-        self.assertEqual(len(client.calls[0]["custom_ai"]), 1)
-        self.assertEqual(
-            client.calls[0]["custom_ai"][0]["model"],
-            "deepseek/deepseek-v4-flash",
-        )
-        self.assertEqual(client.calls[0]["custom_ai"][0]["authorization"], "Bearer deepseek-test-key")
-        self.assertEqual(client.calls[0]["custom_ai"][0]["thinking"], {"type": "disabled"})
-        self.assertEqual(client.calls[0]["response_format"], {"type": "json_object"})
-        self.assertNotIn("url", client.calls[0])
-        self.assertIn("Cleaned homepage content", client.calls[0]["html"])
-        self.assertIn("CLEANED HOMEPAGE MAIN CONTENT", client.calls[0]["prompt"])
-        self.assertIn("Required keys: category_l1", client.calls[0]["prompt"])
-        self.assertIn("coding-development", client.calls[0]["prompt"])
-        self.assertIn("content-generation", client.calls[1]["prompt"])
-        self.assertNotIn("code-generation-understanding", client.calls[1]["prompt"])
-        raw = json.loads(result.category_raw_output)
-        self.assertEqual(raw["prompt_version"], runner.CATEGORY_CLASSIFICATION_PROMPT_VERSION)
-        self.assertEqual(
-            raw["model_chain"],
-            ["deepseek/deepseek-v4-flash"],
-        )
-
-    async def test_category_l2_outside_selected_parent_is_rejected(self) -> None:
-        class RecordingClient(runner.CloudflareBrowserRunAssetClient):
-            def __init__(self) -> None:
-                self.timeout_seconds = 30
-                self.category_api_token = "token"
-                self.category_deepseek_api_key = "deepseek-test-key"
-                self.category_model = runner.DEFAULT_CATEGORY_CLASSIFICATION_MODEL
-                self.category_fallback_model = ""
-                self.call_count = 0
-
-            async def call_quick_action(self, _endpoint: str, _body: dict[str, Any]) -> Any:
-                self.call_count += 1
-                return (
-                    {"category_l1": "writing-text"}
-                    if self.call_count == 1
-                    else {"category_l2": "code-generation-understanding"}
-                )
-
-        task = runner.AssetTask(1, "example", "example.com", "https://example.com", 1, 5, 1, "lease")
-        result = await RecordingClient().fetch_homepage_categories(
-            task,
-            [
-                runner.CategoryCatalogEntry(slug="writing-text"),
-                runner.CategoryCatalogEntry(slug="coding-development"),
-                runner.CategoryCatalogEntry(slug="content-generation", parent_slug="writing-text"),
-                runner.CategoryCatalogEntry(slug="code-generation-understanding", parent_slug="coding-development"),
-            ],
-            main_content="Write and edit long-form content.",
-            source_url="https://example.com",
-        )
-
-        self.assertEqual(result.category_l1, "writing-text")
-        self.assertEqual(result.category_l2, "")
-        self.assertEqual(result.metadata_error, "category_l2_unmatched=code-generation-understanding")
-        self.assertEqual(
-            json.loads(result.category_raw_output)["l2_error"],
-            "category_l2_unmatched=code-generation-understanding",
-        )
-
-    async def test_browser_run_json_requests_split_core_features_and_category_contracts(self) -> None:
-        class RecordingClient(runner.CloudflareBrowserRunAssetClient):
-            def __init__(self) -> None:
-                self.timeout_seconds = 30
-                self.calls: list[tuple[str, dict[str, Any]]] = []
-
-            async def call_quick_action(self, endpoint: str, body: dict[str, Any]) -> Any:
-                self.calls.append((endpoint, body))
-                schema = body["response_format"]["json_schema"]
-                properties = schema.get("schema", schema)["properties"]
-                if "description" in properties:
-                    return {
-                        "product_name": "Example",
-                        "page_title": "Example - AI workspace",
-                        "description": "Example description",
-                        "favicon_href": "",
-                        "name_confidence": 95,
-                        "name_source": "homepage_brand",
-                        "name_evidence": "Header brand",
-                        "content_safety_label": "safe",
-                        "content_safety_confidence": 96,
-                        "content_safety_evidence": "No adult content signals",
-                    }
-                if "key_features" in properties:
-                    return {"key_features": [
-                        {"name": "Feature one", "description": "Description one"},
-                    ]}
-                return {
-                    "category_l1": "image-processing",
-                    "category_l2": "image-editing",
-                }
-
-        client = RecordingClient()
-        task = runner.AssetTask(
-            tool_id=1,
-            canonical_slug="example",
-            normalized_domain="example.com",
-            official_url="https://example.com",
-            attempts=1,
-            max_attempts=5,
-            generation=1,
-            lease_token="test-lease",
-        )
-
-        core = await client.fetch_homepage_core_metadata(task)
-        features = await client.fetch_homepage_key_features(task)
-        categories = await client.fetch_homepage_categories(
-            task,
-            ["image-processing", "image-editing"],
-            main_content="Edit and transform images with AI.",
-            source_url="https://example.com",
-        )
-
-        self.assertEqual(core.description, "Example description")
-        self.assertEqual(len(features.key_features or []), 1)
-        self.assertEqual(categories.category_l2, "image-editing")
-        self.assertEqual(len(client.calls), 3)
-        schemas = [
-            body["response_format"]["json_schema"].get(
-                "schema", body["response_format"]["json_schema"]
-            )
-            for endpoint, body in client.calls
-            if endpoint == "json"
-        ]
-        self.assertEqual(
-            [set(schema["properties"]) for schema in schemas],
-            [
-                {
-                    "product_name",
-                    "page_title",
-                    "description",
-                    "favicon_href",
-                    "name_confidence",
-                    "name_source",
-                    "name_evidence",
-                    "content_safety_label",
-                    "content_safety_confidence",
-                    "content_safety_evidence",
-                },
-                {"key_features"},
-                {"category_l1", "category_l2"},
-            ],
-        )
-        self.assertEqual(schemas[1]["properties"]["key_features"]["minItems"], 1)
-        self.assertEqual(schemas[1]["properties"]["key_features"]["maxItems"], 6)
 
     async def test_browser_run_json_generation_400_remains_retryable(self) -> None:
         class FakeResponse:
@@ -1531,15 +1275,34 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.connection.commit()
         return int(cursor.lastrowid)
 
-    def seed_complete_enrichment(self, tool_id: int, suffix: str) -> None:
-        category = self.connection.execute(
-            "SELECT id FROM categories WHERE status = 'active' ORDER BY id LIMIT 1"
+    def seed_primary_taxonomy(self, tool_id: int) -> int:
+        term = self.connection.execute(
+            """
+            SELECT term.id
+            FROM taxonomy_terms term
+            WHERE term.dimension = 'primary_category'
+              AND term.status = 'active'
+              AND NOT EXISTS (
+                SELECT 1 FROM taxonomy_terms child
+                WHERE child.parent_id = term.id AND child.status = 'active'
+              )
+            ORDER BY term.id
+            LIMIT 1
+            """
         ).fetchone()
-        self.assertIsNotNone(category)
+        self.assertIsNotNone(term)
         self.connection.execute(
-            "UPDATE tools SET primary_category_id = ? WHERE id = ?",
-            [category["id"], tool_id],
+            """
+            INSERT INTO product_taxonomy_assignments (
+              tool_id, term_id, is_primary, confidence, decision_status, source
+            ) VALUES (?, ?, 1, 1, 'verified', 'manual')
+            """,
+            [tool_id, term["id"]],
         )
+        return int(term["id"])
+
+    def seed_complete_enrichment(self, tool_id: int, suffix: str) -> None:
+        self.seed_primary_taxonomy(tool_id)
         self.connection.execute(
             """
             INSERT INTO tool_localizations (
@@ -1775,17 +1538,6 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             """,
             [tool_id, runner.utc_now_iso()],
         )
-        category = self.connection.execute(
-            """
-            SELECT child.canonical_slug AS child_slug, parent.canonical_slug AS parent_slug
-            FROM categories child
-            JOIN categories parent ON parent.id = child.parent_category_id
-            WHERE child.status = 'active' AND parent.status = 'active'
-            ORDER BY child.id
-            LIMIT 1
-            """
-        ).fetchone()
-        self.assertIsNotNone(category)
         self.connection.commit()
 
         store = runner.D1AssetStore(self.d1)
@@ -1795,7 +1547,6 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         class StageRecordingClient:
             def __init__(self) -> None:
                 self.feature_calls = 0
-                self.category_calls = 0
 
             async def fetch_homepage_core_metadata(self, _: runner.AssetTask) -> runner.AssetFetchResult:
                 raise AssertionError("core metadata must not be fetched")
@@ -1808,20 +1559,6 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 return runner.AssetFetchResult(
                     final_url=current_task.official_url,
                     key_features=[{"name": "Feature one", "description": "Does one thing"}],
-                )
-
-            async def fetch_homepage_categories(
-                self,
-                current_task: runner.AssetTask,
-                _: list[str],
-            ) -> runner.AssetFetchResult:
-                self.category_calls += 1
-                if self.category_calls == 1:
-                    raise runner.AssetPipelineError("temporary category failure", retryable=True)
-                return runner.AssetFetchResult(
-                    final_url=current_task.official_url,
-                    category_l1=category["parent_slug"],
-                    category_l2=category["child_slug"],
                 )
 
         class RecordingUploader:
@@ -1845,7 +1582,6 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(status, "done")
         self.assertEqual(browser_client.feature_calls, 1)
-        self.assertEqual(browser_client.category_calls, 0)
         self.assertEqual(uploader.calls, [])
         self.assertEqual(await store.missing_asset_requirements(tool_id), [])
         row = self.task_row("asset_tasks", "tool_id = ? AND source = ?", [tool_id, runner.ASSET_SOURCE])
@@ -1854,17 +1590,7 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_asset_fallbacks_advance_a_qualified_tool_to_pending_review(self) -> None:
         tool_id = self.add_tool("auto-publish-ready")
         now = runner.utc_now_iso()
-        category_id = self.connection.execute(
-            "SELECT id FROM categories WHERE status = 'active' ORDER BY id LIMIT 1"
-        ).fetchone()["id"]
-        self.connection.execute(
-            "INSERT INTO tool_categories (tool_id, category_id, source) VALUES (?, ?, 'auto')",
-            [tool_id, category_id],
-        )
-        self.connection.execute(
-            "UPDATE tools SET primary_category_id = ? WHERE id = ?",
-            [category_id, tool_id],
-        )
+        self.seed_primary_taxonomy(tool_id)
         self.connection.execute(
             """
             INSERT INTO tool_sources (
@@ -1902,16 +1628,6 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
                     final_url=current_task.official_url,
                     key_features=[],
                     metadata_error="features_empty",
-                )
-
-            async def fetch_homepage_categories(
-                self,
-                current_task: runner.AssetTask,
-                _: list[str],
-            ) -> runner.AssetFetchResult:
-                return runner.AssetFetchResult(
-                    final_url=current_task.official_url,
-                    metadata_error="category_empty",
                 )
 
             async def capture_homepage_screenshot(self, current_task: runner.AssetTask) -> runner.AssetFetchResult:
@@ -2020,313 +1736,6 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(row["next_retry_at"])
         self.assertIsNone(row["dead_letter_at"])
         uploader.put_object.assert_not_awaited()
-
-    async def test_asset_category_materialization_writes_parent_and_child(self) -> None:
-        tool_id = self.add_tool("asset-category-materialization")
-        category = self.connection.execute(
-            """
-            SELECT child.id AS child_id, child.canonical_slug AS child_slug,
-                   parent.id AS parent_id, parent.canonical_slug AS parent_slug
-            FROM categories child
-            JOIN categories parent ON parent.id = child.parent_category_id
-            WHERE child.status = 'active' AND parent.status = 'active'
-            ORDER BY child.id
-            LIMIT 1
-            """
-        ).fetchone()
-        self.assertIsNotNone(category)
-        task = runner.AssetTask(
-            tool_id=tool_id,
-            canonical_slug="asset-category-materialization",
-            normalized_domain="asset-category-materialization.example",
-            official_url="https://asset-category-materialization.example",
-            attempts=1,
-            max_attempts=5,
-            generation=1,
-            lease_token="test-lease",
-        )
-        result = runner.AssetFetchResult(
-            final_url=task.official_url,
-            screenshot=b"",
-            category_l1=category["parent_slug"],
-            category_l2=category["child_slug"],
-        )
-
-        await runner.D1AssetStore(self.d1).save_tool_categories(task, result)
-
-        assigned_ids = {
-            row["category_id"]
-            for row in self.connection.execute(
-                "SELECT category_id FROM tool_categories WHERE tool_id = ?",
-                [tool_id],
-            ).fetchall()
-        }
-        self.assertEqual(assigned_ids, {category["parent_id"], category["child_id"]})
-        tool = self.connection.execute(
-            "SELECT primary_category_id FROM tools WHERE id = ?",
-            [tool_id],
-        ).fetchone()
-        self.assertEqual(tool["primary_category_id"], category["parent_id"])
-
-    def _seed_legacy_categories(self, tool_id: int, parent_id: int, child_id: int | None = None) -> None:
-        self.connection.execute(
-            "UPDATE tools SET primary_category_id = ? WHERE id = ?",
-            [parent_id, tool_id],
-        )
-        self.connection.execute(
-            "INSERT INTO tool_categories (tool_id, category_id, source) VALUES (?, ?, 'auto')",
-            [tool_id, parent_id],
-        )
-        if child_id is not None:
-            self.connection.execute(
-                "INSERT INTO tool_categories (tool_id, category_id, source) VALUES (?, ?, 'auto')",
-                [tool_id, child_id],
-            )
-        self.connection.commit()
-
-    def _active_parent_child(self) -> sqlite3.Row:
-        category = self.connection.execute(
-            """
-            SELECT child.id AS child_id, child.canonical_slug AS child_slug,
-                   parent.id AS parent_id, parent.canonical_slug AS parent_slug
-            FROM categories child
-            JOIN categories parent ON parent.id = child.parent_category_id
-            WHERE child.status = 'active' AND parent.status = 'active'
-            ORDER BY child.id
-            LIMIT 1
-            """
-        ).fetchone()
-        self.assertIsNotNone(category)
-        return category
-
-    def _second_parent_child(self, exclude_parent_id: int) -> sqlite3.Row:
-        category = self.connection.execute(
-            """
-            SELECT child.id AS child_id, child.canonical_slug AS child_slug,
-                   parent.id AS parent_id, parent.canonical_slug AS parent_slug
-            FROM categories child
-            JOIN categories parent ON parent.id = child.parent_category_id
-            WHERE child.status = 'active'
-              AND parent.status = 'active'
-              AND parent.id <> ?
-            ORDER BY child.id
-            LIMIT 1
-            """,
-            [exclude_parent_id],
-        ).fetchone()
-        self.assertIsNotNone(category)
-        return category
-
-    async def test_published_legacy_category_candidate_filters(self) -> None:
-        category = self._active_parent_child()
-        published_id = self.add_tool("pub-legacy", status="published")
-        rejected_id = self.add_tool("rej-legacy", status="rejected")
-        manual_id = self.add_tool("pub-manual", status="published")
-        done_id = self.add_tool("pub-done", status="published")
-        pending_id = self.add_tool("pend-legacy", status="pending_enrich")
-
-        self._seed_legacy_categories(published_id, category["parent_id"], category["child_id"])
-        self._seed_legacy_categories(rejected_id, category["parent_id"], category["child_id"])
-        self._seed_legacy_categories(manual_id, category["parent_id"], category["child_id"])
-        self.connection.execute(
-            "UPDATE tool_categories SET source = 'manual' WHERE tool_id = ?",
-            [manual_id],
-        )
-        self._seed_legacy_categories(done_id, category["parent_id"], category["child_id"])
-        raw_done = json.dumps(
-            {
-                "backfill": runner.PUBLISHED_CATEGORY_BACKFILL_VERSION,
-                "prompt_version": runner.CATEGORY_CLASSIFICATION_PROMPT_VERSION,
-                "mode": "hierarchical",
-            }
-        )
-        self.connection.execute(
-            """
-            UPDATE tools
-            SET category_classification_status = 'auto_ok',
-                category_classification_raw = ?
-            WHERE id = ?
-            """,
-            [raw_done, done_id],
-        )
-        self._seed_legacy_categories(pending_id, category["parent_id"], category["child_id"])
-        self.connection.commit()
-
-        store = runner.D1AssetStore(self.d1)
-        tasks = await store.published_legacy_category_tasks(50)
-        tool_ids = {task.tool_id for task in tasks}
-        self.assertIn(published_id, tool_ids)
-        self.assertNotIn(rejected_id, tool_ids)
-        self.assertNotIn(manual_id, tool_ids)
-        self.assertNotIn(done_id, tool_ids)
-        self.assertNotIn(pending_id, tool_ids)
-
-    async def test_published_category_backfill_replaces_atomically_and_is_resumable(self) -> None:
-        old = self._active_parent_child()
-        new = self._second_parent_child(old["parent_id"])
-        tool_id = self.add_tool("pub-backfill-apply", status="published")
-        self._seed_legacy_categories(tool_id, old["parent_id"], old["child_id"])
-
-        task = runner.AssetTask(
-            tool_id=tool_id,
-            canonical_slug="pub-backfill-apply",
-            normalized_domain="pub-backfill-apply.example",
-            official_url="https://pub-backfill-apply.example",
-            attempts=0,
-            max_attempts=1,
-            generation=0,
-            lease_token="published-category-backfill",
-        )
-        result = runner.AssetFetchResult(
-            final_url=task.official_url,
-            category_l1=new["parent_slug"],
-            category_l2=new["child_slug"],
-            category_raw_output=json.dumps(
-                {
-                    "prompt_version": runner.CATEGORY_CLASSIFICATION_PROMPT_VERSION,
-                    "mode": "hierarchical",
-                    "taxonomy_version": "test-tax",
-                    "model_chain": [runner.DEFAULT_CATEGORY_CLASSIFICATION_MODEL],
-                }
-            ),
-        )
-
-        store = runner.D1AssetStore(self.d1)
-        dry = await store.apply_published_category_backfill(task, result, dry_run=True)
-        self.assertFalse(dry["applied"])
-        still_old = self.connection.execute(
-            "SELECT primary_category_id FROM tools WHERE id = ?",
-            [tool_id],
-        ).fetchone()
-        self.assertEqual(still_old["primary_category_id"], old["parent_id"])
-
-        summary = await store.apply_published_category_backfill(task, result, dry_run=False)
-        self.assertTrue(summary["applied"])
-
-        tool = self.connection.execute(
-            """
-            SELECT primary_category_id, category_classification_status, category_classification_raw
-            FROM tools WHERE id = ?
-            """,
-            [tool_id],
-        ).fetchone()
-        self.assertEqual(tool["primary_category_id"], new["parent_id"])
-        self.assertEqual(tool["category_classification_status"], "auto_ok")
-        self.assertTrue(runner.raw_has_published_category_backfill(tool["category_classification_raw"]))
-
-        assigned = {
-            row["category_id"]
-            for row in self.connection.execute(
-                "SELECT category_id FROM tool_categories WHERE tool_id = ?",
-                [tool_id],
-            ).fetchall()
-        }
-        self.assertEqual(assigned, {new["parent_id"], new["child_id"]})
-
-        change = self.connection.execute(
-            "SELECT change_type, old_value, new_value FROM tool_change_log WHERE tool_id = ?",
-            [tool_id],
-        ).fetchone()
-        self.assertEqual(change["change_type"], "category_backfill")
-        self.assertIn(str(old["parent_id"]), change["old_value"])
-        self.assertIn(new["parent_slug"], change["new_value"])
-
-        event = self.connection.execute(
-            "SELECT outcome, category_l1_slug, category_l2_slug FROM tool_category_classification_events WHERE tool_id = ?",
-            [tool_id],
-        ).fetchone()
-        self.assertEqual(event["outcome"], "auto_ok")
-        self.assertEqual(event["category_l1_slug"], new["parent_slug"])
-        self.assertEqual(event["category_l2_slug"], new["child_slug"])
-
-        remaining = await store.published_legacy_category_tasks(50)
-        self.assertNotIn(tool_id, {item.tool_id for item in remaining})
-
-    async def test_published_category_backfill_failure_keeps_live_categories(self) -> None:
-        category = self._active_parent_child()
-        tool_id = self.add_tool("pub-backfill-fail", status="published")
-        self._seed_legacy_categories(tool_id, category["parent_id"], category["child_id"])
-        task = runner.AssetTask(
-            tool_id=tool_id,
-            canonical_slug="pub-backfill-fail",
-            normalized_domain="pub-backfill-fail.example",
-            official_url="https://pub-backfill-fail.example",
-            attempts=0,
-            max_attempts=1,
-            generation=0,
-            lease_token="published-category-backfill",
-        )
-        store = runner.D1AssetStore(self.d1)
-        await store.record_published_category_backfill_failure(
-            task,
-            error="category_l1_empty",
-            raw_output=json.dumps({"error": "category_l1_empty"}),
-        )
-
-        tool = self.connection.execute(
-            "SELECT primary_category_id, category_classification_last_error FROM tools WHERE id = ?",
-            [tool_id],
-        ).fetchone()
-        self.assertEqual(tool["primary_category_id"], category["parent_id"])
-        self.assertEqual(tool["category_classification_last_error"], "category_l1_empty")
-        assigned = {
-            row["category_id"]
-            for row in self.connection.execute(
-                "SELECT category_id FROM tool_categories WHERE tool_id = ?",
-                [tool_id],
-            ).fetchall()
-        }
-        self.assertEqual(assigned, {category["parent_id"], category["child_id"]})
-        outcomes = [
-            row["outcome"]
-            for row in self.connection.execute(
-                "SELECT outcome FROM tool_category_classification_events WHERE tool_id = ?",
-                [tool_id],
-            ).fetchall()
-        ]
-        self.assertEqual(outcomes, ["auto_failed"])
-
-    def test_published_category_backfill_success_helper(self) -> None:
-        ok = runner.AssetFetchResult(final_url="https://x", category_l1="writing-text", category_l2="")
-        self.assertTrue(runner.published_category_backfill_success(ok))
-        bad_l1 = runner.AssetFetchResult(final_url="https://x", category_l1="", metadata_error="category_l1_empty")
-        self.assertFalse(runner.published_category_backfill_success(bad_l1))
-        bad_l2 = runner.AssetFetchResult(
-            final_url="https://x",
-            category_l1="writing-text",
-            metadata_error="category_l2_unmatched=not-a-child",
-        )
-        self.assertFalse(runner.published_category_backfill_success(bad_l2))
-
-    async def test_category_failures_remain_eligible_for_automatic_recovery(self) -> None:
-        tool_id = self.add_tool("asset-category-auto-recovery")
-        store = runner.D1AssetStore(self.d1)
-
-        for attempt in range(runner.CATEGORY_CLASSIFICATION_MAX_ATTEMPTS):
-            state = await store.record_category_classification_failure(
-                tool_id,
-                f"classification failed {attempt + 1}",
-                raw_output=json.dumps({"attempt": attempt + 1}),
-            )
-
-        self.assertEqual(state["status"], "auto_failed")
-        self.assertEqual(state["attempts"], runner.CATEGORY_CLASSIFICATION_MAX_ATTEMPTS)
-        self.assertFalse(await store.category_is_waived(tool_id))
-
-        readiness = await runner.D1EnrichmentStore(self.d1).evaluate_tool(tool_id)
-        self.assertEqual(readiness, "blocked")
-        enrichment = self.task_row("tool_enrichment_states", "tool_id = ?", [tool_id])
-        self.assertIn("category", json.loads(enrichment["blocking_json"]))
-        self.assertNotIn("category_needs_manual", json.loads(enrichment["warnings_json"]))
-
-        outcomes = [
-            row["outcome"]
-            for row in self.connection.execute(
-                "select outcome from tool_category_classification_events where tool_id = ? order by id",
-                [tool_id],
-            ).fetchall()
-        ]
-        self.assertEqual(outcomes, ["auto_failed", "auto_failed", "auto_failed"])
 
     async def test_asset_localization_uses_clean_public_slug_and_numbers_real_collisions(self) -> None:
         existing_tool_id = self.add_tool("existing-hocoos")
@@ -2512,17 +1921,13 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         tool_id = self.add_tool("asset-auto-revive")
         store = runner.D1AssetStore(self.d1)
         self.connection.execute(
-            "UPDATE tools SET category_classification_status = 'needs_manual', category_classification_attempts = 3 WHERE id = ?",
-            [tool_id],
-        )
-        self.connection.execute(
             """
             INSERT INTO asset_tasks (
               tool_id, normalized_domain, source, status, attempts, max_attempts,
               generation, last_error, dead_letter_at
             )
             VALUES (?, 'asset-auto-revive.example', ?, 'failed', 5, 5, 1,
-                    'asset_enrichment_incomplete: missing=key_features,category',
+                    'asset_enrichment_incomplete: missing=key_features',
                     '2000-01-01T00:00:00Z')
             """,
             [tool_id, runner.ASSET_SOURCE],
@@ -2535,12 +1940,6 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task["attempts"], 0)
         self.assertEqual(task["generation"], 2)
         self.assertIsNone(task["dead_letter_at"])
-        tool = self.connection.execute(
-            "SELECT category_classification_status, category_classification_attempts FROM tools WHERE id = ?",
-            [tool_id],
-        ).fetchone()
-        self.assertEqual(tool["category_classification_status"], "needs_manual")
-        self.assertEqual(tool["category_classification_attempts"], 3)
 
     async def test_content_safety_dead_letter_is_not_automatically_revived(self) -> None:
         tool_id = self.add_tool("asset-unsafe")
@@ -3449,9 +2848,13 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(unknown_ai_estimate["estimated_ai_visits"])
 
     async def test_market_facet_rollups_preserve_known_zero_unknown_and_grains(self) -> None:
-        category_id = int(
+        term_id = int(
             self.connection.execute(
-                "INSERT INTO categories (canonical_slug) VALUES ('market-rollup-category')"
+                """
+                INSERT INTO taxonomy_terms (
+                  dimension, slug, name, status, taxonomy_version
+                ) VALUES ('primary_category', 'market-rollup-term', 'Market rollup term', 'active', 2)
+                """
             ).lastrowid
         )
         tool_ids = [
@@ -3459,9 +2862,17 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             for index in range(2)
         ]
         self.connection.execute(
-            "UPDATE tools SET primary_category_id = ?, verification_status = 'verified', "
+            "UPDATE tools SET verification_status = 'verified', "
             "staleness_status = 'fresh' WHERE id IN (?, ?)",
-            [category_id, *tool_ids],
+            tool_ids,
+        )
+        self.connection.executemany(
+            """
+            INSERT INTO product_taxonomy_assignments (
+              tool_id, term_id, is_primary, confidence, decision_status, source
+            ) VALUES (?, ?, 1, 1, 'verified', 'manual')
+            """,
+            [(tool_id, term_id) for tool_id in tool_ids],
         )
         eligibility_revision = await runner.ensure_market_catalog_eligibility_revision(self.d1)
         snapshot_id = int(
@@ -3483,10 +2894,10 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.connection.execute(
                 """
                 INSERT INTO tool_market_snapshots (
-                  snapshot_id, tool_id, normalized_domain, primary_category_id, visits
+                  snapshot_id, tool_id, normalized_domain, primary_term_id, visits
                 ) VALUES (?, ?, ?, ?, 1000)
                 """,
-                [snapshot_id, tool_id, domain, category_id],
+                [snapshot_id, tool_id, domain, term_id],
             )
         country_rows = [
             (tool_ids[0], "market-rollup-0.example", "US", 1, 0, 0),
@@ -3518,32 +2929,32 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
         rows = self.connection.execute(
             """
-            SELECT primary_category_id, country_code, tool_count,
+            SELECT primary_term_id, country_code, tool_count,
                    country_estimated_visits, country_estimated_ai_visits,
                    country_estimated_visits_unknown_count,
                    country_estimated_ai_visits_unknown_count
-            FROM market_snapshot_facet_rollups
+            FROM taxonomy_market_snapshot_facet_rollups
             WHERE snapshot_id = ?
-            ORDER BY primary_category_id, country_code
+            ORDER BY primary_term_id, country_code
             """,
             [snapshot_id],
         ).fetchall()
         indexed = {
-            (row["primary_category_id"], row["country_code"]): tuple(row)[2:]
+            (row["primary_term_id"], row["country_code"]): tuple(row)[2:]
             for row in rows
         }
-        self.assertEqual(indexed[(0, "")], (2, None, None, 0, 0))
-        self.assertEqual(indexed[(category_id, "")], (2, None, None, 0, 0))
-        self.assertEqual(indexed[(0, "US")], (2, 0, 0, 1, 1))
-        self.assertEqual(indexed[(category_id, "US")], (2, 0, 0, 1, 1))
-        self.assertEqual(indexed[(0, "CA")], (1, 0, 0, 0, 0))
-        self.assertEqual(indexed[(0, "GB")], (1, None, None, 1, 1))
-        self.assertNotIn((0, "JP"), indexed)
+        self.assertEqual(indexed[(None, "")], (2, None, None, 0, 0))
+        self.assertEqual(indexed[(term_id, "")], (2, None, None, 0, 0))
+        self.assertEqual(indexed[(None, "US")], (2, 0, 0, 1, 1))
+        self.assertEqual(indexed[(term_id, "US")], (2, 0, 0, 1, 1))
+        self.assertEqual(indexed[(None, "CA")], (1, 0, 0, 0, 0))
+        self.assertEqual(indexed[(None, "GB")], (1, None, None, 1, 1))
+        self.assertNotIn((None, "JP"), indexed)
 
         with self.assertRaises(sqlite3.IntegrityError):
             self.connection.execute(
                 """
-                INSERT INTO market_snapshot_facet_rollups (
+                INSERT INTO taxonomy_market_snapshot_facet_rollups (
                   snapshot_id, country_code, tool_count,
                   country_estimated_visits_unknown_count,
                   country_estimated_ai_visits_unknown_count
@@ -3555,7 +2966,7 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(sqlite3.IntegrityError):
             self.connection.execute(
                 """
-                INSERT INTO market_snapshot_facet_rollups (
+                INSERT INTO taxonomy_market_snapshot_facet_rollups (
                   snapshot_id, country_code, tool_count,
                   country_estimated_visits, country_estimated_ai_visits
                 ) VALUES (?, 'JP', 1, 10, 11)
@@ -4618,6 +4029,104 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertTrue(source["last_success_at"])
 
+    async def test_pricing_manual_review_capture_keeps_collection_cadence(self) -> None:
+        tool_id = self.add_tool("pricing-review-cadence")
+        store = runner.D1PricingStore(self.d1)
+        source_url = "https://pricing-review-cadence.example/pricing"
+        await store.insert_pricing_source(tool_id, source_url, "manual", 100)
+        self.assertEqual(await store.queue_due_tasks(10), 1)
+        task = (await store.claim_due_tasks(10, lease_owner="pricing-review-cadence-worker"))[0]
+        result = runner.PricingFetchResult(
+            url=source_url,
+            final_url=source_url,
+            status=200,
+            content_type="text/html",
+            html="<section><h1>Pricing</h1><p>Pro USD 29 per month</p></section>",
+        )
+
+        self.assertTrue(await store.finish_task(task, "manual_review", "review required", result))
+        source = self.connection.execute(
+            "SELECT last_capture_at, last_capture_hash, last_success_at, next_run_at "
+            "FROM pricing_sources WHERE id = ?",
+            [task.pricing_source_id],
+        ).fetchone()
+        self.assertTrue(source["last_capture_at"])
+        self.assertTrue(source["last_capture_hash"])
+        self.assertIsNone(source["last_success_at"])
+        self.assertTrue(source["next_run_at"])
+
+        self.connection.execute(
+            "UPDATE pricing_sources SET next_run_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+            [task.pricing_source_id],
+        )
+        self.connection.commit()
+        self.assertEqual(await store.queue_due_tasks(10), 1)
+        task_count = self.connection.execute(
+            "SELECT count(*) AS total FROM pricing_tasks WHERE pricing_source_id = ?",
+            [task.pricing_source_id],
+        ).fetchone()["total"]
+        self.assertEqual(task_count, 2)
+
+    async def test_pricing_allowance_change_creates_new_catalog_version(self) -> None:
+        tool_id = self.add_tool("pricing-allowance-change")
+        store = runner.D1PricingStore(self.d1)
+        source_url = "https://pricing-allowance-change.example/pricing"
+        await store.insert_pricing_source(tool_id, source_url, "manual", 100)
+        self.assertEqual(await store.queue_due_tasks(10), 1)
+        task = (await store.claim_due_tasks(10, lease_owner="pricing-allowance-version"))[0]
+        result = runner.PricingFetchResult(
+            url=source_url,
+            final_url=source_url,
+            status=200,
+            content_type="text/html",
+            html="<section>Pro USD 29 per month includes credits</section>",
+        )
+
+        def plans(credits: str) -> list[dict[str, Any]]:
+            return [
+                {
+                    "source_plan_key": "pro",
+                    "name": "Pro",
+                    "prices": [
+                        {
+                            "kind": "recurring",
+                            "amount": "29",
+                            "currency": "USD",
+                            "billing_interval": "monthly",
+                            "display_text": "Pro USD 29 per month",
+                        }
+                    ],
+                    "features": [f"Includes {credits} credits per month"],
+                }
+            ]
+
+        first_version_id = await store.save_catalog(task, result, plans("10,000"))
+        second_version_id = await store.save_catalog(task, result, plans("20,000"))
+
+        self.assertNotEqual(first_version_id, second_version_id)
+        versions = self.connection.execute(
+            "SELECT id, status FROM pricing_catalog_versions "
+            "WHERE pricing_source_id = ? ORDER BY id",
+            [task.pricing_source_id],
+        ).fetchall()
+        self.assertEqual(
+            [(row["id"], row["status"]) for row in versions],
+            [(first_version_id, "superseded"), (second_version_id, "active")],
+        )
+        allowance = self.connection.execute(
+            """
+            SELECT feature.value_number, feature.unit, feature.period
+            FROM plan_features feature
+            JOIN pricing_plans plan ON plan.id = feature.pricing_plan_id
+            WHERE plan.pricing_version_id = ?
+            """,
+            [second_version_id],
+        ).fetchone()
+        self.assertEqual(
+            (allowance["value_number"], allowance["unit"], allowance["period"]),
+            ("20000", "credit", "month"),
+        )
+
     async def test_pricing_shadow_replays_manual_review_once_after_normal_work(self) -> None:
         replay_tool_id = self.add_tool("pricing-shadow-replay")
         normal_tool_id = self.add_tool("pricing-normal-priority")
@@ -5225,6 +4734,7 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
                             "display_text": "$0",
                         }
                     ],
+                    "features": ["Includes 100 credits per month"],
                 }
             ]
         }
@@ -5273,6 +4783,26 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             [version_id],
         ).fetchone()
         self.assertEqual(catalog["status"], "active")
+        allowance = self.connection.execute(
+            """
+            SELECT feature_group, normalized_key, state, value_type,
+                   value_number, unit, period, evidence_quote
+            FROM plan_features
+            WHERE pricing_plan_id IN (
+              SELECT id FROM pricing_plans WHERE pricing_version_id = ?
+            )
+            """,
+            [version_id],
+        ).fetchone()
+        self.assertIsNotNone(allowance)
+        self.assertEqual(allowance["feature_group"], "allowance")
+        self.assertEqual(allowance["normalized_key"], "allowance.credit")
+        self.assertEqual(allowance["state"], "limited")
+        self.assertEqual(allowance["value_type"], "number")
+        self.assertEqual(allowance["value_number"], "100")
+        self.assertEqual(allowance["unit"], "credit")
+        self.assertEqual(allowance["period"], "month")
+        self.assertEqual(allowance["evidence_quote"], "Includes 100 credits per month")
         pricing_task = self.connection.execute(
             "SELECT status FROM pricing_tasks WHERE id = ?",
             [task.task_id],
@@ -5280,12 +4810,71 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pricing_task["status"], "succeeded")
         self.assertEqual(await store.claim_reviewed_extractions(10), [])
 
+    async def test_stale_pricing_review_cannot_overwrite_newer_snapshot(self) -> None:
+        tool_id = self.add_tool("pricing-stale-review")
+        store = runner.D1PricingStore(self.d1)
+        source_url = "https://pricing-stale-review.example/pricing"
+        await store.insert_pricing_source(tool_id, source_url, "manual", 100)
+        self.assertEqual(await store.queue_due_tasks(10), 1)
+        first_task = (await store.claim_due_tasks(10, lease_owner="pricing-stale-review-one"))[0]
+        first_result = runner.PricingFetchResult(
+            url=source_url,
+            final_url=source_url,
+            status=200,
+            content_type="text/html",
+            html="<section><h1>Pricing</h1><p>Pro USD 29 per month</p></section>",
+        )
+        first_snapshot_id = await store.insert_snapshot(first_task, first_result)
+        first_extraction_id = await store.insert_extraction(
+            first_snapshot_id,
+            {"plans": [{"name": "Pro", "prices": [{"amount": "29", "currency": "USD"}]}]},
+            review_status="manual_review",
+            confidence=70,
+            validation_errors=["human approval required"],
+        )
+        self.assertTrue(
+            await store.finish_task(first_task, "manual_review", "human approval required", first_result)
+        )
+
+        self.connection.execute("INSERT INTO app_users (id) VALUES ('stale-pricing-reviewer')")
+        self.connection.execute(
+            "INSERT INTO pricing_extraction_reviews "
+            "(extraction_id, decision, reviewer_user_id, notes) "
+            "VALUES (?, 'approved', 'stale-pricing-reviewer', 'late approval')",
+            [first_extraction_id],
+        )
+        self.connection.execute(
+            "UPDATE pricing_extractions SET review_status = 'approved' WHERE id = ?",
+            [first_extraction_id],
+        )
+        self.connection.execute(
+            "UPDATE pricing_sources SET next_run_at = '2000-01-01T00:00:00Z' WHERE id = ?",
+            [first_task.pricing_source_id],
+        )
+        self.connection.commit()
+
+        self.assertEqual(await store.queue_due_tasks(10), 1)
+        second_task = (await store.claim_due_tasks(10, lease_owner="pricing-stale-review-two"))[0]
+        second_result = runner.PricingFetchResult(
+            url=source_url,
+            final_url=source_url,
+            status=200,
+            content_type="text/html",
+            html="<section><h1>Pricing</h1><p>Pro USD 39 per month</p></section>",
+        )
+        await store.insert_snapshot(second_task, second_result)
+
+        self.assertEqual(await store.claim_reviewed_extractions(10), [])
+        materialization_count = self.connection.execute(
+            "SELECT count(*) AS total FROM pricing_extraction_materializations "
+            "WHERE extraction_id = ?",
+            [first_extraction_id],
+        ).fetchone()["total"]
+        self.assertEqual(materialization_count, 0)
+
     async def test_enrichment_promotes_pending_enrich_to_pending_review(self) -> None:
         tool_id = self.add_tool("enrichment-flow")
-        category_id = self.connection.execute(
-            "SELECT id FROM categories WHERE status = 'active' ORDER BY id LIMIT 1"
-        ).fetchone()["id"]
-        self.connection.execute("UPDATE tools SET primary_category_id = ? WHERE id = ?", [category_id, tool_id])
+        self.seed_primary_taxonomy(tool_id)
         self.connection.execute(
             """
             INSERT INTO tool_assets (tool_id, asset_kind, storage_bucket, storage_object_path, is_current)
@@ -5407,7 +4996,7 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             0,
         )
 
-    async def test_enrichment_reconciliation_promotes_after_manual_category_fix(self) -> None:
+    async def test_enrichment_reconciliation_promotes_after_taxonomy_assignment(self) -> None:
         tool_id = self.add_tool("enrichment-reconcile")
         self.connection.execute(
             """
@@ -5435,10 +5024,7 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         enrichment = runner.D1EnrichmentStore(self.d1)
         self.assertEqual(await enrichment.evaluate_tool(tool_id), "blocked")
 
-        category_id = self.connection.execute(
-            "SELECT id FROM categories WHERE status = 'active' ORDER BY id LIMIT 1"
-        ).fetchone()["id"]
-        self.connection.execute("UPDATE tools SET primary_category_id = ? WHERE id = ?", [category_id, tool_id])
+        self.seed_primary_taxonomy(tool_id)
         self.connection.commit()
         counts = await enrichment.reconcile_pending_tools(10)
 

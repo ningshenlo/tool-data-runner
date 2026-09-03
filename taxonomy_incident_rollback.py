@@ -191,7 +191,6 @@ SELECT
   t.duplicate_of_tool_id,
   t.entity_kind,
   t.entity_kind_source,
-  t.primary_category_id,
   p.profile_json,
   p.profile_version,
   p.extracted_at AS profile_extracted_at,
