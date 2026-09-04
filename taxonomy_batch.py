@@ -65,6 +65,15 @@ STAGES = {
 }
 D1_REQUEST_RESERVATION_CHUNK_SIZE = 50
 D1_SUBMISSION_PERSIST_ATTEMPTS = 3
+TERMINAL_TAXONOMY_BATCH_STATUSES = {"skipped", "partial", "needs_review"}
+CATALOG_INELIGIBLE_ENTITY_KINDS = {
+    "product_module",
+    "feature_landing",
+    "company_site",
+    "regional_mirror",
+    "duplicate_alias",
+    "non_product",
+}
 
 
 def _json(value: Any) -> str:
@@ -92,6 +101,176 @@ def _safe_error(value: Any, limit: int = 1000) -> str:
         except (TypeError, ValueError):
             text = str(value)
     return text.strip()[:limit]
+
+
+def terminal_taxonomy_tool_status(batch_status: str, entity_kind: str) -> str | None:
+    """Map a terminal taxonomy result out of the active enrichment queue."""
+    if batch_status not in TERMINAL_TAXONOMY_BATCH_STATUSES:
+        return None
+    if batch_status == "skipped" and entity_kind in CATALOG_INELIGIBLE_ENTITY_KINDS:
+        return "rejected"
+    return "pending_review"
+
+
+def _taxonomy_terminal_transition_statements(
+    *,
+    tool_id: int,
+    item_id: int,
+    batch_status: str,
+    entity_kind: str,
+    error: str,
+    target_status: str,
+    now: str,
+) -> list[tuple[str, list[Any]]]:
+    old_value = _json({"status": "pending_enrich"})
+    new_value = _json({"status": target_status})
+    notes = (
+        "Taxonomy terminal outcome routed out of active enrichment"
+        f"; batch_item={item_id}"
+        f"; batch_status={batch_status}"
+        f"; entity_kind={entity_kind or 'unresolved'}"
+        f"; error={_safe_error(error, 300) or 'none'}"
+    )
+    return [
+        (
+            """
+            INSERT INTO tool_change_log (
+              tool_id, change_type, old_value, new_value, verified_at, notes
+            )
+            SELECT id, 'status_changed', ?, ?, ?, ?
+            FROM tools
+            WHERE id = ? AND status = 'pending_enrich'
+            """,
+            [old_value, new_value, now, notes, tool_id],
+        ),
+        (
+            """
+            UPDATE tools
+            SET status = ?, updated_at = ?
+            WHERE id = ? AND status = 'pending_enrich'
+            RETURNING id
+            """,
+            [target_status, now, tool_id],
+        ),
+    ]
+
+
+def _batch_result_changes(result: dict[str, Any] | None) -> int:
+    if not isinstance(result, dict):
+        return 0
+    meta = result.get("meta")
+    if isinstance(meta, dict):
+        return int(meta.get("changes") or 0)
+    rows = result.get("results")
+    return len(rows) if isinstance(rows, list) else 0
+
+
+async def route_terminal_taxonomy_tool(
+    d1: Any,
+    *,
+    tool_id: int,
+    item_id: int,
+    batch_status: str,
+    error: str,
+) -> str | None:
+    rows = await d1.query(
+        "SELECT entity_kind FROM tools WHERE id = ? AND status = 'pending_enrich' LIMIT 1",
+        [tool_id],
+    )
+    if not rows:
+        return None
+    entity_kind = str(rows[0].get("entity_kind") or "unresolved")
+    target_status = terminal_taxonomy_tool_status(batch_status, entity_kind)
+    if not target_status:
+        return None
+    results = await d1.batch(
+        _taxonomy_terminal_transition_statements(
+            tool_id=tool_id,
+            item_id=item_id,
+            batch_status=batch_status,
+            entity_kind=entity_kind,
+            error=error,
+            target_status=target_status,
+            now=utc_now_iso(),
+        ),
+        operation="taxonomy.terminal_outcome.route",
+    )
+    return target_status if len(results) >= 2 and _batch_result_changes(results[1]) else None
+
+
+async def reconcile_terminal_taxonomy_tools(
+    d1: Any,
+    limit: int = 200,
+) -> dict[str, int]:
+    """Heal terminal taxonomy items left behind in ``pending_enrich``."""
+    effective_limit = min(500, max(1, int(limit)))
+    rows = await d1.query(
+        """
+        WITH latest_item AS (
+          SELECT tool_id, max(id) AS item_id
+          FROM taxonomy_batch_items
+          GROUP BY tool_id
+        )
+        SELECT
+          tool.id AS tool_id,
+          item.id AS item_id,
+          item.status AS batch_status,
+          coalesce(tool.entity_kind, 'unresolved') AS entity_kind,
+          coalesce(item.error, '') AS error
+        FROM tools tool
+        JOIN latest_item latest ON latest.tool_id = tool.id
+        JOIN taxonomy_batch_items item ON item.id = latest.item_id
+        WHERE tool.status = 'pending_enrich'
+          AND tool.duplicate_of_tool_id IS NULL
+          AND item.status IN ('skipped', 'partial', 'needs_review')
+          AND item.current_stage = 'complete'
+        ORDER BY coalesce(item.completed_at, item.updated_at), item.id
+        LIMIT ?
+        """,
+        [effective_limit + 1],
+    )
+    has_more = len(rows) > effective_limit
+    candidates = rows[:effective_limit]
+    statements: list[tuple[str, list[Any]]] = []
+    targets: list[str] = []
+    now = utc_now_iso()
+    for row in candidates:
+        batch_status = str(row.get("batch_status") or "")
+        entity_kind = str(row.get("entity_kind") or "unresolved")
+        target_status = terminal_taxonomy_tool_status(batch_status, entity_kind)
+        if not target_status:
+            continue
+        targets.append(target_status)
+        statements.extend(
+            _taxonomy_terminal_transition_statements(
+                tool_id=int(row.get("tool_id") or 0),
+                item_id=int(row.get("item_id") or 0),
+                batch_status=batch_status,
+                entity_kind=entity_kind,
+                error=str(row.get("error") or ""),
+                target_status=target_status,
+                now=now,
+            )
+        )
+
+    counts = {
+        "terminal_selected": len(targets),
+        "terminal_pending_review": 0,
+        "terminal_rejected": 0,
+        "terminal_has_more": int(has_more),
+    }
+    if not statements:
+        return counts
+    results = await d1.batch(statements, operation="taxonomy.terminal_outcome.reconcile")
+    for index, target_status in enumerate(targets):
+        update_index = index * 2 + 1
+        if update_index >= len(results) or not _batch_result_changes(results[update_index]):
+            continue
+        if target_status == "rejected":
+            counts["terminal_rejected"] += 1
+        else:
+            counts["terminal_pending_review"] += 1
+    return counts
 
 
 def is_provider_blocked_error(error: Any) -> bool:
@@ -1825,6 +2004,13 @@ async def complete_without_leaf(
         """,
         [status, error, run_id or None, _json(trace), now, now, item_id],
     )
+    await route_terminal_taxonomy_tool(
+        d1,
+        tool_id=tool_id,
+        item_id=item_id,
+        batch_status=status,
+        error=error,
+    )
 
 
 async def finalize_capability_only(
@@ -2902,6 +3088,12 @@ async def run_openai_taxonomy_batch_once(
                 counts.update(
                     await submit_queued_batches(d1, config, catalog, openai)
                 )
+        counts.update(
+            await reconcile_terminal_taxonomy_tools(
+                d1,
+                limit=min(500, max(100, effective_limit * 4)),
+            )
+        )
         active_rows = await d1.query(
             """
             SELECT COUNT(*) AS count FROM taxonomy_batch_jobs

@@ -12,6 +12,7 @@ from taxonomy_batch import (
     apply_request_result,
     batch_failure_error,
     build_responses_batch_line,
+    complete_without_leaf,
     enqueue_stage,
     extract_response_output_text,
     is_retryable_stage_error,
@@ -19,6 +20,7 @@ from taxonomy_batch import (
     load_new_batch_tasks,
     parse_batch_output_line,
     poll_active_batches,
+    reconcile_terminal_taxonomy_tools,
     resume_due_model_retries,
     response_usage,
     schedule_source_retry,
@@ -50,6 +52,20 @@ class AsyncSqliteD1:
 
     async def query(self, sql, params=None, **_kwargs):
         return [dict(row) for row in self.connection.execute(sql, params or []).fetchall()]
+
+    async def batch(self, statements, **_kwargs):
+        results = []
+        try:
+            for sql, params in statements:
+                cursor = self.connection.execute(sql, params or [])
+                rows = [dict(row) for row in cursor.fetchall()] if cursor.description else []
+                changes = cursor.rowcount if cursor.rowcount >= 0 else len(rows)
+                results.append({"results": rows, "meta": {"changes": changes}})
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            raise
+        return results
 
 
 class TaxonomyBatchPureTests(unittest.TestCase):
@@ -478,7 +494,22 @@ class TaxonomyBatchStateMachineTests(unittest.IsolatedAsyncioTestCase):
             CREATE TABLE tools (
               id INTEGER PRIMARY KEY,
               entity_kind TEXT,
-              entity_kind_source TEXT
+              entity_kind_source TEXT,
+              duplicate_of_tool_id INTEGER,
+              status TEXT NOT NULL DEFAULT 'pending_enrich',
+              updated_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.000Z'
+            );
+            CREATE TABLE tool_change_log (
+              id INTEGER PRIMARY KEY AUTOINCREMENT,
+              tool_id INTEGER NOT NULL,
+              change_type TEXT NOT NULL,
+              old_value TEXT,
+              new_value TEXT,
+              detected_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.000Z',
+              verified_at TEXT,
+              notes TEXT,
+              created_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.000Z',
+              updated_at TEXT NOT NULL DEFAULT '2026-01-01T00:00:00.000Z'
             );
             CREATE TABLE taxonomy_terms (
               id INTEGER PRIMARY KEY,
@@ -521,7 +552,8 @@ class TaxonomyBatchStateMachineTests(unittest.IsolatedAsyncioTestCase):
               reviewed_at TEXT,
               UNIQUE(tool_id, term_id)
             );
-            INSERT INTO tools VALUES (10, 'unresolved', 'auto');
+            INSERT INTO tools (id, entity_kind, entity_kind_source)
+            VALUES (10, 'unresolved', 'auto');
             INSERT INTO taxonomy_terms VALUES (1, 'primary_category', 'active');
             INSERT INTO taxonomy_terms VALUES (2, 'primary_category', 'active');
             INSERT INTO taxonomy_terms VALUES (3, 'capability', 'active');
@@ -724,6 +756,89 @@ class TaxonomyBatchStateMachineTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertEqual(run[1:], ("openai_batch_api", "succeeded"))
         self.assertTrue(str(run[0]).startswith("openai-batch-"))
+
+    async def test_terminal_outcomes_leave_active_enrichment_with_audit(self):
+        self.connection.execute(
+            "UPDATE tools SET entity_kind = 'company_site' WHERE id = 10"
+        )
+        item_id = self.connection.execute(
+            """
+            INSERT INTO taxonomy_batch_items (
+              tool_id, pipeline_version, prompt_version, taxonomy_version,
+              source_url, source_content_hash, existing_entity_kind,
+              existing_entity_source
+            ) VALUES (
+              10, 'terminal-route-test', 'terminal-route-test', 2,
+              'https://company.example', 'hash', 'company_site', 'auto'
+            )
+            """
+        ).lastrowid
+        self.connection.commit()
+
+        item = dict(
+            self.connection.execute(
+                "SELECT * FROM taxonomy_batch_items WHERE id = ?", [item_id]
+            ).fetchone()
+        )
+        await complete_without_leaf(
+            self.d1,
+            item,
+            self.catalog,
+            status="skipped",
+            error="entity_ineligible_or_profile_without_signal",
+        )
+
+        tool = self.connection.execute(
+            "SELECT status FROM tools WHERE id = 10"
+        ).fetchone()
+        self.assertEqual(tool["status"], "rejected")
+        change = self.connection.execute(
+            "SELECT old_value, new_value, notes FROM tool_change_log WHERE tool_id = 10"
+        ).fetchone()
+        self.assertEqual(json.loads(change["old_value"]), {"status": "pending_enrich"})
+        self.assertEqual(json.loads(change["new_value"]), {"status": "rejected"})
+        self.assertIn("batch_status=skipped", change["notes"])
+
+    async def test_terminal_reconciliation_routes_existing_review_backlog_once(self):
+        self.connection.execute(
+            """
+            INSERT INTO tools (id, entity_kind, entity_kind_source)
+            VALUES (11, 'unresolved', 'auto')
+            """
+        )
+        self.connection.execute(
+            """
+            INSERT INTO taxonomy_batch_items (
+              tool_id, pipeline_version, prompt_version, taxonomy_version,
+              status, current_stage, source_url, source_content_hash,
+              existing_entity_kind, existing_entity_source, error,
+              completed_at
+            ) VALUES (
+              11, 'terminal-reconcile-test', 'terminal-reconcile-test', 2,
+              'needs_review', 'complete', 'https://review.example', 'hash',
+              'unresolved', 'auto', 'no_valid_primary_leaf_after_escalation',
+              '2026-01-01T00:00:00.000Z'
+            )
+            """
+        )
+        self.connection.commit()
+
+        counts = await reconcile_terminal_taxonomy_tools(self.d1, limit=10)
+
+        self.assertEqual(counts["terminal_pending_review"], 1)
+        self.assertEqual(counts["terminal_rejected"], 0)
+        self.assertEqual(
+            self.connection.execute("SELECT status FROM tools WHERE id = 11").fetchone()[0],
+            "pending_review",
+        )
+        replay = await reconcile_terminal_taxonomy_tools(self.d1, limit=10)
+        self.assertEqual(replay["terminal_selected"], 0)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT count(*) FROM tool_change_log WHERE tool_id = 11"
+            ).fetchone()[0],
+            1,
+        )
 
     async def test_capability_only_keeps_existing_deepseek_primary(self):
         existing_run_id = self.connection.execute(
@@ -1115,7 +1230,8 @@ class TaxonomyBatchStateMachineTests(unittest.IsolatedAsyncioTestCase):
         for offset in range(request_count):
             tool_id = 1000 + offset
             self.connection.execute(
-                "INSERT INTO tools VALUES (?, 'independent_product', 'auto')",
+                "INSERT INTO tools (id, entity_kind, entity_kind_source) "
+                "VALUES (?, 'independent_product', 'auto')",
                 (tool_id,),
             )
             item_id = self.connection.execute(
