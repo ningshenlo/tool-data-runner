@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import html
+import ipaddress
 import json
 import os
 import random
@@ -14,7 +15,8 @@ import time
 import uuid
 import xml.etree.ElementTree as ET
 from contextlib import suppress
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
@@ -24,6 +26,19 @@ from urllib.parse import quote, urljoin, urlsplit
 import httpx
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from dotenv import load_dotenv
+from anti_bot_signatures import detect_anti_bot_page
+from pricing.allowances import (
+    extract_fixed_allowance_quotes,
+    merge_evidenced_rule_features,
+    normalize_plan_feature,
+    retain_evidenced_plan_features,
+)
+from pricing.auto_approval import (
+    evaluate_strict_auto_approval,
+    has_fixed_ai_allowance,
+    has_metered_usage_charge,
+    pricing_payloads_agree,
+)
 from pricing.bundle import PricingSnapshotBundle, build_pricing_snapshot_bundle
 from pricing.claim_states import ClaimState, assert_claim_invariants
 from pricing.feature_flags import assert_safe_pricing_claim_flags
@@ -50,22 +65,23 @@ TRAFFIC_METRICS_SCHEMA_VERSION = 2
 ASSET_SOURCE = "site_scraper"
 ASSET_DB_STORAGE_BUCKET = "sitesimgs"
 DEFAULT_R2_BUCKET = "sitesimgs"
-ASSET_REQUIREMENT_ORDER = ("content_safety", "screenshot", "favicon", "description", "key_features", "category")
+ASSET_REQUIREMENT_ORDER = ("content_safety", "screenshot", "favicon", "description", "key_features")
 AUTO_APPROVE_TOOL_NAME_CONFIDENCE = 85
+CATALOG_AUTO_PUBLISH_POLICY_VERSION = "catalog-auto-publish-v1"
+CATALOG_AUTO_PUBLISH_MAX_LIMIT = 100
 REVIEW_TOOL_NAME_CONFIDENCE = 60
-# Stop automatic attempts at this threshold and route the tool to manual review.
-CATEGORY_CLASSIFICATION_MAX_ATTEMPTS = 3
-CATEGORY_CLASSIFICATION_PROMPT_VERSION = "hierarchical-v2-2026-08-05"
-# Marker stored in classification raw JSON so published backfill is resumable.
-PUBLISHED_CATEGORY_BACKFILL_VERSION = "published-legacy-v1"
-# Primary model via Browser Rendering custom_ai (AI Gateway provider form).
-DEFAULT_CATEGORY_CLASSIFICATION_MODEL = "deepseek/deepseek-v4-flash"
-DEFAULT_CATEGORY_CLASSIFICATION_FALLBACK_MODEL = (
-    "workers-ai/@cf/meta/llama-3.3-70b-instruct-fp8-fast"
-)
+ASSET_DEAD_LETTER_REVIVE_HOURS = 24
+# Primary taxonomy model via Browser Rendering custom_ai (AI Gateway provider form).
+DEFAULT_TAXONOMY_CLASSIFICATION_MODEL = "deepseek/deepseek-v4-flash"
+# Taxonomy L1/leaf decisions must never silently fall back to Workers AI.
+# Operators may configure another paid provider explicitly (for example,
+# ``openai/gpt-5.6-luna``) after evaluation.
+DEFAULT_TAXONOMY_CLASSIFICATION_FALLBACK_MODEL = ""
 D1_API_BASE = "https://api.cloudflare.com/client/v4"
 DOMAIN_STATE_SOURCE = "ahrefs"
 AHREFS_DOMAIN_RATING_URL = "https://api.ahrefs.com/v3/public/domain-rating-free"
+AHREFS_DEFAULT_REQUESTS_PER_MINUTE = 60
+AHREFS_MAX_REQUESTS_PER_MINUTE = 60
 IANA_RDAP_DNS = "https://data.iana.org/rdap/dns.json"
 RDAP_USER_AGENT = "traffic-runner-domain-whois/0.1"
 PRICING_EXTRACTOR_VERSION = "python-rule-pricing-v1"
@@ -75,6 +91,8 @@ DEFAULT_OPENAI_PRICING_MODEL = "gpt-5.6-luna"
 DEFAULT_OPENAI_PRICING_FALLBACK_MODEL = ""
 OPENAI_PRICING_MIN_CONFIDENCE = 60
 DEFAULT_OPENAI_PRICING_TEXT_CHARS = 24000
+PRICING_CLAIMS_V2_REPLAY_MARKER = "pricing_claims_v2_replayed"
+PRICING_CLAIMS_V2_REPLAY_RUNNING_MARKER = "pricing_claims_v2_replay_running"
 BROWSER_RENDERING_TEXT_SCORE_THRESHOLD = 8
 PRICING_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -83,6 +101,9 @@ PRICING_USER_AGENT = (
 _PRICING_UA_GENERATOR: Any | None = None
 MAX_PRICING_HTML_BYTES = 1_200_000
 MAX_PRICING_TEXT_CHARS = 180_000
+MAX_HOMEPAGE_HTML_BYTES = 1_200_000
+HOMEPAGE_MAX_REDIRECTS = 8
+HOMEPAGE_BROWSER_6000_RETRY_DELAY_SECONDS = 6 * 60 * 60
 COMMON_PRICING_PATHS = (
     "/pricing",
     "/pricing/",
@@ -209,12 +230,17 @@ class Config:
     cloudflare_d1_database_id: str
     cloudflare_api_token: str
     ahref_api_key: str
+    ahrefs_requests_per_minute: int
     brightdata_proxy_host: str
     brightdata_proxy_port: int
     brightdata_proxy_user: str
     brightdata_proxy_password: str
     limit: int
     concurrency: int
+    traffic_concurrency: int
+    asset_concurrency: int
+    domain_state_concurrency: int
+    pricing_concurrency: int
     max_retries: int
     poll_interval_seconds: int
     traffic_release_probe_domain: str
@@ -222,18 +248,46 @@ class Config:
     traffic_release_probe_interval_seconds: int
     traffic_release_queue_limit: int
     asset_limit: int
+    enrichment_reconcile_limit: int
+    enrichment_reconcile_concurrency: int
+    catalog_auto_publish_enabled: bool
+    catalog_auto_publish_limit: int
     domain_state_limit: int
     domain_state_max_age_days: int
+    domain_state_poll_interval_seconds: int
+    pricing_monitor_enabled: bool
     pricing_limit: int
+    pricing_manual_review_replay_limit: int
     pricing_timeout_seconds: int
     taxonomy_auto_enabled: bool
+    taxonomy_recheck_auto_non_product: bool
+    taxonomy_capabilities_enabled: bool
+    taxonomy_capability_backfill_enabled: bool
+    taxonomy_capability_candidate_limit: int
     taxonomy_limit: int
     taxonomy_interval_seconds: int
     taxonomy_concurrency: int
     taxonomy_auto_accept_confidence: float
     taxonomy_provider_backoff_seconds: int
+    taxonomy_batch_enabled: bool
+    taxonomy_batch_model: str
+    taxonomy_batch_escalation_model: str
+    taxonomy_batch_profile_reasoning_effort: str
+    taxonomy_batch_l1_reasoning_effort: str
+    taxonomy_batch_leaf_reasoning_effort: str
+    taxonomy_batch_capability_reasoning_effort: str
+    taxonomy_batch_escalation_reasoning_effort: str
+    taxonomy_batch_max_output_tokens: int
+    taxonomy_batch_request_limit: int
+    taxonomy_batch_timeout_seconds: int
+    taxonomy_batch_max_attempts: int
+    taxonomy_batch_retry_base_seconds: int
+    taxonomy_batch_leaf_min_confidence: float
+    taxonomy_batch_l1_min_gap: float
     pricing_claims_shadow: bool
     pricing_claims_publish: bool
+    pricing_strict_auto_publish_enabled: bool
+    pricing_strict_auto_publish_min_confidence: int
     openai_api_key: str
     openai_pricing_model: str
     openai_pricing_fallback_model: str
@@ -242,16 +296,20 @@ class Config:
     browser_rendering_api_token: str
     browser_rendering_enabled: bool
     browser_rendering_timeout_seconds: int
-    category_classification_api_token: str
-    category_classification_deepseek_api_key: str
-    category_classification_model: str
-    category_classification_fallback_model: str
+    taxonomy_classification_api_token: str
+    taxonomy_classification_deepseek_api_key: str
+    taxonomy_classification_model: str
+    taxonomy_classification_fallback_model: str
+    taxonomy_main_content_max_chars: int
+    taxonomy_deepseek_max_output_tokens: int
     r2_access_key_id: str
     r2_secret_access_key: str
     r2_bucket: str
     r2_public_base_url: str
     runner_instance_id: str
     runner_version: str
+    runner_service_name: str
+    runner_workloads: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -299,6 +357,7 @@ class PricingTask:
     max_attempts: int
     generation: int
     lease_token: str
+    is_manual_review_replay: bool = False
 
 
 @dataclass(frozen=True)
@@ -347,6 +406,7 @@ class DomainStateResult:
     error: str | None = None
     rdap_status: str | None = None
     rdap_error: str | None = None
+    retry_after_seconds: float | None = None
 
 
 @dataclass(frozen=True)
@@ -358,9 +418,6 @@ class AssetFetchResult:
     page_title: str = ""
     description: str = ""
     favicon_href: str = ""
-    category_l1: str = ""
-    category_l2: str = ""
-    category_raw_output: str = ""
     key_features: list[dict[str, str]] | None = None
     name_source: str = "internal"
     name_confidence: int = 100
@@ -376,16 +433,6 @@ class AssetFetchResult:
     content_safety_source: str = ""
     metadata_error: str = ""
     metadata_retryable: bool = True
-
-
-@dataclass(frozen=True)
-class CategoryCatalogEntry:
-    slug: str
-    parent_slug: str = ""
-    definition: str = ""
-    includes: str = ""
-    excludes: str = ""
-    examples: str = ""
 
 
 @dataclass(frozen=True)
@@ -420,9 +467,20 @@ class ContentSafetyAssessment:
 
 
 class AssetPipelineError(RuntimeError):
-    def __init__(self, message: str, *, retryable: bool = True):
+    def __init__(
+        self,
+        message: str,
+        *,
+        retryable: bool = True,
+        error_code: str = "",
+        max_attempts: int | None = None,
+        retry_after_seconds: int | None = None,
+    ):
         super().__init__(message)
         self.retryable = retryable
+        self.error_code = error_code
+        self.max_attempts = max_attempts
+        self.retry_after_seconds = retry_after_seconds
 
 
 class PageQualityError(AssetPipelineError):
@@ -544,12 +602,64 @@ def read_float_env(name: str, fallback: float) -> float:
         return fallback
 
 
+_LOG_LEVEL_PRIORITY = {"debug": 10, "info": 20, "error": 40}
+_LOG_LEVEL = (os.getenv("RUNNER_LOG_LEVEL") or "info").strip().lower()
+if _LOG_LEVEL not in _LOG_LEVEL_PRIORITY:
+    _LOG_LEVEL = "info"
+_LOG_CONTEXT: dict[str, Any] = {
+    "service": (os.getenv("RUNNER_SERVICE_NAME") or "tool-data-runner").strip(),
+}
+_LOG_WORKLOAD: ContextVar[str | None] = ContextVar("runner_log_workload", default=None)
+
+
+def configure_logging(service: str, instance_id: str, workloads: tuple[str, ...]) -> None:
+    global _LOG_LEVEL
+    configured_level = (os.getenv("RUNNER_LOG_LEVEL") or _LOG_LEVEL).strip().lower()
+    _LOG_LEVEL = configured_level if configured_level in _LOG_LEVEL_PRIORITY else "info"
+    _LOG_CONTEXT.clear()
+    _LOG_CONTEXT.update(
+        {
+            "service": service,
+            "instance_id": instance_id,
+            "workloads": list(workloads),
+        }
+    )
+
+
+def emit_log(level: str, message: str, fields: dict[str, Any]) -> None:
+    if _LOG_LEVEL_PRIORITY[level] < _LOG_LEVEL_PRIORITY[_LOG_LEVEL]:
+        return
+    workload = _LOG_WORKLOAD.get()
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"),
+        "level": level,
+        **_LOG_CONTEXT,
+        **({"workload": workload} if workload else {}),
+        "message": message,
+        **fields,
+    }
+    print(
+        json.dumps(payload, ensure_ascii=False),
+        file=sys.stderr if level == "error" else sys.stdout,
+        flush=True,
+    )
+
+
+def log_debug(message: str, **fields: Any) -> None:
+    emit_log("debug", message, fields)
+
+
 def log_info(message: str, **fields: Any) -> None:
-    print(json.dumps({"level": "info", "message": message, **fields}, ensure_ascii=False), flush=True)
+    emit_log("info", message, fields)
 
 
 def log_error(message: str, **fields: Any) -> None:
-    print(json.dumps({"level": "error", "message": message, **fields}, ensure_ascii=False), file=sys.stderr, flush=True)
+    emit_log("error", message, fields)
+
+
+def log_task_result(message: str, status: str, **fields: Any) -> None:
+    logger = log_debug if status in {"done", "succeeded"} else log_info
+    logger(message, status=status, **fields)
 
 
 def mask_value(value: str, prefix: int = 18, suffix: int = 8) -> str:
@@ -631,30 +741,89 @@ def d1_request_metadata(body: dict[str, Any], operation: str | None = None) -> d
 
 def load_config(require_brightdata: bool = True) -> Config:
     load_dotenv()
+    shared_concurrency = max(1, read_int_env("RUNNER_CONCURRENCY", 5))
     return Config(
         cloudflare_account_id=os.environ["CLOUDFLARE_ACCOUNT_ID"],
         cloudflare_d1_database_id=os.environ["CLOUDFLARE_D1_DATABASE_ID"],
         cloudflare_api_token=os.environ["CLOUDFLARE_API_TOKEN"],
         ahref_api_key=(os.getenv("AHREF_API_KEY") or os.getenv("AHREFS_API_KEY", "")).strip(),
+        ahrefs_requests_per_minute=min(
+            AHREFS_MAX_REQUESTS_PER_MINUTE,
+            max(
+                1,
+                read_int_env(
+                    "RUNNER_AHREFS_REQUESTS_PER_MINUTE",
+                    AHREFS_DEFAULT_REQUESTS_PER_MINUTE,
+                ),
+            ),
+        ),
         brightdata_proxy_host=os.getenv("BRIGHTDATA_PROXY_HOST", "brd.superproxy.io"),
         brightdata_proxy_port=read_int_env("BRIGHTDATA_PROXY_PORT", 33335),
         brightdata_proxy_user=os.environ["BRIGHTDATA_PROXY_USER"] if require_brightdata else os.getenv("BRIGHTDATA_PROXY_USER", ""),
         brightdata_proxy_password=os.environ["BRIGHTDATA_PROXY_PASSWORD"] if require_brightdata else os.getenv("BRIGHTDATA_PROXY_PASSWORD", ""),
         limit=read_int_env("RUNNER_LIMIT", 20),
-        concurrency=read_int_env("RUNNER_CONCURRENCY", 5),
+        concurrency=shared_concurrency,
+        traffic_concurrency=max(
+            1, read_int_env("RUNNER_TRAFFIC_CONCURRENCY", shared_concurrency)
+        ),
+        asset_concurrency=max(
+            1, read_int_env("RUNNER_ASSET_CONCURRENCY", shared_concurrency)
+        ),
+        domain_state_concurrency=max(
+            1, read_int_env("RUNNER_DOMAIN_CONCURRENCY", shared_concurrency)
+        ),
+        pricing_concurrency=max(
+            1, read_int_env("RUNNER_PRICING_CONCURRENCY", shared_concurrency)
+        ),
         max_retries=read_int_env("RUNNER_MAX_RETRIES", 2),
         poll_interval_seconds=read_int_env("RUNNER_POLL_INTERVAL_SECONDS", 300),
         traffic_release_probe_domain=normalize_domain(os.getenv("TRAFFIC_RELEASE_PROBE_DOMAIN", "chatgpt.com")) or "chatgpt.com",
         traffic_release_probe_start_day=min(max(read_int_env("TRAFFIC_RELEASE_PROBE_START_DAY", 7), 1), 28),
         traffic_release_probe_interval_seconds=max(900, read_int_env("TRAFFIC_RELEASE_PROBE_INTERVAL_SECONDS", 21600)),
         traffic_release_queue_limit=max(1, read_int_env("TRAFFIC_RELEASE_QUEUE_LIMIT", 5000)),
-        asset_limit=read_int_env("RUNNER_ASSET_LIMIT", 5),
+        asset_limit=max(1, read_int_env("RUNNER_ASSET_LIMIT", 25)),
+        enrichment_reconcile_limit=min(
+            500,
+            max(1, read_int_env("RUNNER_ENRICHMENT_RECONCILE_LIMIT", 100)),
+        ),
+        enrichment_reconcile_concurrency=min(
+            10,
+            max(1, read_int_env("RUNNER_ENRICHMENT_RECONCILE_CONCURRENCY", 5)),
+        ),
+        catalog_auto_publish_enabled=read_bool_env("CATALOG_AUTO_PUBLISH_ENABLED", True),
+        catalog_auto_publish_limit=min(
+            CATALOG_AUTO_PUBLISH_MAX_LIMIT,
+            max(1, read_int_env("CATALOG_AUTO_PUBLISH_LIMIT", 25)),
+        ),
         domain_state_limit=read_int_env("RUNNER_DOMAIN_STATE_LIMIT", 50),
-        domain_state_max_age_days=read_int_env("RUNNER_DOMAIN_STATE_MAX_AGE_DAYS", 30),
+        domain_state_max_age_days=max(
+            1, read_int_env("RUNNER_DOMAIN_STATE_MAX_AGE_DAYS", 30)
+        ),
+        domain_state_poll_interval_seconds=max(
+            1, read_int_env("RUNNER_DOMAIN_POLL_INTERVAL_SECONDS", 1)
+        ),
+        pricing_monitor_enabled=read_bool_env("PRICING_MONITOR_ENABLED", False),
         pricing_limit=read_int_env("RUNNER_PRICING_LIMIT", 20),
+        pricing_manual_review_replay_limit=max(
+            0,
+            read_int_env("RUNNER_PRICING_MANUAL_REVIEW_REPLAY_LIMIT", 5),
+        ),
         pricing_timeout_seconds=read_int_env("RUNNER_PRICING_TIMEOUT_SECONDS", 20),
         taxonomy_auto_enabled=read_bool_env("TAXONOMY_AUTO_ENABLED", True),
-        taxonomy_limit=max(1, read_int_env("RUNNER_TAXONOMY_LIMIT", 20)),
+        taxonomy_recheck_auto_non_product=read_bool_env(
+            "TAXONOMY_RECHECK_AUTO_NON_PRODUCT", False
+        ),
+        taxonomy_capabilities_enabled=read_bool_env(
+            "TAXONOMY_CAPABILITIES_ENABLED", True
+        ),
+        taxonomy_capability_backfill_enabled=read_bool_env(
+            "TAXONOMY_CAPABILITY_BACKFILL_ENABLED", True
+        ),
+        taxonomy_capability_candidate_limit=min(
+            160,
+            max(12, read_int_env("TAXONOMY_CAPABILITY_CANDIDATE_LIMIT", 96)),
+        ),
+        taxonomy_limit=max(1, read_int_env("RUNNER_TAXONOMY_LIMIT", 50)),
         taxonomy_interval_seconds=max(
             300, read_int_env("RUNNER_TAXONOMY_INTERVAL_SECONDS", 300)
         ),
@@ -668,8 +837,71 @@ def load_config(require_brightdata: bool = True) -> Config:
         taxonomy_provider_backoff_seconds=max(
             900, read_int_env("RUNNER_TAXONOMY_PROVIDER_BACKOFF_SECONDS", 21600)
         ),
+        taxonomy_batch_enabled=read_bool_env("TAXONOMY_BATCH_ENABLED", True),
+        taxonomy_batch_model=(
+            os.getenv("OPENAI_TAXONOMY_MODEL", "gpt-5.6-luna").strip()
+            or "gpt-5.6-luna"
+        ),
+        taxonomy_batch_escalation_model=(
+            os.getenv("OPENAI_TAXONOMY_ESCALATION_MODEL", "gpt-5.6-terra").strip()
+            or "gpt-5.6-terra"
+        ),
+        taxonomy_batch_profile_reasoning_effort=os.getenv(
+            "OPENAI_TAXONOMY_PROFILE_REASONING_EFFORT", "medium"
+        ).strip(),
+        taxonomy_batch_l1_reasoning_effort=os.getenv(
+            "OPENAI_TAXONOMY_L1_REASONING_EFFORT", "low"
+        ).strip(),
+        taxonomy_batch_leaf_reasoning_effort=os.getenv(
+            "OPENAI_TAXONOMY_LEAF_REASONING_EFFORT", "high"
+        ).strip(),
+        taxonomy_batch_capability_reasoning_effort=os.getenv(
+            "OPENAI_TAXONOMY_CAPABILITY_REASONING_EFFORT", "medium"
+        ).strip(),
+        taxonomy_batch_escalation_reasoning_effort=os.getenv(
+            "OPENAI_TAXONOMY_ESCALATION_REASONING_EFFORT", "high"
+        ).strip(),
+        taxonomy_batch_max_output_tokens=min(
+            16384,
+            max(1024, read_int_env("OPENAI_TAXONOMY_MAX_OUTPUT_TOKENS", 4096)),
+        ),
+        taxonomy_batch_request_limit=min(
+            50000,
+            max(1, read_int_env("OPENAI_TAXONOMY_BATCH_REQUEST_LIMIT", 500)),
+        ),
+        taxonomy_batch_timeout_seconds=max(
+            30, read_int_env("OPENAI_TAXONOMY_TIMEOUT_SECONDS", 90)
+        ),
+        taxonomy_batch_max_attempts=min(
+            10, max(1, read_int_env("OPENAI_TAXONOMY_MAX_ATTEMPTS", 3))
+        ),
+        taxonomy_batch_retry_base_seconds=min(
+            21600,
+            max(30, read_int_env("OPENAI_TAXONOMY_RETRY_BASE_SECONDS", 300)),
+        ),
+        taxonomy_batch_leaf_min_confidence=min(
+            1.0,
+            max(
+                0.35,
+                read_float_env("OPENAI_TAXONOMY_LEAF_MIN_CONFIDENCE", 0.60),
+            ),
+        ),
+        taxonomy_batch_l1_min_gap=min(
+            1.0,
+            max(0.0, read_float_env("OPENAI_TAXONOMY_L1_MIN_GAP", 0.08)),
+        ),
         pricing_claims_shadow=read_bool_env("PRICING_CLAIMS_SHADOW", False),
         pricing_claims_publish=read_bool_env("PRICING_CLAIMS_PUBLISH", False),
+        pricing_strict_auto_publish_enabled=read_bool_env(
+            "PRICING_STRICT_AUTO_PUBLISH_ENABLED", False
+        ),
+        pricing_strict_auto_publish_min_confidence=min(
+            100,
+            max(
+                80,
+                read_int_env("PRICING_STRICT_AUTO_PUBLISH_MIN_CONFIDENCE", 82),
+            ),
+        ),
         openai_api_key=os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API", ""),
         openai_pricing_model=os.getenv("OPENAI_PRICING_MODEL", DEFAULT_OPENAI_PRICING_MODEL),
         openai_pricing_fallback_model=os.getenv("OPENAI_PRICING_FALLBACK_MODEL", DEFAULT_OPENAI_PRICING_FALLBACK_MODEL),
@@ -678,34 +910,50 @@ def load_config(require_brightdata: bool = True) -> Config:
         browser_rendering_api_token=os.getenv("CLOUDFLARE_BROWSER_RENDERING_API_TOKEN") or os.environ["CLOUDFLARE_API_TOKEN"],
         browser_rendering_enabled=read_bool_env("CLOUDFLARE_BROWSER_RENDERING_ENABLED", False),
         browser_rendering_timeout_seconds=read_int_env("CLOUDFLARE_BROWSER_RENDERING_TIMEOUT_SECONDS", 45),
-        category_classification_api_token=(
+        taxonomy_classification_api_token=(
             os.getenv("CLOUDFLARE_WORKERS_AI_API_TOKEN")
             or os.getenv("CLOUDFLARE_BROWSER_RENDERING_API_TOKEN")
             or os.environ["CLOUDFLARE_API_TOKEN"]
         ),
-        category_classification_deepseek_api_key=(
+        taxonomy_classification_deepseek_api_key=(
             os.getenv("DEEPSEEK_API_KEY")
-            or os.getenv("CATEGORY_CLASSIFICATION_DEEPSEEK_API_KEY")
+            or os.getenv("TAXONOMY_CLASSIFICATION_DEEPSEEK_API_KEY")
             or ""
         ).strip(),
-        category_classification_model=normalize_category_model_id(
+        taxonomy_classification_model=normalize_taxonomy_model_id(
             os.getenv(
-                "CATEGORY_CLASSIFICATION_MODEL",
-                DEFAULT_CATEGORY_CLASSIFICATION_MODEL,
+                "TAXONOMY_CLASSIFICATION_MODEL",
+                DEFAULT_TAXONOMY_CLASSIFICATION_MODEL,
             )
         ),
-        category_classification_fallback_model=normalize_category_model_id(
+        taxonomy_classification_fallback_model=normalize_taxonomy_model_id(
             os.getenv(
-                "CATEGORY_CLASSIFICATION_FALLBACK_MODEL",
-                DEFAULT_CATEGORY_CLASSIFICATION_FALLBACK_MODEL,
+                "TAXONOMY_CLASSIFICATION_FALLBACK_MODEL",
+                DEFAULT_TAXONOMY_CLASSIFICATION_FALLBACK_MODEL,
             )
+        ),
+        taxonomy_main_content_max_chars=min(
+            20000,
+            max(2000, read_int_env("TAXONOMY_MAIN_CONTENT_MAX_CHARS", 10000)),
+        ),
+        taxonomy_deepseek_max_output_tokens=min(
+            4096,
+            max(256, read_int_env("TAXONOMY_DEEPSEEK_MAX_OUTPUT_TOKENS", 1024)),
         ),
         r2_access_key_id=os.getenv("CLOUDFLARE_R2_ACCESS_KEY_ID", ""),
         r2_secret_access_key=os.getenv("CLOUDFLARE_R2_SECRET_ACCESS_KEY", ""),
         r2_bucket=os.getenv("CLOUDFLARE_R2_BUCKET", DEFAULT_R2_BUCKET),
         r2_public_base_url=os.getenv("R2_PUBLIC_BASE_URL", "").rstrip("/"),
         runner_instance_id=os.getenv("RUNNER_INSTANCE_ID") or f"runner-{uuid.uuid4().hex[:16]}",
-        runner_version=os.getenv("RUNNER_VERSION", "dev"),
+        runner_version=(
+            os.getenv("RUNNER_VERSION")
+            or os.getenv("DOKPLOY_COMMIT_SHA")
+            or os.getenv("GIT_COMMIT_SHA")
+            or os.getenv("SOURCE_COMMIT")
+            or "dev"
+        ).strip(),
+        runner_service_name=(os.getenv("RUNNER_SERVICE_NAME") or "tool-data-runner").strip(),
+        runner_workloads=(),
     )
 
 
@@ -1007,6 +1255,49 @@ def asset_page_url(task: AssetTask) -> str:
     return f"https://{task.normalized_domain}"
 
 
+def homepage_url_host(url: str) -> str:
+    try:
+        return (urlsplit(url).hostname or "").strip(".").lower()
+    except ValueError:
+        return ""
+
+
+def is_safe_homepage_url(url: str) -> bool:
+    """Reject local/private targets before the runner performs a direct fetch."""
+    try:
+        parsed = urlsplit(url)
+        port = parsed.port
+    except ValueError:
+        return False
+    host = (parsed.hostname or "").strip(".").lower()
+    if (
+        parsed.scheme not in {"http", "https"}
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or (port is not None and port not in {80, 443})
+        or host == "localhost"
+        or host.endswith((".localhost", ".local", ".internal"))
+    ):
+        return False
+    try:
+        return ipaddress.ip_address(host).is_global
+    except ValueError:
+        return True
+
+
+def homepage_urls_share_site(source_url: str, final_url: str) -> bool:
+    source_host = homepage_url_host(source_url)
+    final_host = homepage_url_host(final_url)
+    if not source_host or not final_host:
+        return False
+    return (
+        source_host == final_host
+        or source_host.endswith(f".{final_host}")
+        or final_host.endswith(f".{source_host}")
+    )
+
+
 def read_html_attribute(tag: str, name: str) -> str:
     match = re.search(rf"{re.escape(name)}\s*=\s*(\"[^\"]*\"|'[^']*'|[^\s>]+)", tag, re.I)
     if not match or not match.group(1):
@@ -1019,7 +1310,7 @@ def clean_asset_text(value: Any, limit: int) -> str:
     return html.unescape(text)[:limit]
 
 
-def normalize_category_model_id(value: Any) -> str:
+def normalize_taxonomy_model_id(value: Any) -> str:
     """Normalize category model ids for Browser Rendering custom_ai.
 
     Accepts short DeepSeek names (``deepseek-v4-flash``) and expands them to the
@@ -1035,17 +1326,22 @@ def normalize_category_model_id(value: Any) -> str:
     return model
 
 
-def category_model_auth_token(model: str, config_or_client: Any) -> str:
+def taxonomy_model_auth_token(model: str, config_or_client: Any) -> str:
     """Pick the provider credential for a category custom_ai model entry."""
-    model_id = normalize_category_model_id(model)
+    model_id = normalize_taxonomy_model_id(model)
     if model_id.startswith("deepseek/"):
-        deepseek_key = getattr(config_or_client, "category_deepseek_api_key", None)
+        deepseek_key = getattr(config_or_client, "taxonomy_deepseek_api_key", None)
         if deepseek_key is None:
-            deepseek_key = getattr(config_or_client, "category_classification_deepseek_api_key", "")
+            deepseek_key = getattr(config_or_client, "taxonomy_classification_deepseek_api_key", "")
         return str(deepseek_key or "").strip()
-    token = getattr(config_or_client, "category_api_token", None)
+    if model_id.startswith("openai/"):
+        openai_key = getattr(config_or_client, "taxonomy_openai_api_key", None)
+        if openai_key is None:
+            openai_key = getattr(config_or_client, "openai_api_key", "")
+        return str(openai_key or "").strip()
+    token = getattr(config_or_client, "taxonomy_api_token", None)
     if token is None:
-        token = getattr(config_or_client, "category_classification_api_token", "")
+        token = getattr(config_or_client, "taxonomy_classification_api_token", "")
     return str(token or "").strip()
 
 
@@ -1063,7 +1359,7 @@ def build_browser_response_format(
     Workers AI / default Browser Run accept a json_schema envelope with
     ``name`` + ``schema``.
     """
-    model_id = normalize_category_model_id(model or "")
+    model_id = normalize_taxonomy_model_id(model or "")
     if model_id.startswith("deepseek/"):
         return {"type": "json_object"}
 
@@ -1108,151 +1404,6 @@ def augment_prompt_for_response_format(
         f"Allowed keys: {', '.join(keys)}. "
         "Use empty strings when a value is unknown."
     )
-
-
-def clean_category_slug(value: Any) -> str:
-    slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
-    return slug if re.fullmatch(r"[a-z0-9][a-z0-9-]{0,119}", slug) and slug != "uncategorized" else ""
-
-
-def normalize_category_catalog(
-    category_options: list[str] | list[CategoryCatalogEntry],
-) -> list[CategoryCatalogEntry]:
-    entries: list[CategoryCatalogEntry] = []
-    for item in category_options:
-        if isinstance(item, CategoryCatalogEntry):
-            if item.slug:
-                entries.append(item)
-            continue
-        slug = clean_category_slug(item)
-        if slug:
-            entries.append(CategoryCatalogEntry(slug=slug))
-    return entries
-
-
-def render_category_catalog(entries: list[CategoryCatalogEntry]) -> str:
-    lines: list[str] = []
-    for entry in entries:
-        bits = [entry.slug]
-        if entry.parent_slug:
-            bits.append(f"parent={entry.parent_slug}")
-        if entry.definition:
-            bits.append(f"def={entry.definition}")
-        if entry.includes:
-            bits.append(f"includes={entry.includes}")
-        if entry.excludes:
-            bits.append(f"excludes={entry.excludes}")
-        if entry.examples:
-            bits.append(f"examples={entry.examples}")
-        lines.append(" | ".join(bits))
-    return "\n".join(lines)
-
-
-def category_catalog_version(entries: list[CategoryCatalogEntry]) -> str:
-    payload = [
-        {
-            "slug": entry.slug,
-            "parent_slug": entry.parent_slug,
-            "definition": entry.definition,
-            "includes": entry.includes,
-            "excludes": entry.excludes,
-            "examples": entry.examples,
-        }
-        for entry in entries
-    ]
-    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()[:16]
-
-
-def build_category_classification_prompt(entries: list[CategoryCatalogEntry]) -> str:
-    """Build the legacy flat prompt used when hierarchy metadata is unavailable."""
-    if not entries:
-        return (
-            "Choose the best category slugs for this AI product. No active categories are configured. "
-            "Return empty strings for category_l1 and category_l2."
-        )
-
-    return (
-        "Choose the best category slugs for this AI product from the catalog below. "
-        "Category values must be exact slugs from the catalog. "
-        "Use category_l1 for the broad parent/top-level category and category_l2 for the most specific child. "
-        "When a definition or excludes note is present, treat it as binding boundary guidance. "
-        "Return empty strings when unsure — do not invent slugs.\n\n"
-        f"Catalog:\n{render_category_catalog(entries[:180])}"
-    )
-
-
-def build_category_l1_prompt(entries: list[CategoryCatalogEntry]) -> str:
-    return (
-        "Classify the AI product into exactly one primary top-level category from the catalog below. "
-        "Choose by the product's main user outcome, not incidental features, integrations, or marketing wording. "
-        "Definitions and excludes are binding. "
-        "If the page is a product homepage with any usable product description, tagline, or feature list, "
-        "you MUST pick the single best-matching category_l1 slug — do not return empty just because evidence is partial. "
-        "Return an empty category_l1 only when the page is blank, blocked, or clearly not a product site. "
-        "Use an exact slug and never invent a category.\n\n"
-        f"Top-level catalog:\n{render_category_catalog(entries)}"
-    )
-
-
-def build_category_l2_prompt(
-    parent: CategoryCatalogEntry,
-    children: list[CategoryCatalogEntry],
-) -> str:
-    return (
-        f"The AI product has already been assigned to top-level category '{parent.slug}'. "
-        "Choose the single most specific child category below that best matches its main user outcome. "
-        "Definitions and excludes are binding. Return an empty category_l2 when none is sufficiently supported. "
-        "Use an exact slug and never choose a category outside this parent.\n\n"
-        f"Parent:\n{render_category_catalog([parent])}\n\n"
-        f"Child catalog:\n{render_category_catalog(children)}"
-    )
-
-
-def annotate_published_category_backfill_raw(raw_output: str, result: AssetFetchResult) -> str:
-    """Attach resumable backfill markers to the model raw payload."""
-    payload: dict[str, Any]
-    try:
-        parsed = json.loads(raw_output) if raw_output else {}
-        payload = parsed if isinstance(parsed, dict) else {"raw": parsed}
-    except (TypeError, ValueError, json.JSONDecodeError):
-        payload = {"raw": raw_output}
-    payload["backfill"] = PUBLISHED_CATEGORY_BACKFILL_VERSION
-    payload["prompt_version"] = str(
-        payload.get("prompt_version") or CATEGORY_CLASSIFICATION_PROMPT_VERSION
-    )
-    payload["accepted_l1"] = result.category_l1
-    payload["accepted_l2"] = result.category_l2
-    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-
-
-def published_category_backfill_success(result: AssetFetchResult) -> bool:
-    """Return True when a reclassification result is safe to apply to a published tool.
-
-    L1 is required. An unmatched L2 (invented / out-of-parent slug) is rejected so the
-    live catalog is never partially rewritten. Empty L2 is allowed (parent-only).
-    """
-    if not result.category_l1:
-        return False
-    error = (result.metadata_error or "").strip()
-    if error.startswith("category_l2_unmatched"):
-        return False
-    return True
-
-
-def raw_has_published_category_backfill(raw_output: Any) -> bool:
-    text = str(raw_output or "")
-    if not text:
-        return False
-    if f'"backfill":"{PUBLISHED_CATEGORY_BACKFILL_VERSION}"' in text:
-        return True
-    if f'"backfill": "{PUBLISHED_CATEGORY_BACKFILL_VERSION}"' in text:
-        return True
-    try:
-        parsed = json.loads(text)
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return False
-    return isinstance(parsed, dict) and parsed.get("backfill") == PUBLISHED_CATEGORY_BACKFILL_VERSION
 
 
 def extract_json_object_from_text(text: str) -> dict[str, Any]:
@@ -1414,13 +1565,87 @@ def clean_key_features(value: Any) -> list[dict[str, str]]:
     return features
 
 
+def canonical_slug_fallback_tool_name(task: AssetTask) -> str:
+    base = re.sub(r"-[0-9a-f]{8}$", "", clean_public_slug(task.canonical_slug))
+    words = [part for part in base.split("-") if part]
+    if not words:
+        return domain_fallback_tool_name(task.normalized_domain)
+    acronyms = {"ai": "AI", "api": "API", "gpt": "GPT", "llm": "LLM", "seo": "SEO", "crm": "CRM"}
+    return " ".join(acronyms.get(word, word.capitalize()) for word in words)[:120]
+
+
+def deterministic_fallback_description(
+    task: AssetTask,
+    html_body: str,
+    product_name: str = "",
+) -> str:
+    meta_description = read_html_meta(
+        html_body,
+        {"description", "og:description", "twitter:description"},
+    )
+    if meta_description:
+        return meta_description
+    for tag_name in ("p", "h1"):
+        for match in re.finditer(rf"<{tag_name}\b[^>]*>([\s\S]*?)</{tag_name}>", html_body or "", re.I):
+            text = clean_asset_text(match.group(1), 500)
+            if len(text) >= 24:
+                return text
+    name = clean_asset_text(product_name, 120) or canonical_slug_fallback_tool_name(task)
+    return f"{name} is an AI product available from {task.normalized_domain}."[:500]
+
+
+def pricing_claims_v2_replay_error(error: str | None, claims_count: int) -> str:
+    detail = (error or "manual review").strip() or "manual review"
+    return f"{PRICING_CLAIMS_V2_REPLAY_MARKER}:claims={max(0, claims_count)}; {detail}"[:900]
+
+
+def pricing_claims_v2_replay_detail(error: str | None) -> str | None:
+    value = (error or "").strip()
+    marker_prefix = f"{PRICING_CLAIMS_V2_REPLAY_MARKER}:"
+    if not value.startswith(marker_prefix):
+        return value or None
+    _, separator, detail = value.partition("; ")
+    return detail.strip() if separator and detail.strip() else None
+
+
+def deterministic_fallback_key_features(
+    product_name: str,
+    description: str,
+    html_body: str = "",
+) -> list[dict[str, str]]:
+    features: list[dict[str, str]] = []
+    seen: set[str] = set()
+    generic = {"features", "solutions", "product", "products", "why choose us", "how it works"}
+    for match in re.finditer(r"<h[23]\b[^>]*>([\s\S]*?)</h[23]>", html_body or "", re.I):
+        name = clean_asset_text(match.group(1), 120)
+        key = name.lower()
+        if len(name) < 4 or key in generic or key in seen:
+            continue
+        seen.add(key)
+        features.append({"name": name, "description": ""})
+        if len(features) >= 4:
+            break
+    if features:
+        return features
+    summary = clean_asset_text(description, 240)
+    name = clean_asset_text(product_name, 80)
+    return [{
+        "name": f"{name} overview" if name else "Product overview",
+        "description": summary,
+    }]
+
+
+def strip_html_comments(html_body: str) -> str:
+    return re.sub(r"<!--[\s\S]*?-->", " ", html_body or "")
+
+
 def read_html_title(html_body: str) -> str:
-    match = re.search(r"<title[^>]*>([\s\S]*?)</title>", html_body or "", re.I)
+    match = re.search(r"<title[^>]*>([\s\S]*?)</title>", strip_html_comments(html_body), re.I)
     return clean_asset_text(match.group(1), 120) if match else ""
 
 
 def read_html_meta(html_body: str, names: set[str]) -> str:
-    for tag in re.findall(r"<meta\b[^>]*>", html_body or "", re.I):
+    for tag in re.findall(r"<meta\b[^>]*>", strip_html_comments(html_body), re.I):
         key = (read_html_attribute(tag, "property") or read_html_attribute(tag, "name")).lower()
         content = read_html_attribute(tag, "content")
         if key in names and content:
@@ -1444,6 +1669,144 @@ _ERROR_TITLE_RE = re.compile(
 _GENERIC_PAGE_NAME_RE = re.compile(r"^(?:home|homepage|welcome|index|default\s+page)$", re.I)
 _MARKETING_PAGE_NAME_RE = re.compile(r"^(?:best|free|online|official)\b", re.I)
 _TITLE_SEPARATOR_RE = re.compile(r"\s+(?:\||[–—·])\s+|\s+-\s+|:\s+")
+
+
+_HOMEPAGE_EXCLUDED_TAGS = {
+    "script",
+    "style",
+    "noscript",
+    "template",
+    "nav",
+    "footer",
+    "svg",
+}
+_HOMEPAGE_BLOCK_TAGS = {
+    "address",
+    "article",
+    "aside",
+    "blockquote",
+    "br",
+    "dd",
+    "div",
+    "dl",
+    "dt",
+    "fieldset",
+    "figcaption",
+    "figure",
+    "h1",
+    "h2",
+    "h3",
+    "h4",
+    "h5",
+    "h6",
+    "hr",
+    "li",
+    "main",
+    "ol",
+    "p",
+    "pre",
+    "section",
+    "table",
+    "td",
+    "th",
+    "tr",
+    "ul",
+}
+
+
+class _HomepageMainTextParser(HTMLParser):
+    """Extract semantic homepage body text without navigation or executable markup."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.excluded_depth = 0
+        self.body_depth = 0
+        self.main_depth = 0
+        self.main_end_tags: list[str] = []
+        self.document_parts: list[str] = []
+        self.body_parts: list[str] = []
+        self.main_parts: list[str] = []
+
+    def _append(self, value: str) -> None:
+        if self.excluded_depth > 0 or not value:
+            return
+        self.document_parts.append(value)
+        if self.body_depth > 0:
+            self.body_parts.append(value)
+        if self.main_depth > 0:
+            self.main_parts.append(value)
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        normalized = tag.lower()
+        if normalized in _HOMEPAGE_EXCLUDED_TAGS:
+            self.excluded_depth += 1
+            return
+        if self.excluded_depth > 0:
+            return
+        attributes = {str(key).lower(): str(value or "").lower() for key, value in attrs}
+        if normalized == "body":
+            self.body_depth += 1
+        if normalized == "main" or attributes.get("role") == "main":
+            self.main_depth += 1
+            self.main_end_tags.append(normalized)
+        if normalized in _HOMEPAGE_BLOCK_TAGS:
+            self._append("\n")
+
+    def handle_startendtag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        normalized = tag.lower()
+        if self.excluded_depth == 0 and normalized in _HOMEPAGE_BLOCK_TAGS:
+            self._append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        normalized = tag.lower()
+        if normalized in _HOMEPAGE_EXCLUDED_TAGS:
+            self.excluded_depth = max(0, self.excluded_depth - 1)
+            return
+        if self.excluded_depth > 0:
+            return
+        if normalized in _HOMEPAGE_BLOCK_TAGS:
+            self._append("\n")
+        if self.main_end_tags and normalized == self.main_end_tags[-1]:
+            self.main_end_tags.pop()
+            self.main_depth -= 1
+        if normalized == "body" and self.body_depth > 0:
+            self.body_depth -= 1
+
+    def handle_data(self, data: str) -> None:
+        self._append(data)
+
+
+def _normalize_homepage_text(parts: list[str], limit: int) -> str:
+    lines: list[str] = []
+    previous = ""
+    for raw_line in re.split(r"[\r\n]+", "".join(parts)):
+        line = re.sub(r"\s+", " ", html.unescape(raw_line)).strip()
+        if not line or line == previous:
+            continue
+        lines.append(line)
+        previous = line
+    text = "\n".join(lines).strip()
+    return text[: max(1, limit)].rstrip()
+
+
+def extract_homepage_main_text(html_body: str, limit: int = 10000) -> str:
+    """Return cleaned homepage main/body text for classification model input."""
+    parser = _HomepageMainTextParser()
+    try:
+        parser.feed(html_body or "")
+        parser.close()
+    except Exception:
+        text = re.sub(
+            r"<(?:script|style|noscript|template|nav|footer|svg)\b[\s\S]*?</(?:script|style|noscript|template|nav|footer|svg)>",
+            " ",
+            html_body or "",
+            flags=re.I,
+        )
+        text = re.sub(r"<[^>]+>", "\n", text)
+        return _normalize_homepage_text([text], limit)
+
+    selected = parser.main_parts or parser.body_parts or parser.document_parts
+    return _normalize_homepage_text(selected, limit)
 
 
 def page_visible_text(html_body: str, limit: int = 12000) -> str:
@@ -1470,8 +1833,22 @@ def classify_page_state(
     visible = page_visible_text(html_body)
     visible_lower = visible.lower()
 
+    anti_bot = detect_anti_bot_page(
+        html_body,
+        page_title=title,
+        http_status=http_status,
+    )
+    if anti_bot:
+        return PageQualityAssessment(
+            anti_bot.state,
+            f"anti_bot_signature:{anti_bot.provider}:{anti_bot.code}",
+            anti_bot.evidence,
+        )
+
     if http_status in {401, 403}:
         return PageQualityAssessment("access_denied", f"http_{http_status}", title)
+    if http_status in {404, 410}:
+        return PageQualityAssessment("not_found", f"http_{http_status}", title)
     if http_status == 429:
         return PageQualityAssessment("anti_bot", "http_429", title)
     if http_status is not None and http_status >= 500 and not html_body.strip():
@@ -1487,7 +1864,6 @@ def classify_page_state(
     challenge_signatures = (
         "cf_chl_opt",
         "cf-chl-",
-        "/cdn-cgi/challenge-platform",
         "datadome-captcha",
         "_incapsula_resource",
         "imperva captcha",
@@ -1519,6 +1895,22 @@ def classify_page_state(
     if phrase:
         return PageQualityAssessment("captcha", "human_verification_body", phrase)
 
+    parked_phrases = (
+        "this domain is for sale",
+        "this domain may be for sale",
+        "buy this domain",
+        "domain is parked",
+        "domain parking",
+        "make an offer on this domain",
+        "inquire about this domain",
+    )
+    parked_phrase = next(
+        (item for item in parked_phrases if item in f"{title.lower()} {visible_lower}"),
+        "",
+    )
+    if parked_phrase:
+        return PageQualityAssessment("parked_domain", "domain_parking_signature", parked_phrase)
+
     if len(visible) < 20:
         return PageQualityAssessment("empty_page", "insufficient_visible_content", visible[:120])
     return PageQualityAssessment("valid_product_page", "usable_html", title)
@@ -1528,6 +1920,8 @@ def invalid_tool_name_reason(value: Any) -> str:
     name = clean_asset_text(value, 160)
     if not name:
         return "empty_name"
+    if re.search(r"</?(?:title|meta)\b|-->", name, re.I):
+        return "html_markup_name"
     if _CHALLENGE_TITLE_RE.search(name):
         return "anti_bot_name"
     if _ACCESS_DENIED_TITLE_RE.search(name):
@@ -1616,7 +2010,14 @@ def resolve_tool_name(
     model_source: Any = "",
     model_evidence: Any = "",
 ) -> ToolNameResolution:
-    page_title = clean_asset_text(model_page_title or read_html_title(html_body), 200)
+    deterministic_page_title = (
+        read_html_meta(html_body, {"og:title", "twitter:title"})
+        or read_html_title(html_body)
+    )
+    model_title = clean_asset_text(model_page_title, 200)
+    if re.search(r"</?(?:title|meta)\b|-->|json-ld.{0,80}hreflang", model_title, re.I):
+        model_title = ""
+    page_title = model_title or deterministic_page_title
     candidates: list[tuple[str, str, int, str]] = []
 
     for value in _json_ld_product_names(html_body):
@@ -2018,10 +2419,10 @@ def infer_unit(context: str) -> str | None:
 
 def is_polluted_context(context: str) -> bool:
     lower = context.lower()
-    return bool(
+    return has_metered_usage_charge(context) or bool(
         re.search(
             r"\b(under|shopping|purchase|cart|invoice|discount|save|coupon|refund|tax|blog|privacy|terms|"
-            r"per image|token|credit|api call|api pricing|model price)\b",
+            r"api pricing|model price)\b",
             lower,
         )
     )
@@ -2163,6 +2564,8 @@ def should_verify_rule_pricing_with_openai(
                 reasons.append("long_price_context")
             if re.search(r"\b(raise[sd]?|funding|students?|graduates?|academy|this month only|additional cost|traditional)\b", lower):
                 reasons.append("polluted_price_context")
+            if has_fixed_ai_allowance(display_text):
+                reasons.append("fixed_ai_allowance_present")
             if "\u20b9" in display_text and price.get("currency") != "INR":
                 reasons.append("currency_mismatch")
     if len(currencies) > 1:
@@ -2273,7 +2676,8 @@ def has_free_plan_signal(text: str) -> bool:
 def extract_text_plans(text: str) -> list[dict[str, Any]]:
     plans: list[dict[str, Any]] = []
     seen: set[tuple[str, str | None, str | None]] = set()
-    for match in PRICE_RE.finditer(text):
+    price_matches = list(PRICE_RE.finditer(text))
+    for match_index, match in enumerate(price_matches):
         amount = read_decimal(match.group("amount1") or match.group("amount2"))
         if amount is None:
             continue
@@ -2285,6 +2689,13 @@ def extract_text_plans(text: str) -> list[dict[str, Any]]:
         currency = normalize_currency(match.group("currency1") or match.group("currency2"))
         name = choose_plan_name(text[start:match.start()], len(plans) + 1)
         plan = normalize_pricing_plan(name, amount, currency, context, len(plans))
+        next_price_start = (
+            price_matches[match_index + 1].start()
+            if match_index + 1 < len(price_matches)
+            else len(text)
+        )
+        allowance_context = text[match.end():min(next_price_start, match.end() + 360)]
+        plan["features"] = extract_fixed_allowance_quotes(allowance_context)
         price = plan["prices"][0]
         key = (plan["name"].lower(), price["amount"], price["billing_interval"])
         if key in seen:
@@ -2591,7 +3002,10 @@ class OpenAIPricingExtractor:
                     "content": (
                         "Extract public SaaS pricing plans from the provided pricing page text. "
                         "Return only primary public package prices. Ignore discounts, trials, FAQ examples, add-ons, "
-                        "API credit tables, and unrelated comparison text unless they are the main package price. "
+                        "metered API rate tables, and unrelated comparison text unless they are the main package price. "
+                        "Fixed allowances such as included credits, tokens, generations, images, minutes, or API calls "
+                        "are normal plan features: copy their concise visible wording into features and do not classify "
+                        "the package price as usage pricing unless money is charged per usage unit. "
                         "Use at most six plans. Each plan must keep at most one primary price."
                     ),
                 },
@@ -2646,6 +3060,7 @@ class OpenAIPricingExtractor:
             for index, raw_plan in enumerate(raw_plans if isinstance(raw_plans, list) else [])
             if (normalized := normalize_openai_plan(raw_plan, index)) is not None
         ][:6]
+        feature_evidence = retain_evidenced_plan_features(plans, text)
         validation_errors = validate_pricing_plans(plans, source_url, final_url, http_status, error)
         validation_errors.extend(validate_extracted_plan_consistency(plans))
         try:
@@ -2665,6 +3080,7 @@ class OpenAIPricingExtractor:
                 "text_score": pricing_text_quality(text),
                 "final_url": final_url,
                 "notes": clean_snippet(str(parsed.get("notes") or ""), 300) if isinstance(parsed, dict) else "",
+                "feature_evidence": feature_evidence,
             },
             "extraction_method": "openai_structured",
         }
@@ -2757,15 +3173,22 @@ class CloudflareBrowserRunAssetClient:
             "Content-Type": "application/json",
         }
         self.timeout_seconds = config.browser_rendering_timeout_seconds
-        self.category_api_token = config.category_classification_api_token
-        self.category_deepseek_api_key = config.category_classification_deepseek_api_key
-        self.category_model = normalize_category_model_id(config.category_classification_model)
-        self.category_fallback_model = normalize_category_model_id(
-            config.category_classification_fallback_model
+        self.taxonomy_api_token = config.taxonomy_classification_api_token
+        self.taxonomy_deepseek_api_key = config.taxonomy_classification_deepseek_api_key
+        self.taxonomy_openai_api_key = getattr(config, "openai_api_key", "")
+        self.taxonomy_model = normalize_taxonomy_model_id(config.taxonomy_classification_model)
+        self.taxonomy_fallback_model = normalize_taxonomy_model_id(
+            config.taxonomy_classification_fallback_model
         )
+        self.taxonomy_main_content_max_chars = config.taxonomy_main_content_max_chars
+        self.taxonomy_deepseek_max_output_tokens = config.taxonomy_deepseek_max_output_tokens
         self._validated_pages: dict[int, tuple[str, str, PageQualityAssessment]] = {}
 
-    async def call_quick_action(self, endpoint: str, body: dict[str, Any]) -> Any:
+    async def call_quick_action_envelope(
+        self,
+        endpoint: str,
+        body: dict[str, Any],
+    ) -> tuple[Any, dict[str, Any]]:
         async with httpx.AsyncClient(timeout=float(self.timeout_seconds)) as client:
             response = await client.post(f"{self.endpoint_base}/{endpoint}", headers=self.headers, json=body)
         text = response.text
@@ -2775,6 +3198,7 @@ class CloudflareBrowserRunAssetClient:
             parsed = None
         if response.status_code < 200 or response.status_code >= 300 or (isinstance(parsed, dict) and parsed.get("success") is False):
             messages: list[str] = []
+            error_codes: list[int] = []
             if isinstance(parsed, dict):
                 errors = parsed.get("errors")
                 if isinstance(errors, list):
@@ -2783,6 +3207,11 @@ class CloudflareBrowserRunAssetClient:
                             continue
                         code = error.get("code")
                         message = str(error.get("message") or "").strip()
+                        try:
+                            if code is not None:
+                                error_codes.append(int(code))
+                        except (TypeError, ValueError):
+                            pass
                         if message and code is not None:
                             messages.append(f"{code}: {message}")
                         elif message:
@@ -2800,19 +3229,93 @@ class CloudflareBrowserRunAssetClient:
                 or response.status_code >= 500
                 or (200 <= response.status_code < 300 and isinstance(parsed, dict) and parsed.get("success") is False)
             )
+            error_code = f"browser_run_{error_codes[0]}" if error_codes else f"browser_run_http_{response.status_code}"
+            max_attempts: int | None = None
+            retry_after_seconds: int | None = None
+            if endpoint == "content" and 6000 in error_codes:
+                # A second attempt may succeed after the target/CDN state changes,
+                # but immediate identical retries only amplify this high-volume error.
+                retryable = True
+                max_attempts = 2
+                retry_after_seconds = HOMEPAGE_BROWSER_6000_RETRY_DELAY_SECONDS
+            elif endpoint == "content" and any(code in {2001, 5006, 6002} for code in error_codes):
+                retryable = True
             raise AssetPipelineError(
                 f"browser_run_{endpoint}_api_error: {detail}",
                 retryable=retryable,
+                error_code=error_code,
+                max_attempts=max_attempts,
+                retry_after_seconds=retry_after_seconds,
             )
-        return parsed.get("result") if isinstance(parsed, dict) and "result" in parsed else parsed
+        result = parsed.get("result") if isinstance(parsed, dict) and "result" in parsed else parsed
+        meta = parsed.get("meta") if isinstance(parsed, dict) and isinstance(parsed.get("meta"), dict) else {}
+        return result, meta
+
+    async def call_quick_action(self, endpoint: str, body: dict[str, Any]) -> Any:
+        result, _ = await self.call_quick_action_envelope(endpoint, body)
+        return result
+
+    async def fetch_structured_text_data(
+        self,
+        *,
+        source_url: str,
+        prompt: str,
+        json_schema: dict[str, Any],
+        stage: str,
+        custom_ai: list[dict[str, Any]] | None = None,
+        allow_empty_required_arrays: bool = False,
+        empty_object_means_empty_required_arrays: bool = False,
+    ) -> tuple[str, dict[str, Any]]:
+        """Classify supplied cleaned text without navigating to a model-side product URL."""
+        parsed_source = urlsplit(source_url)
+        transport_task = AssetTask(
+            tool_id=0,
+            canonical_slug="cleaned-homepage-transport",
+            normalized_domain=parsed_source.hostname or "invalid.local",
+            official_url=source_url or "https://invalid.local/",
+            attempts=0,
+            max_attempts=1,
+            generation=0,
+            lease_token="prompt-only-classification-transport",
+        )
+        log_info(
+            "classification.cleaned_text.request",
+            stage=stage,
+            source_url=source_url,
+            prompt_chars=len(prompt),
+            models=[str(item.get("model") or "") for item in (custom_ai or []) if item],
+            deepseek_thinking_requested=(
+                "disabled"
+                if any(
+                    str(item.get("model") or "").startswith("deepseek/")
+                    and item.get("thinking") == {"type": "disabled"}
+                    for item in (custom_ai or [])
+                    if item
+                )
+                else "not_applicable"
+            ),
+        )
+        _, metadata = await self.fetch_structured_asset_data(
+            transport_task,
+            prompt=prompt,
+            json_schema=json_schema,
+            stage=stage,
+            custom_ai=custom_ai,
+            allow_empty_required_arrays=allow_empty_required_arrays,
+            empty_object_means_empty_required_arrays=empty_object_means_empty_required_arrays,
+            inline_html=(
+                '<main data-classification-transport="prompt-only">'
+                "Cleaned homepage content is embedded only in the classification prompt."
+                "</main>"
+            ),
+            result_url=source_url,
+        )
+        return source_url, metadata
 
     def asset_candidate_urls(self, task: AssetTask) -> list[str]:
-        primary_url = asset_page_url(task)
-        parsed = urlsplit(primary_url)
-        candidates = [primary_url]
-        if parsed.scheme == "https":
-            candidates.append(f"http://{parsed.netloc}{parsed.path or '/'}")
-        return candidates
+        # Redirects are followed deliberately by the source fetcher. Do not send
+        # a second immediate Browser Run request to an invented HTTP downgrade.
+        return [asset_page_url(task)]
 
     def browser_payload(self, target_url: str, *, reject_heavy_resources: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
@@ -2830,20 +3333,20 @@ class CloudflareBrowserRunAssetClient:
             payload["rejectResourceTypes"] = ["image", "media", "font"]
         return payload
 
-    def category_custom_ai(self) -> list[dict[str, Any]]:
+    def taxonomy_custom_ai(self) -> list[dict[str, Any]]:
         models = list(
             dict.fromkeys(
                 filter(
                     None,
                     [
-                        normalize_category_model_id(
-                            getattr(self, "category_model", DEFAULT_CATEGORY_CLASSIFICATION_MODEL)
+                        normalize_taxonomy_model_id(
+                            getattr(self, "taxonomy_model", DEFAULT_TAXONOMY_CLASSIFICATION_MODEL)
                         ),
-                        normalize_category_model_id(
+                        normalize_taxonomy_model_id(
                             getattr(
                                 self,
-                                "category_fallback_model",
-                                DEFAULT_CATEGORY_CLASSIFICATION_FALLBACK_MODEL,
+                                "taxonomy_fallback_model",
+                                DEFAULT_TAXONOMY_CLASSIFICATION_FALLBACK_MODEL,
                             )
                         ),
                     ],
@@ -2852,12 +3355,25 @@ class CloudflareBrowserRunAssetClient:
         )
         configs: list[dict[str, Any]] = []
         for model in models:
-            token = category_model_auth_token(model, self)
+            if model.startswith("workers-ai/"):
+                log_info(
+                    "assets.taxonomy_custom_ai.exclude_untrusted_model",
+                    model=model,
+                    provider="workers-ai",
+                )
+                continue
+            token = taxonomy_model_auth_token(model, self)
             if not token:
                 log_info(
-                    "assets.category_custom_ai.skip_missing_token",
+                    "assets.taxonomy_custom_ai.skip_missing_token",
                     model=model,
-                    provider="deepseek" if model.startswith("deepseek/") else "workers-ai",
+                    provider=(
+                        "deepseek"
+                        if model.startswith("deepseek/")
+                        else "openai"
+                        if model.startswith("openai/")
+                        else "workers-ai"
+                    ),
                 )
                 continue
             item: dict[str, Any] = {
@@ -2867,8 +3383,11 @@ class CloudflareBrowserRunAssetClient:
             # Some providers (gpt-oss, deepseek) spend tokens on reasoning; request a
             # higher completion budget where Browser Run honors it.
             if "gpt-oss" in model or model.startswith("deepseek/"):
-                item["max_tokens"] = 1024
-                item["max_completion_tokens"] = 1024
+                max_output_tokens = int(getattr(self, "taxonomy_deepseek_max_output_tokens", 1024))
+                item["max_tokens"] = max_output_tokens
+                item["max_completion_tokens"] = max_output_tokens
+            if model.startswith("deepseek/"):
+                item["thinking"] = {"type": "disabled"}
             configs.append(item)
         return configs
 
@@ -2924,6 +3443,8 @@ class CloudflareBrowserRunAssetClient:
         custom_ai: list[dict[str, Any]] | None = None,
         allow_empty_required_arrays: bool = False,
         empty_object_means_empty_required_arrays: bool = False,
+        inline_html: str | None = None,
+        result_url: str | None = None,
     ) -> tuple[str, dict[str, Any]]:
         errors: list[str] = []
         retryable_errors: list[bool] = []
@@ -2936,7 +3457,12 @@ class CloudflareBrowserRunAssetClient:
         else:
             model_attempts = [None]
 
-        for target_url in self.asset_candidate_urls(task):
+        target_urls = (
+            [str(result_url or asset_page_url(task))]
+            if inline_html is not None
+            else self.asset_candidate_urls(task)
+        )
+        for target_url in target_urls:
             for ai_config in model_attempts:
                 model_name = ""
                 if ai_config and isinstance(ai_config[0], dict):
@@ -2948,8 +3474,13 @@ class CloudflareBrowserRunAssetClient:
                 )
                 request_prompt = augment_prompt_for_response_format(prompt, json_schema, response_format)
                 try:
+                    page_payload = (
+                        {"html": inline_html}
+                        if inline_html is not None
+                        else self.browser_payload(target_url)
+                    )
                     body = {
-                        **self.browser_payload(target_url),
+                        **page_payload,
                         "prompt": request_prompt,
                         "response_format": response_format,
                     }
@@ -2963,31 +3494,6 @@ class CloudflareBrowserRunAssetClient:
                         allow_empty_required_arrays=allow_empty_required_arrays,
                         empty_object_means_empty_required_arrays=empty_object_means_empty_required_arrays,
                     ):
-                        # DeepSeek often returns {"category_l1":""} when uncertain. One force-pick retry.
-                        if model_name.startswith("deepseek/") and response_format.get("type") == "json_object":
-                            force_prompt = (
-                                f"{request_prompt}\n\n"
-                                "IMPORTANT: Do not return empty strings. Choose the single best-matching slug "
-                                "from the catalog for this product homepage."
-                            )
-                            try:
-                                force_body = {
-                                    **self.browser_payload(target_url),
-                                    "prompt": force_prompt,
-                                    "response_format": response_format,
-                                    "custom_ai": ai_config,
-                                }
-                                forced = await self.call_quick_action("json", force_body)
-                                forced_meta = normalize_structured_json_payload(forced)
-                                if self.structured_payload_has_required_fields(
-                                    forced_meta,
-                                    json_schema,
-                                    allow_empty_required_arrays=allow_empty_required_arrays,
-                                    empty_object_means_empty_required_arrays=empty_object_means_empty_required_arrays,
-                                ):
-                                    return target_url, forced_meta
-                            except Exception:
-                                pass
                         log_info(
                             "assets.browser_json.empty_schema_result",
                             stage=stage,
@@ -3018,8 +3524,13 @@ class CloudflareBrowserRunAssetClient:
                                 json_schema,
                                 fallback_format,
                             )
+                            page_payload = (
+                                {"html": inline_html}
+                                if inline_html is not None
+                                else self.browser_payload(target_url)
+                            )
                             body = {
-                                **self.browser_payload(target_url),
+                                **page_payload,
                                 "prompt": fallback_prompt,
                                 "response_format": fallback_format,
                             }
@@ -3047,30 +3558,206 @@ class CloudflareBrowserRunAssetClient:
             retryable=any(retryable_errors),
         )
 
-    async def fetch_homepage_content(self, task: AssetTask) -> tuple[str, str]:
-        errors: list[str] = []
-        retryable_errors: list[bool] = []
-        for target_url in self.asset_candidate_urls(task):
-            try:
-                content = await self.call_quick_action(
-                    "content",
-                    self.browser_payload(target_url, reject_heavy_resources=True),
-                )
-                if isinstance(content, dict):
-                    html_body = str(content.get("content") or content.get("html") or "")
-                else:
-                    html_body = str(content or "")
-                if html_body.strip():
-                    return target_url, html_body
-                raise RuntimeError("content returned no HTML")
-            except Exception as error:
-                errors.append(f"{target_url}: {str(error)[:220]}")
-                retryable_errors.append(bool(getattr(error, "retryable", True)))
+    async def fetch_static_homepage_content(self, task: AssetTask) -> tuple[str, str]:
+        target_url = asset_page_url(task)
+        if not is_safe_homepage_url(target_url):
+            raise AssetPipelineError(
+                f"homepage_static_unsafe_url:{target_url[:220]}",
+                retryable=False,
+                error_code="unsafe_homepage_url",
+            )
 
-        raise AssetPipelineError(
-            "Browser Run content extraction failed. " + " | ".join(errors),
-            retryable=any(retryable_errors),
+        current_url = target_url
+        started_at = time.perf_counter()
+        try:
+            async with httpx.AsyncClient(
+                timeout=float(self.timeout_seconds),
+                follow_redirects=False,
+                headers=pricing_request_headers(target_url),
+            ) as client:
+                for redirect_count in range(HOMEPAGE_MAX_REDIRECTS + 1):
+                    response = await client.get(current_url)
+                    location = response.headers.get("location", "").strip()
+                    if response.status_code in {301, 302, 303, 307, 308} and location:
+                        next_url = urljoin(current_url, location)
+                        if not is_safe_homepage_url(next_url):
+                            raise AssetPipelineError(
+                                f"homepage_static_unsafe_redirect:{next_url[:220]}",
+                                retryable=False,
+                                error_code="unsafe_homepage_redirect",
+                            )
+                        if not homepage_urls_share_site(target_url, next_url):
+                            raise AssetPipelineError(
+                                f"homepage_static_unrelated_redirect:{target_url[:160]}->{next_url[:160]}",
+                                retryable=False,
+                                error_code="unrelated_homepage_redirect",
+                            )
+                        if redirect_count >= HOMEPAGE_MAX_REDIRECTS:
+                            raise AssetPipelineError(
+                                f"homepage_static_redirect_limit:{target_url[:220]}",
+                                retryable=True,
+                                error_code="homepage_redirect_limit",
+                            )
+                        current_url = next_url
+                        continue
+                    break
+                else:  # pragma: no cover - loop exits through a response or an exception
+                    raise AssetPipelineError("homepage_static_redirect_limit", retryable=True)
+        except AssetPipelineError:
+            raise
+        except Exception as error:
+            raise AssetPipelineError(
+                f"homepage_static_request_error:{str(error)[:300] or type(error).__name__}",
+                retryable=True,
+                error_code="homepage_static_request_error",
+            ) from error
+
+        final_url = str(response.url)
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        content_type = response.headers.get("content-type", "")
+        raw_body = response.content[:MAX_HOMEPAGE_HTML_BYTES]
+        looks_like_markup = raw_body.lstrip()[:200].lower().startswith((b"<!doctype html", b"<html", b"<?xml"))
+        html_body = ""
+        if any(kind in content_type.lower() for kind in ("html", "xml", "text")) or looks_like_markup:
+            html_body = raw_body.decode(response.encoding or "utf-8", errors="replace")
+        assessment = classify_page_state(
+            html_body,
+            page_title=read_html_title(html_body),
+            http_status=response.status_code,
         )
+        log_info(
+            "assets.homepage_static.response",
+            tool_id=task.tool_id,
+            url=target_url,
+            final_url=final_url,
+            status_code=response.status_code,
+            elapsed_ms=elapsed_ms,
+            content_type=content_type[:120],
+            page_state=assessment.state,
+        )
+
+        if assessment.state in {"not_found", "parked_domain"}:
+            raise AssetPipelineError(
+                f"homepage_static_terminal:{assessment.state}:{assessment.reason}",
+                retryable=False,
+                error_code=assessment.state,
+            )
+        if not 200 <= response.status_code < 300:
+            raise AssetPipelineError(
+                f"homepage_static_http_{response.status_code}:{assessment.state}:{assessment.reason}",
+                retryable=True,
+                error_code=f"homepage_static_http_{response.status_code}",
+            )
+        main_content = extract_homepage_main_text(html_body, limit=1000)
+        if not assessment.is_valid or len(main_content) < 80:
+            raise AssetPipelineError(
+                f"homepage_static_requires_browser:{assessment.state}:{assessment.reason}:main_chars={len(main_content)}",
+                retryable=True,
+                error_code="homepage_static_requires_browser",
+            )
+        return final_url, html_body
+
+    async def fetch_browser_homepage_content(self, task: AssetTask) -> tuple[str, str]:
+        target_url = asset_page_url(task)
+        content, meta = await self.call_quick_action_envelope(
+            "content",
+            self.browser_payload(target_url, reject_heavy_resources=True),
+        )
+        if isinstance(content, dict):
+            html_body = str(content.get("content") or content.get("html") or "")
+        else:
+            html_body = str(content or "")
+        final_url = str(meta.get("finalUrl") or target_url).strip() or target_url
+        try:
+            origin_status = int(meta.get("status")) if meta.get("status") is not None else None
+        except (TypeError, ValueError):
+            origin_status = None
+        assessment = classify_page_state(
+            html_body,
+            page_title=str(meta.get("title") or ""),
+            http_status=origin_status,
+        )
+        if not is_safe_homepage_url(final_url):
+            raise AssetPipelineError(
+                f"homepage_browser_unsafe_final_url:{final_url[:220]}",
+                retryable=False,
+                error_code="unsafe_homepage_final_url",
+            )
+        if not homepage_urls_share_site(target_url, final_url):
+            raise AssetPipelineError(
+                f"homepage_browser_unrelated_redirect:{target_url[:160]}->{final_url[:160]}",
+                retryable=False,
+                error_code="unrelated_homepage_redirect",
+            )
+        if assessment.state in {"not_found", "parked_domain"}:
+            raise AssetPipelineError(
+                f"homepage_browser_terminal:{assessment.state}:{assessment.reason}",
+                retryable=False,
+                error_code=assessment.state,
+            )
+        if not assessment.is_valid:
+            raise AssetPipelineError(
+                f"homepage_browser_invalid:{assessment.state}:{assessment.reason}",
+                retryable=assessment.state in {"anti_bot", "access_denied", "captcha", "empty_page", "error_page"},
+                error_code=f"homepage_browser_{assessment.state}",
+            )
+        log_info(
+            "assets.homepage_browser.success",
+            tool_id=task.tool_id,
+            url=target_url,
+            final_url=final_url,
+            origin_status=origin_status,
+            page_state=assessment.state,
+        )
+        return final_url, html_body
+
+    async def fetch_homepage_content(self, task: AssetTask) -> tuple[str, str]:
+        static_error: Exception | None = None
+        try:
+            final_url, html_body = await self.fetch_static_homepage_content(task)
+            log_info(
+                "assets.homepage_fetch.success",
+                tool_id=task.tool_id,
+                transport="static_http",
+                final_url=final_url,
+            )
+            return final_url, html_body
+        except AssetPipelineError as error:
+            static_error = error
+            if not error.retryable:
+                raise
+            log_info(
+                "assets.homepage_static.fallback",
+                tool_id=task.tool_id,
+                error=str(error)[:300],
+            )
+        except Exception as error:  # defensive: a static transport defect must not suppress Browser Run
+            static_error = error
+            log_info(
+                "assets.homepage_static.fallback",
+                tool_id=task.tool_id,
+                error=str(error)[:300] or type(error).__name__,
+            )
+
+        try:
+            final_url, html_body = await self.fetch_browser_homepage_content(task)
+            log_info(
+                "assets.homepage_fetch.success",
+                tool_id=task.tool_id,
+                transport="browser_run",
+                final_url=final_url,
+            )
+            return final_url, html_body
+        except Exception as browser_error:
+            static_detail = str(static_error)[:260] if static_error else "not_attempted"
+            browser_detail = str(browser_error)[:320] or type(browser_error).__name__
+            raise AssetPipelineError(
+                f"homepage_content_failed:static={static_detail};browser={browser_detail}",
+                retryable=bool(getattr(browser_error, "retryable", True)),
+                error_code=str(getattr(browser_error, "error_code", "") or "homepage_browser_failed"),
+                max_attempts=getattr(browser_error, "max_attempts", None),
+                retry_after_seconds=getattr(browser_error, "retry_after_seconds", None),
+            ) from browser_error
 
     async def preflight_homepage(self, task: AssetTask) -> PageQualityAssessment:
         cached = getattr(self, "_validated_pages", {}).get(task.tool_id)
@@ -3169,6 +3856,12 @@ class CloudflareBrowserRunAssetClient:
             model_source=metadata.get("name_source"),
             model_evidence=metadata.get("name_evidence"),
         )
+        if not description:
+            description = deterministic_fallback_description(
+                task,
+                html_body,
+                resolution.product_name,
+            )
         content_safety = assess_content_safety(
             html_body,
             task.normalized_domain,
@@ -3245,194 +3938,6 @@ class CloudflareBrowserRunAssetClient:
             key_features=key_features,
             metadata_error="" if key_features else "features_empty",
             metadata_retryable=True,
-        )
-
-    async def fetch_homepage_categories(
-        self,
-        task: AssetTask,
-        category_options: list[str] | list[CategoryCatalogEntry],
-    ) -> AssetFetchResult:
-        entries = normalize_category_catalog(category_options)
-        model_chain = [item["model"] for item in self.category_custom_ai()]
-        custom_ai = self.category_custom_ai()
-        taxonomy_version = category_catalog_version(entries)
-        parents = [entry for entry in entries if not entry.parent_slug]
-        parent_by_slug = {entry.slug: entry for entry in parents}
-        children_by_parent: dict[str, list[CategoryCatalogEntry]] = {}
-        for entry in entries:
-            if entry.parent_slug in parent_by_slug:
-                children_by_parent.setdefault(entry.parent_slug, []).append(entry)
-
-        if not entries:
-            raw_output = json.dumps(
-                {
-                    "prompt_version": CATEGORY_CLASSIFICATION_PROMPT_VERSION,
-                    "taxonomy_version": taxonomy_version,
-                    "model_chain": model_chain,
-                    "error": "category_catalog_empty",
-                },
-                separators=(",", ":"),
-            )
-            return AssetFetchResult(
-                final_url=asset_page_url(task),
-                category_raw_output=raw_output,
-                metadata_error="category_catalog_empty",
-                metadata_retryable=False,
-            )
-
-        if not children_by_parent:
-            valid_categories = {entry.slug for entry in entries}
-            final_url, metadata = await self.fetch_structured_asset_data(
-                task,
-                stage="category",
-                prompt=build_category_classification_prompt(entries),
-                json_schema={
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "category_l1": {"type": "string"},
-                        "category_l2": {"type": "string"},
-                    },
-                    "required": ["category_l1", "category_l2"],
-                },
-                custom_ai=custom_ai,
-            )
-            extracted_category_l1 = clean_category_slug(metadata.get("category_l1"))
-            extracted_category_l2 = clean_category_slug(metadata.get("category_l2"))
-            category_l1 = extracted_category_l1 if extracted_category_l1 in valid_categories else ""
-            category_l2 = extracted_category_l2 if extracted_category_l2 in valid_categories else ""
-            rejected = [
-                slug
-                for slug in (extracted_category_l1, extracted_category_l2)
-                if slug and slug not in valid_categories
-            ]
-            metadata_error = ""
-            if not category_l1 and not category_l2:
-                metadata_error = (
-                    "category_unmatched=" + ",".join(rejected)
-                    if rejected
-                    else "category_empty"
-                )
-            raw_output = json.dumps(
-                {
-                    "prompt_version": CATEGORY_CLASSIFICATION_PROMPT_VERSION,
-                    "taxonomy_version": taxonomy_version,
-                    "model_chain": model_chain,
-                    "mode": "flat_fallback",
-                    "category_l1": extracted_category_l1 or str(metadata.get("category_l1") or ""),
-                    "category_l2": extracted_category_l2 or str(metadata.get("category_l2") or ""),
-                    "accepted_l1": category_l1,
-                    "accepted_l2": category_l2,
-                    "error": metadata_error,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            return AssetFetchResult(
-                final_url=final_url,
-                category_l1=category_l1,
-                category_l2=category_l2,
-                category_raw_output=raw_output,
-                metadata_error=metadata_error,
-                metadata_retryable=True,
-            )
-
-        final_url, l1_metadata = await self.fetch_structured_asset_data(
-            task,
-            stage="category_l1",
-            prompt=build_category_l1_prompt(parents),
-            json_schema={
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {"category_l1": {"type": "string"}},
-                "required": ["category_l1"],
-            },
-            custom_ai=custom_ai,
-        )
-        extracted_category_l1 = clean_category_slug(l1_metadata.get("category_l1"))
-        category_l1 = extracted_category_l1 if extracted_category_l1 in parent_by_slug else ""
-        if not category_l1:
-            metadata_error = (
-                f"category_l1_unmatched={extracted_category_l1}"
-                if extracted_category_l1
-                else "category_l1_empty"
-            )
-            raw_output = json.dumps(
-                {
-                    "prompt_version": CATEGORY_CLASSIFICATION_PROMPT_VERSION,
-                    "taxonomy_version": taxonomy_version,
-                    "model_chain": model_chain,
-                    "mode": "hierarchical",
-                    "l1": l1_metadata,
-                    "accepted_l1": "",
-                    "accepted_l2": "",
-                    "error": metadata_error,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            return AssetFetchResult(
-                final_url=final_url,
-                category_raw_output=raw_output,
-                metadata_error=metadata_error,
-                metadata_retryable=True,
-            )
-
-        parent = parent_by_slug[category_l1]
-        children = children_by_parent.get(category_l1, [])
-        l2_metadata: dict[str, Any] = {}
-        category_l2 = ""
-        l2_error = ""
-        l2_retryable = True
-        if children:
-            try:
-                final_url, l2_metadata = await self.fetch_structured_asset_data(
-                    task,
-                    stage="category_l2",
-                    prompt=build_category_l2_prompt(parent, children),
-                    json_schema={
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {"category_l2": {"type": "string"}},
-                        "required": ["category_l2"],
-                    },
-                    custom_ai=custom_ai,
-                )
-                extracted_category_l2 = clean_category_slug(l2_metadata.get("category_l2"))
-                valid_children = {entry.slug for entry in children}
-                category_l2 = extracted_category_l2 if extracted_category_l2 in valid_children else ""
-                if extracted_category_l2 and not category_l2:
-                    l2_error = f"category_l2_unmatched={extracted_category_l2}"
-                elif not extracted_category_l2:
-                    l2_error = "category_l2_empty"
-            except Exception as error:
-                l2_error = str(error)[:500] or type(error).__name__
-                l2_retryable = bool(getattr(error, "retryable", True))
-                l2_metadata = {"error": l2_error}
-
-        raw_output = json.dumps(
-            {
-                "prompt_version": CATEGORY_CLASSIFICATION_PROMPT_VERSION,
-                "taxonomy_version": taxonomy_version,
-                "model_chain": model_chain,
-                "mode": "hierarchical",
-                "l1": l1_metadata,
-                "l2": l2_metadata,
-                "accepted_l1": category_l1,
-                "accepted_l2": category_l2,
-                "l2_error": l2_error,
-                "error": l2_error,
-            },
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        return AssetFetchResult(
-            final_url=final_url,
-            category_l1=category_l1,
-            category_l2=category_l2,
-            category_raw_output=raw_output,
-            metadata_error=l2_error,
-            metadata_retryable=l2_retryable,
         )
 
     async def capture_homepage_screenshot(self, task: AssetTask) -> AssetFetchResult:
@@ -4215,9 +4720,47 @@ def find_rdap_base_urls(domain: str, bootstrap: dict[str, Any]) -> list[str]:
     return best_urls
 
 
+class AsyncRequestPacer:
+    """Space request starts evenly so a concurrent batch cannot burst the provider."""
+
+    def __init__(self, requests_per_minute: int) -> None:
+        bounded_rate = min(
+            AHREFS_MAX_REQUESTS_PER_MINUTE,
+            max(1, int(requests_per_minute)),
+        )
+        self.requests_per_minute = bounded_rate
+        self.interval_seconds = 60.0 / bounded_rate
+        self._next_request_at = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            now = time.monotonic()
+            scheduled_at = max(now, self._next_request_at)
+            self._next_request_at = scheduled_at + self.interval_seconds
+            delay = scheduled_at - now
+        if delay > 0:
+            await asyncio.sleep(delay)
+
+
+def parse_retry_after_seconds(value: str | None, default: float = 60.0) -> float:
+    if not value:
+        return default
+    try:
+        return max(1.0, float(value.strip()))
+    except (TypeError, ValueError):
+        return default
+
+
 class DomainStateClient:
-    def __init__(self, ahref_api_key: str) -> None:
+    def __init__(
+        self,
+        ahref_api_key: str,
+        requests_per_minute: int = AHREFS_DEFAULT_REQUESTS_PER_MINUTE,
+        request_pacer: Any | None = None,
+    ) -> None:
         self.ahref_api_key = ahref_api_key.strip()
+        self.request_pacer = request_pacer or AsyncRequestPacer(requests_per_minute)
 
     async def fetch(
         self,
@@ -4260,6 +4803,9 @@ class DomainStateClient:
             error=error,
             rdap_status=rdap_result.status if rdap_result is not None else None,
             rdap_error=rdap_result.error if rdap_result is not None else None,
+            retry_after_seconds=(
+                ahrefs_result.retry_after_seconds if ahrefs_result is not None else None
+            ),
         )
 
     async def fetch_ahrefs_domain_rating(self, domain: str) -> DomainStateResult:
@@ -4270,6 +4816,7 @@ class DomainStateClient:
             raise RuntimeError("AHREF_API_KEY is required for Ahrefs Domain Rating requests")
 
         endpoint = httpx.URL(AHREFS_DOMAIN_RATING_URL).copy_add_param("target", clean_domain)
+        await self.request_pacer.wait()
         try:
             async with httpx.AsyncClient(timeout=25.0) as client:
                 response = await client.get(
@@ -4284,6 +4831,16 @@ class DomainStateClient:
 
         if response.status_code == 404:
             return DomainStateResult(status="no_data", domain_rating=None, domain_created_at=None, error="ahrefs_not_found")
+        if response.status_code == 429:
+            return DomainStateResult(
+                status="failed",
+                domain_rating=None,
+                domain_created_at=None,
+                error=f"Ahrefs HTTP 429: {response.text[:300]}",
+                retry_after_seconds=parse_retry_after_seconds(
+                    response.headers.get("retry-after")
+                ),
+            )
         if not response.is_success:
             raise RuntimeError(f"Ahrefs HTTP {response.status_code}: {response.text[:300]}")
 
@@ -4771,7 +5328,7 @@ class D1Client:
 
     async def insert_result(self, task: TrafficTask, result: FetchResult) -> None:
         rows = result.monthly_rows or [{"traffic_month": task.traffic_month}]
-        log_info(
+        log_debug(
             "d1.insert_result.start",
             domain=task.normalized_domain,
             traffic_month=task.traffic_month,
@@ -4805,7 +5362,7 @@ class D1Client:
                 projection_rows,
             )
             await self.upsert_tool_traffic_monthly(task.normalized_domain, result.monthly_rows)
-        log_info(
+        log_debug(
             "d1.insert_result.done",
             domain=task.normalized_domain,
             traffic_month=task.traffic_month,
@@ -5227,21 +5784,23 @@ MARKET_SNAPSHOT_PUBLIC_TOOL_PREDICATE = """
 MARKET_VISIBLE_TOOLS_CTES = """
 visible_tools_ranked AS (
   SELECT
-    id,
-    lower(trim(normalized_domain)) AS normalized_domain,
-    primary_category_id,
+    tool.id,
+    lower(trim(tool.normalized_domain)) AS normalized_domain,
+    primary_taxonomy.term_id AS primary_term_id,
     row_number() OVER (
-      PARTITION BY lower(trim(normalized_domain))
-      ORDER BY coalesce(first_published_at, listed_at) ASC, id ASC
+      PARTITION BY lower(trim(tool.normalized_domain))
+      ORDER BY coalesce(tool.first_published_at, tool.listed_at) ASC, tool.id ASC
     ) AS domain_row
-  FROM tools
-  WHERE status = 'published'
-    AND content_safety_status = 'safe'
-    AND duplicate_of_tool_id IS NULL
-    AND verification_status IN ('verified', 'pending')
-    AND staleness_status IN ('fresh', 'aging')
+  FROM tools tool
+  LEFT JOIN current_tool_primary_taxonomy primary_taxonomy
+    ON primary_taxonomy.tool_id = tool.id
+  WHERE tool.status = 'published'
+    AND tool.content_safety_status = 'safe'
+    AND tool.duplicate_of_tool_id IS NULL
+    AND tool.verification_status IN ('verified', 'pending')
+    AND tool.staleness_status IN ('fresh', 'aging')
 ), visible_tools AS (
-  SELECT id, normalized_domain, primary_category_id
+  SELECT id, normalized_domain, primary_term_id
   FROM visible_tools_ranked
   WHERE domain_row = 1
 )
@@ -5375,16 +5934,16 @@ async def build_market_snapshot_facet_rollups_from_d1(
     await d1.batch(
         [
             (
-                "DELETE FROM market_snapshot_facet_rollups WHERE snapshot_id = ?",
+                "DELETE FROM taxonomy_market_snapshot_facet_rollups WHERE snapshot_id = ?",
                 [snapshot_id],
             ),
             (
                 f"""
-                INSERT INTO market_snapshot_facet_rollups (
-                  snapshot_id, primary_category_id, primary_category_value,
+                INSERT INTO taxonomy_market_snapshot_facet_rollups (
+                  snapshot_id, primary_term_id, primary_term_value,
                   country_code, tool_count, built_at
                 )
-                SELECT ?, 0, '', '', count(*), ?
+                SELECT ?, NULL, '', '', count(*), ?
                 FROM tool_market_snapshots snapshot
                 JOIN tools t ON t.id = snapshot.tool_id
                 JOIN market_catalog_eligibility_revision revision
@@ -5397,28 +5956,28 @@ async def build_market_snapshot_facet_rollups_from_d1(
             ),
             (
                 f"""
-                INSERT INTO market_snapshot_facet_rollups (
-                  snapshot_id, primary_category_id, primary_category_value,
+                INSERT INTO taxonomy_market_snapshot_facet_rollups (
+                  snapshot_id, primary_term_id, primary_term_value,
                   country_code, tool_count, built_at
                 )
                 SELECT
                   snapshot.snapshot_id,
-                  snapshot.primary_category_id,
-                  category.canonical_slug,
+                  snapshot.primary_term_id,
+                  term.slug,
                   '',
                   count(*),
                   ?
                 FROM tool_market_snapshots snapshot
                 JOIN tools t ON t.id = snapshot.tool_id
-                JOIN categories category ON category.id = snapshot.primary_category_id
+                JOIN taxonomy_terms term ON term.id = snapshot.primary_term_id
                 JOIN market_catalog_eligibility_revision revision
                   ON revision.id = 1 AND revision.revision = ?
                 WHERE snapshot.snapshot_id = ?
                   AND {MARKET_SNAPSHOT_PUBLIC_TOOL_PREDICATE}
                 GROUP BY
                   snapshot.snapshot_id,
-                  snapshot.primary_category_id,
-                  category.canonical_slug
+                  snapshot.primary_term_id,
+                  term.slug
                 """,
                 [built_at, catalog_eligibility_revision, snapshot_id],
             ),
@@ -5427,8 +5986,8 @@ async def build_market_snapshot_facet_rollups_from_d1(
                 WITH country_domains AS (
                   SELECT
                     country.snapshot_id,
-                    snapshot.primary_category_id,
-                    category.canonical_slug AS primary_category_value,
+                    snapshot.primary_term_id,
+                    term.slug AS primary_term_value,
                     country.country_code,
                     country.normalized_domain,
                     max(country.estimated_visits) AS estimated_visits,
@@ -5438,20 +5997,20 @@ async def build_market_snapshot_facet_rollups_from_d1(
                     ON snapshot.snapshot_id = country.snapshot_id
                    AND snapshot.tool_id = country.tool_id
                   JOIN tools t ON t.id = snapshot.tool_id
-                  LEFT JOIN categories category ON category.id = snapshot.primary_category_id
+                  LEFT JOIN taxonomy_terms term ON term.id = snapshot.primary_term_id
                   JOIN market_catalog_eligibility_revision revision
                     ON revision.id = 1 AND revision.revision = ?
                   WHERE country.snapshot_id = ?
                     AND {MARKET_SNAPSHOT_PUBLIC_TOOL_PREDICATE}
                   GROUP BY
                     country.snapshot_id,
-                    snapshot.primary_category_id,
-                    category.canonical_slug,
+                    snapshot.primary_term_id,
+                    term.slug,
                     country.country_code,
                     country.normalized_domain
                 )
-                INSERT INTO market_snapshot_facet_rollups (
-                  snapshot_id, primary_category_id, primary_category_value,
+                INSERT INTO taxonomy_market_snapshot_facet_rollups (
+                  snapshot_id, primary_term_id, primary_term_value,
                   country_code, tool_count,
                   country_estimated_visits, country_estimated_ai_visits,
                   country_estimated_visits_unknown_count,
@@ -5460,7 +6019,7 @@ async def build_market_snapshot_facet_rollups_from_d1(
                 )
                 SELECT
                   snapshot_id,
-                  0,
+                  NULL,
                   '',
                   country_code,
                   count(*),
@@ -5474,8 +6033,8 @@ async def build_market_snapshot_facet_rollups_from_d1(
                 UNION ALL
                 SELECT
                   snapshot_id,
-                  primary_category_id,
-                  primary_category_value,
+                  primary_term_id,
+                  primary_term_value,
                   country_code,
                   count(*),
                   sum(estimated_visits),
@@ -5484,12 +6043,12 @@ async def build_market_snapshot_facet_rollups_from_d1(
                   sum(CASE WHEN estimated_ai_visits IS NULL THEN 1 ELSE 0 END),
                   ?
                 FROM country_domains
-                WHERE primary_category_id IS NOT NULL
-                  AND primary_category_value IS NOT NULL
+                WHERE primary_term_id IS NOT NULL
+                  AND primary_term_value IS NOT NULL
                 GROUP BY
                   snapshot_id,
-                  primary_category_id,
-                  primary_category_value,
+                  primary_term_id,
+                  primary_term_value,
                   country_code
                 """,
                 [
@@ -5515,7 +6074,7 @@ async def get_market_snapshot_coverage(d1: D1Client, snapshot_id: int) -> dict[s
           coalesce(sum(CASE WHEN ai_visits IS NOT NULL THEN 1 ELSE 0 END), 0) AS ai_tools,
           coalesce(sum(CASE WHEN domain_rating IS NOT NULL THEN 1 ELSE 0 END), 0) AS dr_tools,
           coalesce(sum(CASE WHEN domain_rating_change IS NOT NULL THEN 1 ELSE 0 END), 0) AS dr_comparable_tools,
-          coalesce(sum(CASE WHEN primary_category_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS category_tools,
+          coalesce(sum(CASE WHEN primary_term_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS category_tools,
           (
             SELECT count(*)
             FROM tool_country_market_snapshots country
@@ -5556,7 +6115,7 @@ async def get_market_snapshot_coverage(d1: D1Client, snapshot_id: int) -> dict[s
               ON country_snapshot.snapshot_id = country.snapshot_id
              AND country_snapshot.tool_id = country.tool_id
             WHERE country.snapshot_id = target.snapshot_id
-              AND country_snapshot.primary_category_id IS NOT NULL
+              AND country_snapshot.primary_term_id IS NOT NULL
           ) AS country_category_rows,
           coalesce((
             SELECT version.catalog_eligibility_revision
@@ -5570,77 +6129,77 @@ async def get_market_snapshot_coverage(d1: D1Client, snapshot_id: int) -> dict[s
           ), -1) AS current_catalog_eligibility_revision,
           (
             SELECT count(*)
-            FROM market_snapshot_facet_rollups rollup
+            FROM taxonomy_market_snapshot_facet_rollups rollup
             WHERE rollup.snapshot_id = target.snapshot_id
           ) AS facet_rollup_rows,
           (
             SELECT count(*)
-            FROM market_snapshot_facet_rollups rollup
+            FROM taxonomy_market_snapshot_facet_rollups rollup
             WHERE rollup.snapshot_id = target.snapshot_id
-              AND rollup.primary_category_id = 0
+              AND rollup.primary_term_id IS NULL
               AND rollup.country_code = ''
           ) AS facet_rollup_global_rows,
           coalesce((
             SELECT rollup.tool_count
-            FROM market_snapshot_facet_rollups rollup
+            FROM taxonomy_market_snapshot_facet_rollups rollup
             WHERE rollup.snapshot_id = target.snapshot_id
-              AND rollup.primary_category_id = 0
+              AND rollup.primary_term_id IS NULL
               AND rollup.country_code = ''
           ), 0) AS facet_rollup_global_tools,
           (
             SELECT count(*)
-            FROM market_snapshot_facet_rollups rollup
+            FROM taxonomy_market_snapshot_facet_rollups rollup
             WHERE rollup.snapshot_id = target.snapshot_id
-              AND rollup.primary_category_id > 0
+              AND rollup.primary_term_id IS NOT NULL
               AND rollup.country_code = ''
           ) AS facet_rollup_category_rows,
           coalesce((
             SELECT sum(rollup.tool_count)
-            FROM market_snapshot_facet_rollups rollup
+            FROM taxonomy_market_snapshot_facet_rollups rollup
             WHERE rollup.snapshot_id = target.snapshot_id
-              AND rollup.primary_category_id > 0
+              AND rollup.primary_term_id IS NOT NULL
               AND rollup.country_code = ''
           ), 0) AS facet_rollup_category_tools,
           (
             SELECT count(*)
-            FROM market_snapshot_facet_rollups rollup
+            FROM taxonomy_market_snapshot_facet_rollups rollup
             WHERE rollup.snapshot_id = target.snapshot_id
-              AND rollup.primary_category_id = 0
+              AND rollup.primary_term_id IS NULL
               AND rollup.country_code <> ''
           ) AS facet_rollup_country_rows,
           coalesce((
             SELECT sum(rollup.tool_count)
-            FROM market_snapshot_facet_rollups rollup
+            FROM taxonomy_market_snapshot_facet_rollups rollup
             WHERE rollup.snapshot_id = target.snapshot_id
-              AND rollup.primary_category_id = 0
+              AND rollup.primary_term_id IS NULL
               AND rollup.country_code <> ''
           ), 0) AS facet_rollup_country_tools,
           coalesce((
             SELECT sum(rollup.country_estimated_visits_unknown_count)
-            FROM market_snapshot_facet_rollups rollup
+            FROM taxonomy_market_snapshot_facet_rollups rollup
             WHERE rollup.snapshot_id = target.snapshot_id
-              AND rollup.primary_category_id = 0
+              AND rollup.primary_term_id IS NULL
               AND rollup.country_code <> ''
           ), 0) AS facet_rollup_country_estimated_unknown_rows,
           coalesce((
             SELECT sum(rollup.country_estimated_ai_visits_unknown_count)
-            FROM market_snapshot_facet_rollups rollup
+            FROM taxonomy_market_snapshot_facet_rollups rollup
             WHERE rollup.snapshot_id = target.snapshot_id
-              AND rollup.primary_category_id = 0
+              AND rollup.primary_term_id IS NULL
               AND rollup.country_code <> ''
           ), 0) AS facet_rollup_country_ai_unknown_rows,
           (
             SELECT count(*)
-            FROM market_snapshot_facet_rollups rollup
+            FROM taxonomy_market_snapshot_facet_rollups rollup
             WHERE rollup.snapshot_id = target.snapshot_id
-              AND rollup.primary_category_id > 0
+              AND rollup.primary_term_id IS NOT NULL
               AND rollup.country_code <> ''
           ) AS facet_rollup_category_country_rows,
           coalesce((
             SELECT sum(rollup.tool_count)
-            FROM market_snapshot_facet_rollups rollup
+            FROM taxonomy_market_snapshot_facet_rollups rollup
             WHERE rollup.snapshot_id = target.snapshot_id
-              AND rollup.primary_category_id > 0
+              AND rollup.primary_term_id IS NOT NULL
               AND rollup.country_code <> ''
           ), 0) AS facet_rollup_category_country_tools
         FROM target
@@ -6028,7 +6587,7 @@ async def build_market_snapshot_from_d1(
                AND baseline.baseline_row = 1
             )
             INSERT INTO tool_market_snapshots (
-              snapshot_id, tool_id, normalized_domain, primary_category_id,
+              snapshot_id, tool_id, normalized_domain, primary_term_id,
               visits, previous_visits, visits_change, visits_growth_rate,
               search_share_bps, organic_search_share_bps, paid_search_share_bps,
               search_visits, paid_search_visits,
@@ -6042,7 +6601,7 @@ async def build_market_snapshot_from_d1(
               ?,
               tool.id,
               tool.normalized_domain,
-              tool.primary_category_id,
+              tool.primary_term_id,
               current.visits,
               baseline.visits,
               CASE WHEN current.visits IS NOT NULL AND baseline.visits IS NOT NULL
@@ -6234,17 +6793,27 @@ async def preview_market_snapshot(
 
 
 class RunnerTelemetry:
-    BASE_WORKLOADS = ["assets", "traffic", "domain_state", "pricing", "enrichment"]
+    BASE_WORKLOADS = [
+        "assets",
+        "traffic",
+        "domain_state",
+        "pricing",
+        "enrichment",
+        "catalog_publish",
+    ]
 
-    def __init__(self, d1: D1Client, config: Config):
+    def __init__(self, d1: D1Client, config: Config, workload: str | None = None):
         self.d1 = d1
         self.instance_id = config.runner_instance_id
         self.version = config.runner_version
-        self.workloads = list(self.BASE_WORKLOADS)
-        if getattr(config, "taxonomy_auto_enabled", False):
+        self.service = getattr(config, "runner_service_name", "tool-data-runner")
+        self.workload = workload
+        configured_workloads = tuple(getattr(config, "runner_workloads", ()) or ())
+        self.workloads = list(configured_workloads or ([workload] if workload else self.BASE_WORKLOADS))
+        if not configured_workloads and workload is None and getattr(config, "taxonomy_auto_enabled", False):
             self.workloads.insert(-1, "taxonomy")
 
-    async def start(self, workload: str) -> int:
+    async def register(self) -> None:
         now = utc_now_iso()
         await self.d1.run(
             """
@@ -6252,16 +6821,21 @@ class RunnerTelemetry:
               instance_id, service, version, status, workloads_json,
               started_at, last_heartbeat_at, last_error, metadata_json, updated_at
             )
-            VALUES (?, 'tool-data-runner', ?, 'healthy', ?, ?, ?, NULL, '{}', ?)
+            VALUES (?, ?, ?, 'healthy', ?, ?, ?, NULL, '{}', ?)
             ON CONFLICT(instance_id) DO UPDATE SET
+              service = excluded.service,
               version = excluded.version,
               workloads_json = excluded.workloads_json,
               last_heartbeat_at = excluded.last_heartbeat_at,
               stopped_at = NULL,
               updated_at = excluded.updated_at
             """,
-            [self.instance_id, self.version, json.dumps(self.workloads), now, now, now],
+            [self.instance_id, self.service, self.version, json.dumps(self.workloads), now, now, now],
         )
+
+    async def start(self, workload: str) -> int:
+        now = utc_now_iso()
+        await self.register()
         rows = await self.d1.query(
             """
             INSERT INTO runner_runs (instance_id, workload, status, started_at, counts_json)
@@ -6280,7 +6854,12 @@ class RunnerTelemetry:
         counts_json = json.dumps(counts, sort_keys=True)
         degraded_counts = {
             key: int(counts.get(key) or 0)
-            for key in ("failed", "materialization_failed", "stale")
+            for key in (
+                "failed",
+                "materialization_failed",
+                "stale",
+                "auto_publish_failed",
+            )
             if int(counts.get(key) or 0) > 0
         }
         health_error = error
@@ -6289,6 +6868,41 @@ class RunnerTelemetry:
                 f"{key}={value}" for key, value in degraded_counts.items()
             )
         status = "failed" if health_error else "succeeded"
+        workload_values = ", ".join("(?)" for _ in self.workloads)
+        latest_health_sql = f"""
+                WITH workloads(workload) AS (
+                  VALUES {workload_values}
+                ),
+                latest_health AS (
+                  SELECT EXISTS (
+                    SELECT 1
+                    FROM workloads workload
+                    WHERE (
+                      SELECT latest.status
+                      FROM runner_runs latest
+                      WHERE latest.instance_id = ?
+                        AND latest.workload = workload.workload
+                      ORDER BY latest.id DESC
+                      LIMIT 1
+                    ) = 'failed'
+                  ) AS has_failed
+                )
+                UPDATE runner_instances
+                SET status = CASE
+                      WHEN ? IS NOT NULL THEN 'degraded'
+                      WHEN (SELECT has_failed FROM latest_health) = 1 THEN 'degraded'
+                      ELSE 'healthy'
+                    END,
+                    last_heartbeat_at = ?,
+                    last_success_at = CASE WHEN ? IS NULL THEN ? ELSE last_success_at END,
+                    last_error = CASE
+                      WHEN ? IS NOT NULL THEN ?
+                      WHEN (SELECT has_failed FROM latest_health) = 1 THEN last_error
+                      ELSE NULL
+                    END,
+                    updated_at = ?
+                WHERE instance_id = ?
+                """
         statements: list[tuple[str, list[Any]]] = [
             (
                 """
@@ -6299,52 +6913,16 @@ class RunnerTelemetry:
                 [status, now, counts_json, health_error, run_id, self.instance_id],
             ),
             (
-                """
-                UPDATE runner_instances
-                SET status = CASE
-                      WHEN ? IS NOT NULL THEN 'degraded'
-                      WHEN EXISTS (
-                        SELECT 1
-                        FROM runner_runs latest
-                        WHERE latest.instance_id = ? AND latest.status = 'failed'
-                          AND latest.id = (
-                            SELECT max(candidate.id)
-                            FROM runner_runs candidate
-                            WHERE candidate.instance_id = latest.instance_id
-                              AND candidate.workload = latest.workload
-                          )
-                      ) THEN 'degraded'
-                      ELSE 'healthy'
-                    END,
-                    last_heartbeat_at = ?,
-                    last_success_at = CASE WHEN ? IS NULL THEN ? ELSE last_success_at END,
-                    last_error = CASE
-                      WHEN ? IS NOT NULL THEN ?
-                      WHEN EXISTS (
-                        SELECT 1
-                        FROM runner_runs latest
-                        WHERE latest.instance_id = ? AND latest.status = 'failed'
-                          AND latest.id = (
-                            SELECT max(candidate.id)
-                            FROM runner_runs candidate
-                            WHERE candidate.instance_id = latest.instance_id
-                              AND candidate.workload = latest.workload
-                          )
-                      ) THEN last_error
-                      ELSE NULL
-                    END,
-                    updated_at = ?
-                WHERE instance_id = ?
-                """,
+                latest_health_sql,
                 [
-                    health_error,
+                    *self.workloads,
                     self.instance_id,
+                    health_error,
                     now,
                     health_error,
                     now,
                     health_error,
                     health_error,
-                    self.instance_id,
                     now,
                     self.instance_id,
                 ],
@@ -6352,16 +6930,200 @@ class RunnerTelemetry:
         ]
         await self.d1.batch(statements)
 
-    async def heartbeat(self) -> None:
+    async def heartbeat(self, metadata: dict[str, Any] | None = None) -> None:
         now = utc_now_iso()
+        heartbeat_metadata: dict[str, Any] = {"process_heartbeat_at": now}
+        heartbeat_metadata.update(metadata or {})
+        metadata_patch = json.dumps(heartbeat_metadata, sort_keys=True)
         await self.d1.run(
             """
             UPDATE runner_instances
-            SET last_heartbeat_at = ?, updated_at = ?
+            SET last_heartbeat_at = ?,
+                metadata_json = CASE
+                  WHEN ? IS NULL THEN json_patch(coalesce(metadata_json, '{}'), ?)
+                  ELSE json_set(
+                    json_patch(coalesce(metadata_json, '{}'), ?),
+                    '$.workload_heartbeats.' || ?,
+                    ?
+                  )
+                END,
+                updated_at = ?
             WHERE instance_id = ?
             """,
-            [now, now, self.instance_id],
+            [
+                now,
+                self.workload,
+                metadata_patch,
+                metadata_patch,
+                self.workload,
+                now,
+                now,
+                self.instance_id,
+            ],
         )
+
+
+def accepted_primary_taxonomy_predicate(tool_alias: str) -> str:
+    if tool_alias not in {"t", "tools"}:
+        raise ValueError("Unsupported tools table alias")
+    return f"""
+      EXISTS (
+        SELECT 1
+        FROM product_taxonomy_assignments assignment
+        JOIN taxonomy_terms term
+          ON term.id = assignment.term_id
+         AND term.dimension = 'primary_category'
+         AND term.status = 'active'
+        WHERE assignment.tool_id = {tool_alias}.id
+          AND assignment.is_primary = 1
+          AND assignment.decision_status IN ('verified', 'auto_accepted')
+          AND NOT EXISTS (
+            SELECT 1
+            FROM taxonomy_terms active_child
+            WHERE active_child.parent_id = term.id
+              AND active_child.dimension = 'primary_category'
+              AND active_child.status = 'active'
+          )
+      )
+    """
+
+
+def tool_live_ready_predicate(tool_alias: str) -> str:
+    if tool_alias not in {"t", "tools"}:
+        raise ValueError("Unsupported tools table alias")
+    return f"""
+      {tool_alias}.content_safety_status = 'safe'
+      AND EXISTS (
+        SELECT 1 FROM tool_enrichment_states state
+        WHERE state.tool_id = {tool_alias}.id AND state.readiness = 'ready'
+      )
+      AND EXISTS (
+        SELECT 1 FROM tool_assets asset
+        WHERE asset.tool_id = {tool_alias}.id
+          AND asset.asset_kind = 'screenshot'
+          AND asset.is_current = 1
+      )
+      AND EXISTS (
+        SELECT 1 FROM tool_localizations localization
+        WHERE localization.tool_id = {tool_alias}.id
+          AND localization.translation_status = 'published'
+          AND localization.published_at IS NOT NULL
+          AND trim(localization.name) <> ''
+          AND coalesce(localization.name_review_status, 'legacy_unreviewed')
+              NOT IN ('needs_review', 'rejected')
+          AND trim(coalesce(localization.short_description, '')) <> ''
+      )
+      AND (
+        EXISTS (
+          SELECT 1 FROM tool_key_features feature
+          WHERE feature.tool_id = {tool_alias}.id
+        )
+        OR EXISTS (
+          SELECT 1 FROM tool_localizations localization
+          WHERE localization.tool_id = {tool_alias}.id
+            AND localization.translation_status = 'published'
+            AND localization.published_at IS NOT NULL
+            AND json_array_length(coalesce(localization.feature_highlights, '[]')) > 0
+        )
+      )
+      AND {accepted_primary_taxonomy_predicate(tool_alias)}
+      AND EXISTS (
+        SELECT 1 FROM tool_sources source
+        WHERE source.tool_id = {tool_alias}.id
+      )
+    """
+
+
+class D1CatalogPublisher:
+    def __init__(
+        self,
+        d1: D1Client,
+        runner_instance_id: str,
+        policy_version: str = CATALOG_AUTO_PUBLISH_POLICY_VERSION,
+    ):
+        self.d1 = d1
+        self.runner_instance_id = runner_instance_id
+        self.policy_version = policy_version
+
+    async def publish_ready(self, limit: int) -> dict[str, int]:
+        effective_limit = min(CATALOG_AUTO_PUBLISH_MAX_LIMIT, max(1, int(limit)))
+        predicate = tool_live_ready_predicate("t")
+        rows = await self.d1.query(
+            f"""
+            SELECT t.id
+            FROM tools t
+            WHERE t.status = 'pending_review'
+              AND t.duplicate_of_tool_id IS NULL
+              AND ({predicate})
+            ORDER BY t.id
+            LIMIT ?
+            """,
+            [effective_limit],
+            operation="catalog.auto_publish.select",
+        )
+        tool_ids = [int(row["id"]) for row in rows if int(row.get("id") or 0) > 0]
+        if not tool_ids:
+            return {"selected": 0, "published": 0, "skipped": 0}
+
+        placeholders = ", ".join("?" for _ in tool_ids)
+        old_value = json.dumps({"status": "pending_review"}, separators=(",", ":"))
+        new_value = json.dumps({"status": "published"}, separators=(",", ":"))
+        notes = (
+            "Automated catalog publish"
+            f"; policy={self.policy_version}"
+            f"; instance={self.runner_instance_id}"
+        )
+        results = await self.d1.batch(
+            [
+                (
+                    f"""
+                    INSERT INTO tool_change_log (
+                      tool_id, change_type, old_value, new_value, verified_at, notes
+                    )
+                    SELECT
+                      t.id,
+                      'status_changed',
+                      ?,
+                      ?,
+                      strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                      ?
+                    FROM tools t
+                    WHERE t.id IN ({placeholders})
+                      AND t.status = 'pending_review'
+                      AND t.duplicate_of_tool_id IS NULL
+                      AND ({predicate})
+                    """,
+                    [old_value, new_value, notes, *tool_ids],
+                ),
+                (
+                    f"""
+                    UPDATE tools
+                    SET status = 'published',
+                        first_published_at = coalesce(
+                          first_published_at,
+                          strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                        ),
+                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+                    WHERE id IN ({placeholders})
+                      AND status = 'pending_review'
+                      AND duplicate_of_tool_id IS NULL
+                      AND ({tool_live_ready_predicate('tools')})
+                    RETURNING id
+                    """,
+                    tool_ids,
+                ),
+            ],
+            operation="catalog.auto_publish.commit",
+        )
+        published = 0
+        if len(results) >= 2:
+            published_rows = results[1].get("results") or []
+            published = len(published_rows)
+        return {
+            "selected": len(tool_ids),
+            "published": published,
+            "skipped": max(0, len(tool_ids) - published),
+        }
 
 
 class D1EnrichmentStore:
@@ -6369,7 +7131,7 @@ class D1EnrichmentStore:
         self.d1 = d1
 
     async def evaluate_tool(self, tool_id: int) -> str:
-        query_with_category_status = """
+        query_with_category_status = f"""
             SELECT
               t.id,
               state.readiness AS previous_readiness,
@@ -6393,6 +7155,11 @@ class D1EnrichmentStore:
                 WHERE l.tool_id = t.id AND l.translation_status = 'published'
                   AND l.published_at IS NOT NULL AND trim(l.name) <> ''
                   AND coalesce(l.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
+                  AND length(trim(l.name)) <= 80
+                  AND instr(l.name, '<') = 0
+                  AND instr(l.name, '>') = 0
+                  AND instr(l.name, '`') = 0
+                  AND instr(lower(l.name), 'json-ld') = 0
               ) THEN 1 ELSE 0 END AS has_name_quality,
               CASE WHEN EXISTS (SELECT 1 FROM tool_key_features f WHERE f.tool_id = t.id)
                      OR EXISTS (
@@ -6401,10 +7168,18 @@ class D1EnrichmentStore:
                          AND l.published_at IS NOT NULL
                          AND json_array_length(coalesce(l.feature_highlights, '[]')) > 0
                      ) THEN 1 ELSE 0 END AS has_features,
-              CASE WHEN t.primary_category_id IS NOT NULL
-                     OR EXISTS (SELECT 1 FROM tool_categories tc WHERE tc.tool_id = t.id)
+              CASE WHEN {accepted_primary_taxonomy_predicate('t')}
                    THEN 1 ELSE 0 END AS has_category,
-              CASE WHEN t.category_classification_status = 'needs_manual' THEN 1 ELSE 0 END AS category_needs_manual,
+              CASE WHEN NOT {accepted_primary_taxonomy_predicate('t')} AND EXISTS (
+                SELECT 1
+                FROM product_taxonomy_assignments pending_assignment
+                JOIN taxonomy_terms pending_term ON pending_term.id = pending_assignment.term_id
+                WHERE pending_assignment.tool_id = t.id
+                  AND pending_assignment.is_primary = 1
+                  AND pending_assignment.decision_status IN ('provisional', 'unresolved')
+                  AND pending_term.dimension = 'primary_category'
+                  AND pending_term.status = 'active'
+              ) THEN 1 ELSE 0 END AS category_needs_manual,
               CASE WHEN EXISTS (SELECT 1 FROM tool_sources s WHERE s.tool_id = t.id)
                    THEN 1 ELSE 0 END AS has_source,
               CASE WHEN EXISTS (
@@ -6427,7 +7202,7 @@ class D1EnrichmentStore:
             WHERE t.id = ?
             LIMIT 1
             """
-        query_legacy = """
+        query_legacy = f"""
             SELECT
               t.id,
               state.readiness AS previous_readiness,
@@ -6451,6 +7226,11 @@ class D1EnrichmentStore:
                 WHERE l.tool_id = t.id AND l.translation_status = 'published'
                   AND l.published_at IS NOT NULL AND trim(l.name) <> ''
                   AND coalesce(l.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
+                  AND length(trim(l.name)) <= 80
+                  AND instr(l.name, '<') = 0
+                  AND instr(l.name, '>') = 0
+                  AND instr(l.name, '`') = 0
+                  AND instr(lower(l.name), 'json-ld') = 0
               ) THEN 1 ELSE 0 END AS has_name_quality,
               CASE WHEN EXISTS (SELECT 1 FROM tool_key_features f WHERE f.tool_id = t.id)
                      OR EXISTS (
@@ -6459,8 +7239,7 @@ class D1EnrichmentStore:
                          AND l.published_at IS NOT NULL
                          AND json_array_length(coalesce(l.feature_highlights, '[]')) > 0
                      ) THEN 1 ELSE 0 END AS has_features,
-              CASE WHEN t.primary_category_id IS NOT NULL
-                     OR EXISTS (SELECT 1 FROM tool_categories tc WHERE tc.tool_id = t.id)
+              CASE WHEN {accepted_primary_taxonomy_predicate('t')}
                    THEN 1 ELSE 0 END AS has_category,
               0 AS category_needs_manual,
               CASE WHEN EXISTS (SELECT 1 FROM tool_sources s WHERE s.tool_id = t.id)
@@ -6563,27 +7342,59 @@ class D1EnrichmentStore:
             )
         return readiness
 
-    async def reconcile_active_tools(self, limit: int) -> dict[str, int]:
+    async def evaluate_tools(
+        self,
+        tool_ids: list[int],
+        concurrency: int = 1,
+    ) -> dict[str, int]:
+        counts = {"evaluated": 0, "ready": 0, "blocked": 0, "missing": 0}
+        semaphore = asyncio.Semaphore(max(1, concurrency))
+
+        async def evaluate(tool_id: int) -> str:
+            async with semaphore:
+                return await self.evaluate_tool(tool_id)
+
+        results = await asyncio.gather(*(evaluate(tool_id) for tool_id in tool_ids))
+        for readiness in results:
+            counts["evaluated"] += 1
+            counts[readiness] = counts.get(readiness, 0) + 1
+        return counts
+
+    async def reconcile_active_tools(
+        self,
+        limit: int,
+        concurrency: int = 1,
+    ) -> dict[str, int]:
+        effective_limit = max(1, limit)
         rows = await self.d1.query(
-            """
+            f"""
             SELECT t.id AS tool_id
             FROM tools t
             LEFT JOIN tool_enrichment_states state ON state.tool_id = t.id
             WHERE t.status IN ('pending_enrich', 'pending_review', 'published')
               AND t.duplicate_of_tool_id IS NULL
+              AND (
+                state.evaluated_at IS NULL
+                OR t.updated_at > state.evaluated_at
+                OR (
+                  instr(coalesce(state.blocking_json, ''), '"category"') > 0
+                  AND {accepted_primary_taxonomy_predicate('t')}
+                )
+              )
             ORDER BY CASE WHEN t.status = 'pending_enrich' THEN 0 ELSE 1 END,
                      CASE WHEN state.evaluated_at IS NULL THEN 0 ELSE 1 END,
                      state.evaluated_at,
                      t.id
             LIMIT ?
             """,
-            [max(1, limit)],
+            [effective_limit + 1],
         )
-        counts = {"evaluated": 0, "ready": 0, "blocked": 0, "missing": 0}
-        for row in rows:
-            readiness = await self.evaluate_tool(int(row.get("tool_id") or 0))
-            counts["evaluated"] += 1
-            counts[readiness] = counts.get(readiness, 0) + 1
+        has_more = len(rows) > effective_limit
+        counts = await self.evaluate_tools(
+            [int(row.get("tool_id") or 0) for row in rows[:effective_limit]],
+            concurrency,
+        )
+        counts["has_more"] = int(has_more)
         return counts
 
     async def reconcile_pending_tools(self, limit: int) -> dict[str, int]:
@@ -6594,6 +7405,62 @@ class D1EnrichmentStore:
 class D1AssetStore:
     def __init__(self, d1: D1Client):
         self.d1 = d1
+
+    async def revive_incomplete_dead_letter_tasks(self, limit: int) -> int:
+        """Re-open incomplete enrichment after a cooldown so deploy fixes heal the backlog."""
+        now = utc_now_iso()
+        one_day_ago = iso_delta(hours=-ASSET_DEAD_LETTER_REVIVE_HOURS)
+        one_week_ago = iso_delta(days=-7)
+        one_month_ago = iso_delta(days=-30)
+        rows = await self.d1.query(
+            """
+            SELECT task.tool_id
+            FROM asset_tasks task
+            JOIN tools t ON t.id = task.tool_id
+            WHERE task.source = ?
+              AND task.status = 'failed'
+              AND task.dead_letter_at IS NOT NULL
+              AND t.status = 'pending_enrich'
+              AND coalesce(task.last_error, '') NOT LIKE 'content_safety_blocked:%'
+              AND (
+                (task.generation <= 1 AND task.dead_letter_at <= ?)
+                OR (task.generation BETWEEN 2 AND 3 AND task.dead_letter_at <= ?)
+                OR (task.generation >= 4 AND task.dead_letter_at <= ?)
+              )
+            ORDER BY task.dead_letter_at, task.tool_id
+            LIMIT ?
+            """,
+            [ASSET_SOURCE, one_day_ago, one_week_ago, one_month_ago, max(1, limit)],
+        )
+        revived = 0
+        for row in rows:
+            tool_id = int(row.get("tool_id") or 0)
+            if tool_id <= 0:
+                continue
+            meta = await self.d1.run(
+                """
+                UPDATE asset_tasks
+                SET status = 'queued',
+                    attempts = 0,
+                    generation = generation + 1,
+                    last_queued_at = ?,
+                    next_retry_at = NULL,
+                    last_error = 'Automatically revived after enrichment cooldown',
+                    lease_owner = NULL,
+                    lease_token = NULL,
+                    lease_expires_at = NULL,
+                    dead_letter_at = NULL,
+                    updated_at = ?
+                WHERE tool_id = ?
+                  AND source = ?
+                  AND status = 'failed'
+                  AND dead_letter_at IS NOT NULL
+                """,
+                [now, now, tool_id, ASSET_SOURCE],
+            )
+            changed = int(meta.get("changes") or 0)
+            revived += changed
+        return revived
 
     async def queue_missing_asset_tasks(self, limit: int) -> int:
         now = utc_now_iso()
@@ -6650,14 +7517,6 @@ class D1AssetStore:
                       AND tl.translation_status = 'published'
                       AND tl.published_at IS NOT NULL
                       AND json_array_length(coalesce(tl.feature_highlights, '[]')) > 0
-                  )
-                )
-                OR (
-                  t.primary_category_id IS NULL
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM tool_categories tc
-                    WHERE tc.tool_id = t.id
                   )
                 )
               )
@@ -6865,410 +7724,6 @@ class D1AssetStore:
             [task.tool_id, asset_kind, ASSET_DB_STORAGE_BUCKET, storage_object_path, public_url, mime_type, width, height],
         )
 
-    async def category_catalog(self) -> list[CategoryCatalogEntry]:
-        """Load active taxonomy with optional definition fields for classification prompts."""
-        try:
-            rows = await self.d1.query(
-                """
-                SELECT
-                  c.canonical_slug AS slug,
-                  parent.canonical_slug AS parent_slug,
-                  c.definition AS definition,
-                  c.includes AS includes,
-                  c.excludes AS excludes,
-                  c.examples AS examples
-                FROM categories c
-                LEFT JOIN categories parent
-                  ON parent.id = c.parent_category_id
-                 AND parent.status = 'active'
-                WHERE c.status = 'active'
-                ORDER BY c.parent_category_id IS NOT NULL, c.display_order, c.canonical_slug
-                """,
-            )
-        except Exception:
-            # Pre-migration environments without definition columns.
-            rows = await self.d1.query(
-                """
-                SELECT
-                  c.canonical_slug AS slug,
-                  parent.canonical_slug AS parent_slug
-                FROM categories c
-                LEFT JOIN categories parent
-                  ON parent.id = c.parent_category_id
-                 AND parent.status = 'active'
-                WHERE c.status = 'active'
-                ORDER BY c.parent_category_id IS NOT NULL, c.display_order, c.canonical_slug
-                """,
-            )
-        entries: list[CategoryCatalogEntry] = []
-        for row in rows:
-            slug = clean_category_slug(row.get("slug") or row.get("canonical_slug"))
-            if not slug:
-                continue
-            entries.append(
-                CategoryCatalogEntry(
-                    slug=slug,
-                    parent_slug=clean_category_slug(row.get("parent_slug")),
-                    definition=clean_asset_text(row.get("definition"), 280),
-                    includes=clean_asset_text(row.get("includes"), 280),
-                    excludes=clean_asset_text(row.get("excludes"), 280),
-                    examples=clean_asset_text(row.get("examples"), 200),
-                )
-            )
-        return entries
-
-    async def category_options(self) -> list[str]:
-        return [entry.slug for entry in await self.category_catalog()]
-
-    async def published_legacy_category_tasks(
-        self,
-        limit: int,
-        *,
-        after_tool_id: int = 0,
-        tool_ids: list[int] | None = None,
-    ) -> list[AssetTask]:
-        """Return published tools whose categories still need hierarchical reclassification.
-
-        Scope:
-        - status = published only (rejected/draft/pending_* are never selected)
-        - must already have at least one category assignment
-        - skip tools with any source=manual assignment
-        - skip tools already successfully backfilled (raw.backfill marker) or
-          already classified with the current hierarchical prompt version
-        """
-        if limit <= 0:
-            return []
-
-        params: list[Any] = []
-        id_filter = ""
-        if tool_ids:
-            cleaned = sorted({int(tool_id) for tool_id in tool_ids if int(tool_id) > 0})
-            if not cleaned:
-                return []
-            placeholders = ",".join("?" for _ in cleaned)
-            id_filter = f"AND t.id IN ({placeholders})"
-            params.extend(cleaned)
-        else:
-            id_filter = "AND t.id > ?"
-            params.append(int(after_tool_id or 0))
-
-        # Prefer json_extract when raw is valid JSON; fall back to LIKE for resilience.
-        already_done = f"""
-            (
-              t.category_classification_status = 'auto_ok'
-              AND t.category_classification_raw IS NOT NULL
-              AND trim(t.category_classification_raw) <> ''
-              AND (
-                json_extract(t.category_classification_raw, '$.backfill') = ?
-                OR t.category_classification_raw LIKE ?
-                OR (
-                  json_extract(t.category_classification_raw, '$.prompt_version') = ?
-                  AND json_extract(t.category_classification_raw, '$.mode') = 'hierarchical'
-                )
-              )
-            )
-        """
-        params.extend(
-            [
-                PUBLISHED_CATEGORY_BACKFILL_VERSION,
-                f'%"backfill":"{PUBLISHED_CATEGORY_BACKFILL_VERSION}"%',
-                CATEGORY_CLASSIFICATION_PROMPT_VERSION,
-            ]
-        )
-
-        rows = await self.d1.query(
-            f"""
-            SELECT
-              t.id AS tool_id,
-              t.canonical_slug,
-              t.normalized_domain,
-              t.official_url
-            FROM tools t
-            WHERE t.status = 'published'
-              {id_filter}
-              AND (
-                t.primary_category_id IS NOT NULL
-                OR EXISTS (SELECT 1 FROM tool_categories tc WHERE tc.tool_id = t.id)
-              )
-              AND NOT EXISTS (
-                SELECT 1
-                FROM tool_categories tc
-                WHERE tc.tool_id = t.id
-                  AND tc.source = 'manual'
-              )
-              AND NOT {already_done}
-            ORDER BY t.id ASC
-            LIMIT ?
-            """,
-            [*params, limit],
-        )
-        tasks: list[AssetTask] = []
-        for row in rows:
-            tool_id = to_integer(row.get("tool_id")) or 0
-            if tool_id <= 0:
-                continue
-            tasks.append(
-                AssetTask(
-                    tool_id=tool_id,
-                    canonical_slug=str(row.get("canonical_slug") or f"tool-{tool_id}"),
-                    normalized_domain=str(row.get("normalized_domain") or ""),
-                    official_url=str(row.get("official_url") or ""),
-                    attempts=0,
-                    max_attempts=1,
-                    generation=0,
-                    lease_token="published-category-backfill",
-                )
-            )
-        return tasks
-
-    async def load_tool_category_snapshot(self, tool_id: int) -> dict[str, Any]:
-        tool_rows = await self.d1.query(
-            """
-            SELECT id, primary_category_id, category_classification_status, category_classification_raw
-            FROM tools
-            WHERE id = ?
-            LIMIT 1
-            """,
-            [tool_id],
-        )
-        tool = tool_rows[0] if tool_rows else {}
-        category_rows = await self.d1.query(
-            """
-            SELECT
-              tc.category_id,
-              tc.source,
-              tc.raw_output,
-              tc.classified_at,
-              c.canonical_slug AS slug,
-              parent.canonical_slug AS parent_slug
-            FROM tool_categories tc
-            JOIN categories c ON c.id = tc.category_id
-            LEFT JOIN categories parent ON parent.id = c.parent_category_id
-            WHERE tc.tool_id = ?
-            ORDER BY c.parent_category_id IS NOT NULL, c.canonical_slug
-            """,
-            [tool_id],
-        )
-        return {
-            "tool_id": tool_id,
-            "primary_category_id": to_integer(tool.get("primary_category_id")),
-            "category_classification_status": tool.get("category_classification_status"),
-            "category_classification_raw": tool.get("category_classification_raw"),
-            "categories": [
-                {
-                    "category_id": to_integer(row.get("category_id")),
-                    "slug": row.get("slug"),
-                    "parent_slug": row.get("parent_slug"),
-                    "source": row.get("source") or "auto",
-                    "classified_at": row.get("classified_at"),
-                }
-                for row in category_rows
-            ],
-        }
-
-    async def apply_published_category_backfill(
-        self,
-        task: AssetTask,
-        result: AssetFetchResult,
-        *,
-        dry_run: bool = False,
-    ) -> dict[str, Any]:
-        """Atomically replace non-manual categories for one published tool.
-
-        On failure paths the caller must not invoke this. Live categories stay untouched
-        until this batch commits (delete non-manual + insert new + update primary + audit).
-        """
-        if not published_category_backfill_success(result):
-            raise ValueError(result.metadata_error or "category_backfill_invalid_result")
-
-        slugs = [slug for slug in (result.category_l2, result.category_l1) if slug]
-        slugs = list(dict.fromkeys(slugs))
-        slug_placeholders = ",".join("?" for _ in slugs)
-        rows = await self.d1.query(
-            f"""
-            SELECT
-              c.id,
-              c.canonical_slug,
-              c.parent_category_id,
-              parent.id AS parent_id,
-              parent.canonical_slug AS parent_slug
-            FROM categories c
-            LEFT JOIN categories parent
-              ON parent.id = c.parent_category_id
-             AND parent.status = 'active'
-            WHERE c.status = 'active'
-              AND c.canonical_slug IN ({slug_placeholders})
-            """,
-            slugs,
-        )
-        by_slug = {str(row.get("canonical_slug")): row for row in rows}
-        specific = next((by_slug.get(slug) for slug in slugs if by_slug.get(slug)), None)
-        if not specific:
-            raise ValueError("category_backfill_unresolved_slugs")
-
-        primary_id = int(specific.get("parent_id") or specific.get("id") or 0)
-        specific_id = int(specific.get("id") or 0)
-        if primary_id <= 0 or specific_id <= 0:
-            raise ValueError("category_backfill_invalid_ids")
-
-        category_ids = list(dict.fromkeys([primary_id, specific_id]))
-        now = utc_now_iso()
-        raw_output = annotate_published_category_backfill_raw(
-            result.category_raw_output
-            or json.dumps(
-                {"category_l1": result.category_l1, "category_l2": result.category_l2},
-                ensure_ascii=False,
-                separators=(",", ":"),
-            ),
-            result,
-        )
-        taxonomy_version = ""
-        try:
-            parsed_raw = json.loads(raw_output)
-            if isinstance(parsed_raw, dict):
-                taxonomy_version = str(parsed_raw.get("taxonomy_version") or "")
-        except (TypeError, ValueError, json.JSONDecodeError):
-            taxonomy_version = ""
-
-        old_snapshot = await self.load_tool_category_snapshot(task.tool_id)
-        if any(item.get("source") == "manual" for item in old_snapshot.get("categories") or []):
-            raise ValueError("category_backfill_manual_present")
-
-        new_snapshot = {
-            "primary_category_id": primary_id,
-            "category_l1": result.category_l1,
-            "category_l2": result.category_l2,
-            "category_ids": category_ids,
-            "backfill": PUBLISHED_CATEGORY_BACKFILL_VERSION,
-            "prompt_version": CATEGORY_CLASSIFICATION_PROMPT_VERSION,
-        }
-        summary = {
-            "tool_id": task.tool_id,
-            "slug": task.canonical_slug,
-            "old": old_snapshot,
-            "new": new_snapshot,
-            "applied": False,
-            "dry_run": dry_run,
-        }
-        if dry_run:
-            return summary
-
-        statements: list[tuple[str, list[Any]]] = [
-            (
-                """
-                INSERT INTO tool_change_log (
-                  tool_id, change_type, old_value, new_value, notes, detected_at
-                )
-                VALUES (?, 'category_backfill', ?, ?, ?, ?)
-                """,
-                [
-                    task.tool_id,
-                    json.dumps(old_snapshot, ensure_ascii=False, separators=(",", ":")),
-                    json.dumps(new_snapshot, ensure_ascii=False, separators=(",", ":")),
-                    f"published category backfill {PUBLISHED_CATEGORY_BACKFILL_VERSION}",
-                    now,
-                ],
-            ),
-            (
-                """
-                DELETE FROM tool_categories
-                WHERE tool_id = ?
-                  AND (source IS NULL OR source <> 'manual')
-                """,
-                [task.tool_id],
-            ),
-        ]
-        for category_id in category_ids:
-            statements.append(
-                (
-                    """
-                    INSERT INTO tool_categories (
-                      tool_id, category_id, source, raw_output, classified_at
-                    )
-                    VALUES (?, ?, 'auto', ?, ?)
-                    """,
-                    [task.tool_id, category_id, raw_output, now],
-                )
-            )
-        statements.append(
-            (
-                """
-                UPDATE tools
-                SET primary_category_id = ?,
-                    category_classification_status = 'auto_ok',
-                    category_classification_attempts = 0,
-                    category_classification_last_error = NULL,
-                    category_classification_raw = ?,
-                    category_classification_updated_at = ?,
-                    updated_at = ?
-                WHERE id = ?
-                  AND status = 'published'
-                """,
-                [primary_id, raw_output, now, now, task.tool_id],
-            )
-        )
-        statements.append(
-            (
-                """
-                INSERT INTO tool_category_classification_events (
-                  tool_id, outcome, category_l1_slug, category_l2_slug,
-                  model_name, prompt_version, taxonomy_version, raw_output, error
-                )
-                VALUES (?, 'auto_ok', ?, ?, ?, ?, ?, ?, NULL)
-                """,
-                [
-                    task.tool_id,
-                    result.category_l1 or None,
-                    result.category_l2 or None,
-                    DEFAULT_CATEGORY_CLASSIFICATION_MODEL,
-                    CATEGORY_CLASSIFICATION_PROMPT_VERSION,
-                    taxonomy_version,
-                    raw_output,
-                ],
-            )
-        )
-        await self.d1.batch(statements)
-        summary["applied"] = True
-        return summary
-
-    async def record_published_category_backfill_failure(
-        self,
-        task: AssetTask,
-        *,
-        error: str,
-        raw_output: str = "",
-        dry_run: bool = False,
-    ) -> None:
-        """Record a failed reclassification without mutating live category assignments."""
-        if dry_run:
-            return
-        message = (error or "category_backfill_failed")[:500]
-        now = utc_now_iso()
-        try:
-            await self.d1.run(
-                """
-                UPDATE tools
-                SET category_classification_last_error = ?,
-                    category_classification_raw = CASE
-                      WHEN ? <> '' THEN ?
-                      ELSE category_classification_raw
-                    END,
-                    category_classification_updated_at = ?,
-                    updated_at = ?
-                WHERE id = ?
-                  AND status = 'published'
-                """,
-                [message, raw_output, raw_output, now, now, task.tool_id],
-            )
-        except Exception:
-            pass
-        await self.record_category_classification_event(
-            task.tool_id,
-            outcome="auto_failed",
-            raw_output=raw_output,
-            error=message,
-        )
-
     async def save_tool_localization(self, task: AssetTask, result: AssetFetchResult) -> None:
         title = clean_asset_text(result.title, 120)
         description = clean_asset_text(result.description, 500)
@@ -7278,13 +7733,20 @@ class D1AssetStore:
         name_review_status = result.name_review_status
         invalid_reason = invalid_tool_name_reason(title)
         if invalid_reason:
-            title = domain_fallback_tool_name(task.normalized_domain)
-            name_source = "domain_fallback"
-            name_confidence = 45
-            name_evidence = invalid_reason
-            name_review_status = "needs_review"
+            title = canonical_slug_fallback_tool_name(task)
+            name_source = "verified_submission_fallback"
+            name_confidence = AUTO_APPROVE_TOOL_NAME_CONFIDENCE
+            name_evidence = f"pending_review fallback after {invalid_reason}"
+            name_review_status = "auto_approved"
         elif name_confidence < AUTO_APPROVE_TOOL_NAME_CONFIDENCE:
-            name_review_status = "needs_review"
+            original_source = name_source
+            title = canonical_slug_fallback_tool_name(task)
+            name_source = "verified_submission_fallback"
+            name_confidence = AUTO_APPROVE_TOOL_NAME_CONFIDENCE
+            name_evidence = (
+                f"Qualified Discovery candidate fallback after low-confidence {original_source}"
+            )[:500]
+            name_review_status = "auto_approved"
         if not title and not description:
             return
         rows = await self.d1.query(
@@ -7410,237 +7872,6 @@ class D1AssetStore:
             ],
         )
 
-    async def save_tool_categories(self, task: AssetTask, result: AssetFetchResult) -> None:
-        slugs = [slug for slug in (result.category_l2, result.category_l1) if slug]
-        slugs = list(dict.fromkeys(slugs))
-        if not slugs:
-            return
-        slug_placeholders = ",".join("?" for _ in slugs)
-        rows = await self.d1.query(
-            f"""
-            SELECT
-              c.id,
-              c.canonical_slug,
-              c.parent_category_id,
-              parent.id AS parent_id,
-              parent.canonical_slug AS parent_slug
-            FROM categories c
-            LEFT JOIN categories parent
-              ON parent.id = c.parent_category_id
-             AND parent.status = 'active'
-            WHERE c.status = 'active'
-              AND c.canonical_slug IN ({slug_placeholders})
-            """,
-            slugs,
-        )
-        by_slug = {str(row.get("canonical_slug")): row for row in rows}
-        specific = next((by_slug.get(slug) for slug in slugs if by_slug.get(slug)), None)
-        if not specific:
-            return
-        primary_id = int(specific.get("parent_id") or specific.get("id") or 0)
-        specific_id = int(specific.get("id") or 0)
-        now = utc_now_iso()
-        raw_output = result.category_raw_output or json.dumps(
-            {"category_l1": result.category_l1, "category_l2": result.category_l2},
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        for category_id in dict.fromkeys([primary_id, specific_id]):
-            if category_id > 0:
-                # Prefer provenance columns when migration 0029 is applied.
-                try:
-                    await self.d1.run(
-                        """
-                        INSERT INTO tool_categories (tool_id, category_id, source, raw_output, classified_at)
-                        VALUES (?, ?, 'auto', ?, ?)
-                        ON CONFLICT(tool_id, category_id) DO UPDATE SET
-                          source = CASE
-                            WHEN tool_categories.source = 'manual' THEN tool_categories.source
-                            ELSE excluded.source
-                          END,
-                          raw_output = CASE
-                            WHEN tool_categories.source = 'manual' THEN tool_categories.raw_output
-                            ELSE excluded.raw_output
-                          END,
-                          classified_at = CASE
-                            WHEN tool_categories.source = 'manual' THEN tool_categories.classified_at
-                            ELSE excluded.classified_at
-                          END
-                        """,
-                        [task.tool_id, category_id, raw_output, now],
-                    )
-                except Exception:
-                    await self.d1.run(
-                        "INSERT OR IGNORE INTO tool_categories (tool_id, category_id) VALUES (?, ?)",
-                        [task.tool_id, category_id],
-                    )
-        if primary_id > 0:
-            try:
-                await self.d1.run(
-                    """
-                    UPDATE tools
-                    SET primary_category_id = ?,
-                        category_classification_status = 'auto_ok',
-                        category_classification_raw = ?,
-                        category_classification_last_error = NULL,
-                        category_classification_updated_at = ?,
-                        updated_at = ?
-                    WHERE id = ?
-                      AND primary_category_id IS NULL
-                    """,
-                    [primary_id, raw_output, now, now, task.tool_id],
-                )
-            except Exception:
-                await self.d1.run(
-                    """
-                    UPDATE tools
-                    SET primary_category_id = ?,
-                        updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-                    WHERE id = ?
-                      AND primary_category_id IS NULL
-                    """,
-                    [primary_id, task.tool_id],
-                )
-        await self.record_category_classification_event(
-            task.tool_id,
-            outcome="auto_ok",
-            category_l1=result.category_l1,
-            category_l2=result.category_l2,
-            raw_output=raw_output,
-        )
-
-    async def record_category_classification_event(
-        self,
-        tool_id: int,
-        *,
-        outcome: str,
-        category_l1: str = "",
-        category_l2: str = "",
-        raw_output: str = "",
-        error: str = "",
-    ) -> None:
-        metadata: dict[str, Any] = {}
-        try:
-            parsed = json.loads(raw_output) if raw_output else {}
-            metadata = parsed if isinstance(parsed, dict) else {}
-        except ValueError:
-            metadata = {}
-        model_chain = metadata.get("model_chain")
-        requested_model = (
-            str(model_chain[0])
-            if isinstance(model_chain, list) and model_chain
-            else DEFAULT_CATEGORY_CLASSIFICATION_MODEL
-        )
-        try:
-            await self.d1.run(
-                """
-                INSERT INTO tool_category_classification_events (
-                  tool_id, outcome, category_l1_slug, category_l2_slug,
-                  model_name, prompt_version, taxonomy_version, raw_output, error
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    tool_id,
-                    outcome,
-                    category_l1 or None,
-                    category_l2 or None,
-                    requested_model,
-                    str(metadata.get("prompt_version") or CATEGORY_CLASSIFICATION_PROMPT_VERSION),
-                    str(metadata.get("taxonomy_version") or ""),
-                    raw_output or None,
-                    error[:500] or None,
-                ],
-            )
-        except Exception:
-            # Migration 0030 may not be present during a rolling deploy.
-            return
-
-    async def get_category_classification_state(self, tool_id: int) -> dict[str, Any]:
-        try:
-            rows = await self.d1.query(
-                """
-                SELECT
-                  category_classification_status AS status,
-                  category_classification_attempts AS attempts,
-                  category_classification_last_error AS last_error
-                FROM tools
-                WHERE id = ?
-                LIMIT 1
-                """,
-                [tool_id],
-            )
-        except Exception:
-            return {"status": None, "attempts": 0, "last_error": None}
-        row = rows[0] if rows else {}
-        return {
-            "status": row.get("status"),
-            "attempts": int(row.get("attempts") or 0),
-            "last_error": row.get("last_error"),
-        }
-
-    async def record_category_classification_failure(
-        self,
-        tool_id: int,
-        error: str,
-        *,
-        raw_output: str = "",
-    ) -> dict[str, Any]:
-        """Increment attempts and stop automatic retries after repeated failures."""
-        now = utc_now_iso()
-        message = (error or "category_failed")[:500]
-        try:
-            await self.d1.run(
-                """
-                UPDATE tools
-                SET category_classification_attempts = coalesce(category_classification_attempts, 0) + 1,
-                    category_classification_last_error = ?,
-                    category_classification_raw = CASE
-                      WHEN ? <> '' THEN ?
-                      ELSE category_classification_raw
-                    END,
-                    category_classification_updated_at = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                [message, raw_output, raw_output, now, now, tool_id],
-            )
-            state = await self.get_category_classification_state(tool_id)
-            attempts = int(state.get("attempts") or 0)
-            if attempts >= CATEGORY_CLASSIFICATION_MAX_ATTEMPTS and state.get("status") != "auto_ok":
-                await self.d1.run(
-                    """
-                    UPDATE tools
-                    SET category_classification_status = 'needs_manual',
-                        category_classification_updated_at = ?,
-                        updated_at = ?
-                    WHERE id = ?
-                      AND (category_classification_status IS NULL OR category_classification_status <> 'auto_ok')
-                    """,
-                    [now, now, tool_id],
-                )
-                state = await self.get_category_classification_state(tool_id)
-            outcome = "needs_manual" if state.get("status") == "needs_manual" else "auto_failed"
-            await self.record_category_classification_event(
-                tool_id,
-                outcome=outcome,
-                raw_output=raw_output,
-                error=message,
-            )
-            return state
-        except Exception as exc:
-            log_info(
-                "assets.category_classification.record_failed",
-                tool_id=tool_id,
-                error=str(exc)[:200],
-            )
-            return {"status": None, "attempts": 0, "last_error": message}
-
-    async def category_is_waived(self, tool_id: int) -> bool:
-        """True when automatic classification retries should stop for manual review."""
-        state = await self.get_category_classification_state(tool_id)
-        return str(state.get("status") or "") == "needs_manual"
-
     async def save_tool_features(self, task: AssetTask, result: AssetFetchResult) -> None:
         features = clean_key_features(result.key_features)
         if not features:
@@ -7678,9 +7909,48 @@ class D1AssetStore:
             [feature_highlights, task.tool_id],
         )
 
-    async def missing_tool_enrichment_requirements(self, tool_id: int) -> list[str]:
+    async def fallback_tool_content(self, task: AssetTask) -> tuple[str, str]:
         rows = await self.d1.query(
             """
+            SELECT name, short_description
+            FROM tool_localizations
+            WHERE tool_id = ?
+              AND translation_status = 'published'
+              AND published_at IS NOT NULL
+            ORDER BY CASE WHEN locale_code = 'en' THEN 0 ELSE 1 END
+            LIMIT 1
+            """,
+            [task.tool_id],
+        )
+        row = rows[0] if rows else {}
+        name = clean_asset_text(row.get("name"), 120) or canonical_slug_fallback_tool_name(task)
+        description = clean_asset_text(row.get("short_description"), 500)
+        if not description:
+            description = deterministic_fallback_description(task, "", name)
+        return name, description
+
+    async def save_deterministic_tool_features(
+        self,
+        task: AssetTask,
+        html_body: str = "",
+    ) -> bool:
+        name, description = await self.fallback_tool_content(task)
+        features = deterministic_fallback_key_features(name, description, html_body)
+        if not features:
+            return False
+        await self.save_tool_features(
+            task,
+            AssetFetchResult(
+                final_url=asset_page_url(task),
+                key_features=features,
+                metadata_retryable=False,
+            ),
+        )
+        return True
+
+    async def missing_tool_enrichment_requirements(self, tool_id: int) -> list[str]:
+        rows = await self.d1.query(
+            f"""
             SELECT
               CASE WHEN EXISTS (
                 SELECT 1 FROM tools t
@@ -7708,12 +7978,10 @@ class D1AssetStore:
               ) THEN 1 ELSE 0 END AS has_features,
               CASE WHEN EXISTS (
                 SELECT 1 FROM tools t
-                WHERE t.id = ? AND t.primary_category_id IS NOT NULL
-              ) OR EXISTS (
-                SELECT 1 FROM tool_categories tc WHERE tc.tool_id = ?
+                WHERE t.id = ? AND {accepted_primary_taxonomy_predicate('t')}
               ) THEN 1 ELSE 0 END AS has_category
             """,
-            [tool_id, tool_id, tool_id, tool_id, tool_id, tool_id],
+            [tool_id, tool_id, tool_id, tool_id, tool_id],
         )
         row = rows[0] if rows else {}
         return [
@@ -7769,24 +8037,12 @@ class D1AssetStore:
                   AND tl.translation_status = 'published'
                   AND tl.published_at IS NOT NULL
                   AND json_array_length(coalesce(tl.feature_highlights, '[]')) > 0
-              ) THEN 1 ELSE 0 END AS has_key_features,
-              CASE WHEN EXISTS (
-                SELECT 1
-                FROM tools t
-                WHERE t.id = ?
-                  AND t.primary_category_id IS NOT NULL
-              ) OR EXISTS (
-                SELECT 1
-                FROM tool_categories tc
-                WHERE tc.tool_id = ?
-              ) THEN 1 ELSE 0 END AS has_category
+              ) THEN 1 ELSE 0 END AS has_key_features
             """,
             [
                 tool_id,
                 tool_id,
                 ASSET_DB_STORAGE_BUCKET,
-                tool_id,
-                tool_id,
                 tool_id,
                 tool_id,
                 tool_id,
@@ -7800,16 +8056,12 @@ class D1AssetStore:
             "favicon": "has_favicon",
             "description": "has_description",
             "key_features": "has_key_features",
-            "category": "has_category",
         }
         missing = [
             requirement
             for requirement in ASSET_REQUIREMENT_ORDER
             if not int(row.get(columns[requirement]) or 0)
         ]
-        # The asset task can finish, but readiness still blocks until an admin assigns a category.
-        if "category" in missing and await self.category_is_waived(tool_id):
-            missing = [item for item in missing if item != "category"]
         return missing
 
     async def save_content_safety(
@@ -7886,11 +8138,6 @@ class D1AssetStore:
 
     async def has_tool_enrichment(self, tool_id: int) -> bool:
         return not await self.missing_tool_enrichment_requirements(tool_id)
-
-    async def save_tool_enrichment(self, task: AssetTask, result: AssetFetchResult) -> None:
-        await self.save_tool_localization(task, result)
-        await self.save_tool_categories(task, result)
-        await self.save_tool_features(task, result)
 
     async def renew_lease(self, task: AssetTask) -> bool:
         meta = await self.d1.run(
@@ -8894,6 +9141,11 @@ class D1PricingStore:
               AND (
                 task.id IS NULL
                 OR task.status = 'succeeded'
+                OR (
+                  task.status = 'manual_review'
+                  AND ps.last_capture_at IS NOT NULL
+                  AND ps.next_run_at IS NOT NULL
+                )
               )
             ORDER BY coalesce(ps.next_run_at, ''), ps.id
             LIMIT ?
@@ -8932,6 +9184,7 @@ class D1PricingStore:
         task_ids: list[int] | None = None,
         claim: bool = True,
         lease_owner: str = "tool-data-runner",
+        replay_manual_review: bool = False,
     ) -> list[PricingTask]:
         now = utc_now_iso()
         lease_expires_at = iso_delta(hours=1)
@@ -8941,8 +9194,45 @@ class D1PricingStore:
             placeholders = ", ".join("?" for _ in task_ids)
             where = f"task.id IN ({placeholders}) AND task.status IN ('queued', 'manual_review', 'failed')"
             params = [*task_ids, limit]
+        elif replay_manual_review:
+            rows = await self.d1.query(
+                """
+                SELECT
+                  task.id AS task_id,
+                  task.pricing_source_id,
+                  task.tool_id,
+                  task.attempts,
+                  task.max_attempts,
+                  task.generation,
+                  task.status,
+                  task.last_error,
+                  t.canonical_slug,
+                  t.official_url,
+                  ps.url AS source_url
+                FROM pricing_tasks task
+                JOIN pricing_sources ps ON ps.id = task.pricing_source_id
+                JOIN tools t ON t.id = task.tool_id
+                WHERE task.status = 'manual_review'
+                  AND task.dead_letter_at IS NULL
+                  AND task.attempts < task.max_attempts
+                  AND ps.is_active = 1
+                  AND t.status IN ('published', 'pending_enrich', 'pending_review')
+                  AND t.duplicate_of_tool_id IS NULL
+                  AND coalesce(task.last_error, '') NOT LIKE ?
+                  AND NOT EXISTS (
+                    SELECT 1
+                    FROM pricing_tasks newer
+                    WHERE newer.pricing_source_id = task.pricing_source_id
+                      AND newer.id > task.id
+                  )
+                ORDER BY task.priority DESC, task.id ASC
+                LIMIT ?
+                """,
+                [f"{PRICING_CLAIMS_V2_REPLAY_MARKER}:%", limit],
+            )
+            params = []
         else:
-            where = """
+            where = f"""
               task.dead_letter_at IS NULL
               AND task.attempts < task.max_attempts
               AND (
@@ -8956,8 +9246,9 @@ class D1PricingStore:
             """
             params = [now, now, limit]
 
-        rows = await self.d1.query(
-            f"""
+        if not (replay_manual_review and not task_ids):
+            rows = await self.d1.query(
+                f"""
             SELECT
               task.id AS task_id,
               task.pricing_source_id,
@@ -8965,6 +9256,8 @@ class D1PricingStore:
               task.attempts,
               task.max_attempts,
               task.generation,
+              task.status,
+              task.last_error,
               t.canonical_slug,
               t.official_url,
               ps.url AS source_url
@@ -8972,11 +9265,14 @@ class D1PricingStore:
             JOIN pricing_sources ps ON ps.id = task.pricing_source_id
             JOIN tools t ON t.id = task.tool_id
             WHERE {where}
-            ORDER BY task.priority DESC, task.id ASC
+            ORDER BY
+              CASE WHEN task.status = 'manual_review' THEN 1 ELSE 0 END,
+              task.priority DESC,
+              task.id ASC
             LIMIT ?
             """,
-            params,
-        )
+                params,
+            )
 
         tasks: list[PricingTask] = []
         for row in rows:
@@ -8991,6 +9287,13 @@ class D1PricingStore:
                 max_attempts=int(row.get("max_attempts") or 3),
                 generation=int(row.get("generation") or 1),
                 lease_token="",
+                is_manual_review_replay=(
+                    (
+                        replay_manual_review
+                        and str(row.get("status") or "") == "manual_review"
+                    )
+                    or str(row.get("last_error") or "") == PRICING_CLAIMS_V2_REPLAY_RUNNING_MARKER
+                ),
             )
             if not claim:
                 tasks.append(task)
@@ -9003,7 +9306,11 @@ class D1PricingStore:
                     attempts = attempts + 1,
                     started_at = ?,
                     finished_at = NULL,
-                    last_error = NULL,
+                    last_error = CASE
+                      WHEN ? = 1 THEN ?
+                      WHEN last_error = ? THEN last_error
+                      ELSE NULL
+                    END,
                     lease_owner = ?,
                     lease_token = lower(hex(randomblob(16))),
                     lease_expires_at = ?,
@@ -9019,10 +9326,43 @@ class D1PricingStore:
                       AND lease_expires_at IS NOT NULL
                       AND lease_expires_at <= ?
                     )
+                    OR (
+                      ? = 1
+                      AND status = 'manual_review'
+                      AND coalesce(last_error, '') NOT LIKE ?
+                      AND id = (
+                        SELECT max(latest_task.id)
+                        FROM pricing_tasks latest_task
+                        WHERE latest_task.pricing_source_id = pricing_tasks.pricing_source_id
+                      )
+                      AND EXISTS (
+                        SELECT 1
+                        FROM pricing_sources replay_source
+                        JOIN tools replay_tool ON replay_tool.id = replay_source.tool_id
+                        WHERE replay_source.id = pricing_tasks.pricing_source_id
+                          AND replay_source.is_active = 1
+                          AND replay_tool.status IN ('published', 'pending_enrich', 'pending_review')
+                          AND replay_tool.duplicate_of_tool_id IS NULL
+                      )
+                    )
                   )
                 RETURNING attempts, max_attempts, generation, lease_token
                 """,
-                [now, lease_owner, lease_expires_at, now, task.task_id, 1 if task_ids else 0, now, now],
+                [
+                    now,
+                    1 if replay_manual_review else 0,
+                    PRICING_CLAIMS_V2_REPLAY_RUNNING_MARKER,
+                    PRICING_CLAIMS_V2_REPLAY_RUNNING_MARKER,
+                    lease_owner,
+                    lease_expires_at,
+                    now,
+                    task.task_id,
+                    1 if task_ids else 0,
+                    now,
+                    now,
+                    1 if replay_manual_review else 0,
+                    f"{PRICING_CLAIMS_V2_REPLAY_MARKER}:%",
+                ],
             )
             if claimed_rows:
                 claimed_row = claimed_rows[0]
@@ -9038,6 +9378,7 @@ class D1PricingStore:
                         max_attempts=int(claimed_row.get("max_attempts") or task.max_attempts),
                         generation=int(claimed_row.get("generation") or task.generation),
                         lease_token=str(claimed_row.get("lease_token") or ""),
+                        is_manual_review_replay=task.is_manual_review_replay,
                     )
                 )
         return tasks
@@ -9063,8 +9404,14 @@ class D1PricingStore:
         previous_rows = await self.d1.query(
             """
             SELECT pricing_region_hash, snapshot_format_version
-            FROM pricing_snapshots
-            WHERE pricing_source_id = ? AND pricing_region_hash IS NOT NULL
+            FROM pricing_snapshots snapshot
+            WHERE pricing_source_id = ?
+              AND pricing_region_hash IS NOT NULL
+              AND EXISTS (
+                SELECT 1
+                FROM pricing_snapshot_artifacts artifact
+                WHERE artifact.snapshot_id = snapshot.id
+              )
             ORDER BY fetched_at DESC, id DESC
             LIMIT 1
             """,
@@ -9659,6 +10006,43 @@ class D1PricingStore:
                         price.get("display_text"),
                     ],
                 )
+            for raw_feature in list(plan.get("features") or [])[:24]:
+                feature = normalize_plan_feature(raw_feature)
+                if feature is None:
+                    continue
+                await self.d1.run(
+                    """
+                    INSERT INTO plan_features (
+                      pricing_plan_id,
+                      feature_group,
+                      raw_name,
+                      normalized_key,
+                      state,
+                      value_type,
+                      value_number,
+                      value_text,
+                      unit,
+                      period,
+                      scope,
+                      evidence_quote
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    [
+                        plan_id,
+                        feature["feature_group"],
+                        feature["raw_name"],
+                        feature["normalized_key"],
+                        feature["state"],
+                        feature["value_type"],
+                        feature["value_number"],
+                        feature["value_text"],
+                        feature["unit"],
+                        feature["period"],
+                        feature["scope"],
+                        feature["evidence_quote"],
+                    ],
+                )
         return version_id
 
     async def update_summary(self, task: PricingTask, plans: list[dict[str, Any]]) -> None:
@@ -9730,22 +10114,40 @@ class D1PricingStore:
         if int(meta.get("changes") or 0) == 0:
             log_info("pricing_task.stale_completion_ignored", task_id=task.task_id)
             return False
-        if status == "succeeded":
+        capture_succeeded = bool(
+            result
+            and 200 <= result.status < 400
+            and result.page_status in {"found", "contact_sales"}
+            and result.html
+        )
+        if status == "succeeded" or capture_succeeded:
+            capture_hash = sha256_text(result.html) if result else None
             await self.d1.run(
                 """
                 UPDATE pricing_sources
-                SET last_success_at = ?,
-                    last_content_hash = ?,
-                    unchanged_runs = 0,
+                SET last_capture_at = ?,
+                    last_capture_hash = ?,
+                    last_success_at = CASE WHEN ? = 1 THEN ? ELSE last_success_at END,
+                    last_content_hash = CASE WHEN ? = 1 THEN ? ELSE last_content_hash END,
+                    unchanged_runs = CASE
+                      WHEN last_capture_hash = ? THEN unchanged_runs + 1
+                      ELSE 0
+                    END,
                     next_run_at = ?,
-                    last_error = NULL,
+                    last_error = ?,
                     updated_at = ?
                 WHERE id = ?
                 """,
                 [
                     now,
-                    sha256_text(result.html) if result else None,
+                    capture_hash,
+                    1 if status == "succeeded" else 0,
+                    now,
+                    1 if status == "succeeded" else 0,
+                    capture_hash,
+                    capture_hash,
                     iso_delta(days=30),
+                    None if status == "succeeded" else pricing_claims_v2_replay_detail(error),
                     now,
                     task.pricing_source_id,
                 ],
@@ -9758,7 +10160,7 @@ class D1PricingStore:
             SET last_error = ?, updated_at = ?
             WHERE id = ?
             """,
-            [(error or "")[:2000] or None, now, task.pricing_source_id],
+            [pricing_claims_v2_replay_detail(error), now, task.pricing_source_id],
         )
         return True
 
@@ -9793,6 +10195,11 @@ class D1PricingStore:
               ON materialization.extraction_id = extraction.id
             WHERE review.decision = 'approved'
               AND extraction.review_status = 'approved'
+              AND snapshot.id = (
+                SELECT max(newer_snapshot.id)
+                FROM pricing_snapshots newer_snapshot
+                WHERE newer_snapshot.pricing_source_id = snapshot.pricing_source_id
+              )
               AND (
                 materialization.extraction_id IS NULL
                 OR materialization.status = 'failed'
@@ -9935,20 +10342,20 @@ async def process_task(
 ) -> str:
     result = FetchResult(status="failed", monthly_rows=[], error="not_started")
     for attempt in range(max_retries + 1):
-        log_info(
-            "task.fetch_attempt.start",
+        log_debug(
+            "traffic_task.fetch_attempt.start",
             domain=task.normalized_domain,
             traffic_month=task.traffic_month,
             attempt=attempt + 1,
             max_attempts=max_retries + 1,
         )
         result = await similarweb.fetch(task.normalized_domain, task.traffic_month)
-        log_info(
-            "task.fetch_attempt.done",
+        log_task_result(
+            "traffic_task.fetch_attempt.done",
+            result.status,
             domain=task.normalized_domain,
             traffic_month=task.traffic_month,
             attempt=attempt + 1,
-            status=result.status,
         )
         if result.status != "failed":
             break
@@ -9974,7 +10381,7 @@ async def process_domain_state(
     rdap_created_at: str | None = None
     rdap_error: str | None = None
     for attempt in range(max_retries + 1):
-        log_info(
+        log_debug(
             "domain_state.fetch_attempt.start",
             domain=task.normalized_domain,
             attempt=attempt + 1,
@@ -9999,6 +10406,7 @@ async def process_domain_state(
                 error=current_result.error,
                 rdap_status=rdap_status,
                 rdap_error=rdap_error,
+                retry_after_seconds=current_result.retry_after_seconds,
             )
         except Exception as error:
             if fetch_rdap:
@@ -10012,16 +10420,21 @@ async def process_domain_state(
                 rdap_status=rdap_status,
                 rdap_error=rdap_error,
             )
-        log_info(
+        log_task_result(
             "domain_state.fetch_attempt.done",
+            result.status,
             domain=task.normalized_domain,
             attempt=attempt + 1,
-            status=result.status,
         )
         if result.status != "failed":
             break
         if attempt < max_retries:
-            await asyncio.sleep(random.uniform(1.0, 3.0))
+            await asyncio.sleep(
+                max(
+                    random.uniform(1.0, 3.0),
+                    float(result.retry_after_seconds or 0),
+                )
+            )
 
     if not await store.renew_lease(task):
         return "stale"
@@ -10035,49 +10448,123 @@ async def run_with_telemetry(
     workload: str,
     operation: Any,
 ) -> dict[str, int]:
-    telemetry = RunnerTelemetry(d1, config)
-    run_id = await telemetry.start(workload)
-    async def heartbeat_loop() -> None:
-        while True:
-            await asyncio.sleep(30)
-            try:
-                await telemetry.heartbeat()
-            except Exception as error:
-                log_error("runner.telemetry.heartbeat_failed", workload=workload, error=str(error)[:300])
-
-    heartbeat_task = asyncio.create_task(heartbeat_loop())
+    log_token = _LOG_WORKLOAD.set(workload)
     try:
-        counts = await operation()
-    except asyncio.CancelledError:
+        telemetry = RunnerTelemetry(d1, config, workload)
+        run_id = await telemetry.start(workload)
+        await telemetry.heartbeat()
+
+        async def heartbeat_loop() -> None:
+            while True:
+                await asyncio.sleep(30)
+                try:
+                    await telemetry.heartbeat()
+                except Exception as error:
+                    log_error("runner.telemetry.heartbeat_failed", error=str(error)[:300])
+
+        heartbeat_task = asyncio.create_task(heartbeat_loop())
         try:
-            await telemetry.finish(run_id, error="cancelled")
-        except Exception as telemetry_error:
-            log_error("runner.telemetry.cancel_finish_failed", workload=workload, error=str(telemetry_error)[:300])
-        raise
-    except Exception as error:
-        try:
-            await telemetry.finish(run_id, error=str(error)[:2000])
-        except Exception as telemetry_error:
-            log_error(
-                "runner.telemetry.finish_failed",
-                workload=workload,
-                run_id=run_id,
-                error=str(telemetry_error)[:300],
-            )
-        raise
+            counts = await operation()
+        except asyncio.CancelledError:
+            try:
+                await telemetry.finish(run_id, error="cancelled")
+            except Exception as telemetry_error:
+                log_error("runner.telemetry.cancel_finish_failed", error=str(telemetry_error)[:300])
+            raise
+        except Exception as error:
+            try:
+                await telemetry.finish(run_id, error=str(error)[:2000])
+            except Exception as telemetry_error:
+                log_error(
+                    "runner.telemetry.finish_failed",
+                    run_id=run_id,
+                    error=str(telemetry_error)[:300],
+                )
+            raise
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+        await telemetry.finish(run_id, counts=counts)
+        return counts
     finally:
-        heartbeat_task.cancel()
-        with suppress(asyncio.CancelledError):
-            await heartbeat_task
-    await telemetry.finish(run_id, counts=counts)
-    return counts
+        _LOG_WORKLOAD.reset(log_token)
+
+
+async def run_with_service_heartbeat(
+    config: Config,
+    operation: Any,
+    heartbeat_interval_seconds: int = 30,
+) -> Any:
+    """Keep process liveness independent from bounded workload runs and sleeps."""
+    async with D1Client(config) as heartbeat_d1:
+        telemetry = RunnerTelemetry(heartbeat_d1, config)
+
+        async def heartbeat_loop() -> None:
+            registered = False
+            while True:
+                try:
+                    if not registered:
+                        await telemetry.register()
+                        registered = True
+                    await telemetry.heartbeat()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as error:
+                    registered = False
+                    log_error(
+                        "runner.telemetry.service_heartbeat_failed",
+                        error=str(error)[:300],
+                    )
+                await asyncio.sleep(max(1, heartbeat_interval_seconds))
+
+        heartbeat_task = asyncio.create_task(heartbeat_loop())
+        # Let the first registration attempt begin without making workload
+        # startup depend on telemetry availability.
+        await asyncio.sleep(0)
+        try:
+            return await operation(telemetry)
+        finally:
+            heartbeat_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await heartbeat_task
+
+
+async def report_service_schedule(
+    telemetry: RunnerTelemetry | None,
+    delay_seconds: int,
+    *,
+    backoff_reason: str | None = None,
+) -> None:
+    if telemetry is None:
+        return
+    delay_seconds = max(0, int(delay_seconds))
+    try:
+        await telemetry.heartbeat(
+            {
+                "next_poll_at": iso_delta(seconds=delay_seconds),
+                "backoff_until": iso_delta(seconds=delay_seconds) if backoff_reason else None,
+                "backoff_reason": backoff_reason,
+            }
+        )
+    except Exception as error:
+        log_error("runner.telemetry.schedule_failed", error=str(error)[:300])
 
 
 async def _run_domain_state_once(config: Config, d1: D1Client, limit: int | None = None) -> dict[str, int]:
     effective_limit = limit or config.domain_state_limit
-    log_info("domain_state_runner.batch.start", limit=effective_limit, concurrency=config.concurrency)
+    concurrency = getattr(config, "domain_state_concurrency", config.concurrency)
+    log_info("domain_state_runner.batch.start", limit=effective_limit, concurrency=concurrency)
     store = D1DomainStateStore(d1)
-    client = DomainStateClient(config.ahref_api_key)
+    requests_per_minute = getattr(
+        config,
+        "ahrefs_requests_per_minute",
+        AHREFS_DEFAULT_REQUESTS_PER_MINUTE,
+    )
+    client = DomainStateClient(
+        config.ahref_api_key,
+        requests_per_minute=requests_per_minute,
+    )
     credential_requeued = (
         await store.requeue_missing_credential_tasks(effective_limit)
         if config.ahref_api_key
@@ -10092,7 +10579,7 @@ async def _run_domain_state_once(config: Config, d1: D1Client, limit: int | None
     tasks = await store.claim_due_tasks(effective_limit, config.runner_instance_id)
     log_info("domain_state_runner.claim_due_tasks.done", claimed=len(tasks))
 
-    semaphore = asyncio.Semaphore(config.concurrency)
+    semaphore = asyncio.Semaphore(concurrency)
     counts = {
         "credential_requeued": credential_requeued,
         "queued": queued,
@@ -10133,7 +10620,7 @@ async def _run_domain_state_once(config: Config, d1: D1Client, limit: int | None
                         error=str(completion_error)[:300],
                     )
             counts[status] = counts.get(status, 0) + 1
-            log_info("domain_state.done", domain=task.normalized_domain, status=status)
+            log_task_result("domain_state.done", status, domain=task.normalized_domain)
 
     if tasks:
         await asyncio.gather(*(guarded(task) for task in tasks))
@@ -10209,7 +10696,6 @@ async def process_asset_task(
     store: D1AssetStore,
     public_base_url: str,
     max_retries: int,
-    category_options: list[str] | list[CategoryCatalogEntry],
 ) -> str:
     last_error = "not_started"
     last_retryable = True
@@ -10219,7 +10705,7 @@ async def process_asset_task(
         if not missing_before:
             if not await store.complete_task(task, "done"):
                 return "stale"
-            log_info(
+            log_debug(
                 "asset_task.fetch_attempt.skipped",
                 tool_id=task.tool_id,
                 slug=task.canonical_slug,
@@ -10242,7 +10728,7 @@ async def process_asset_task(
             )
 
         try:
-            log_info(
+            log_debug(
                 "asset_task.fetch_attempt.start",
                 tool_id=task.tool_id,
                 slug=task.canonical_slug,
@@ -10303,71 +10789,41 @@ async def process_asset_task(
                     feature_result = await browser_client.fetch_homepage_key_features(task)
                     if not await store.renew_lease(task):
                         return "stale"
-                    await store.save_tool_features(task, feature_result)
-                    if feature_result.metadata_error:
+                    if feature_result.key_features and not feature_result.metadata_error:
+                        await store.save_tool_features(task, feature_result)
+                    elif await store.save_deterministic_tool_features(
+                        task,
+                        core_result.html if core_result else "",
+                    ):
+                        log_info(
+                            "assets.key_features.deterministic_fallback",
+                            tool_id=task.tool_id,
+                            slug=task.canonical_slug,
+                            model_error=feature_result.metadata_error[:200],
+                        )
+                    else:
                         record_stage_error(
                             "key_features",
-                            feature_result.metadata_error,
+                            feature_result.metadata_error or "features_empty",
                             retryable=feature_result.metadata_retryable,
                         )
                 except Exception as error:
-                    record_stage_error("key_features", error)
-
-            if "category" in missing_before:
-                try:
-                    if await store.category_is_waived(task.tool_id):
+                    try:
+                        fallback_saved = await store.save_deterministic_tool_features(
+                            task,
+                            core_result.html if core_result else "",
+                        )
+                    except Exception:
+                        fallback_saved = False
+                    if fallback_saved:
                         log_info(
-                            "assets.category.waived_needs_manual",
+                            "assets.key_features.deterministic_fallback",
                             tool_id=task.tool_id,
                             slug=task.canonical_slug,
+                            model_error=str(error)[:200],
                         )
                     else:
-                        category_result = await browser_client.fetch_homepage_categories(
-                            task,
-                            category_options,
-                        )
-                        if not await store.renew_lease(task):
-                            return "stale"
-                        if category_result.metadata_error or (
-                            not category_result.category_l1 and not category_result.category_l2
-                        ):
-                            state = await store.record_category_classification_failure(
-                                task.tool_id,
-                                category_result.metadata_error or "category_empty",
-                                raw_output=category_result.category_raw_output,
-                            )
-                            waived = str(state.get("status") or "") == "needs_manual"
-                            record_stage_error(
-                                "category",
-                                category_result.metadata_error or "category_empty",
-                                # After max attempts, leave the category for an admin instead of retrying forever.
-                                retryable=not waived,
-                            )
-                            if waived:
-                                log_info(
-                                    "assets.category.needs_manual",
-                                    tool_id=task.tool_id,
-                                    slug=task.canonical_slug,
-                                    attempts=state.get("attempts"),
-                                    error=(category_result.metadata_error or "category_empty")[:200],
-                                )
-                        else:
-                            await store.save_tool_categories(task, category_result)
-                except Exception as error:
-                    state = await store.record_category_classification_failure(
-                        task.tool_id,
-                        str(error)[:500],
-                    )
-                    waived = str(state.get("status") or "") == "needs_manual"
-                    record_stage_error("category", error, retryable=not waived)
-                    if waived:
-                        log_info(
-                            "assets.category.needs_manual",
-                            tool_id=task.tool_id,
-                            slug=task.canonical_slug,
-                            attempts=state.get("attempts"),
-                            error=str(error)[:200],
-                        )
+                        record_stage_error("key_features", error)
 
             if "screenshot" in missing_before:
                 try:
@@ -10421,9 +10877,6 @@ async def process_asset_task(
             # revive it forever. Successful stages are still skipped on every
             # retry because missing_before is recomputed at the top of the loop.
             blocking_requirements = list(missing_requirements)
-            # Category may still appear missing if migration not applied; double-check waiver.
-            if "category" in blocking_requirements and await store.category_is_waived(task.tool_id):
-                blocking_requirements = [item for item in blocking_requirements if item != "category"]
             if blocking_requirements:
                 details = [f"missing={','.join(blocking_requirements)}"]
                 if stage_errors:
@@ -10434,7 +10887,7 @@ async def process_asset_task(
 
             if not await store.complete_task(task, "done"):
                 return "stale"
-            log_info(
+            log_debug(
                 "asset_task.fetch_attempt.done",
                 tool_id=task.tool_id,
                 slug=task.canonical_slug,
@@ -10592,6 +11045,8 @@ async def run_openai_pricing_extraction(
     if not ((review_status != "approved" or needs_model_check) and openai_extractors and result.page_status == "found"):
         return payload, review_status, confidence, validation_errors, None
 
+    rule_payload = payload
+    rule_review_status = review_status
     model_name = None
     model_verified = False
     for index, openai_extractor in enumerate(openai_extractors):
@@ -10615,6 +11070,29 @@ async def run_openai_pricing_extraction(
         payload, review_status, confidence, validation_errors = openai_extraction
         model_name = openai_extractor.model
         model_verified = True
+        rule_model_agreement = (
+            rule_review_status == "approved"
+            and review_status == "approved"
+            and pricing_payloads_agree(rule_payload, payload)
+        )
+        if rule_model_agreement:
+            merge_evidenced_rule_features(rule_payload, payload)
+        payload["verification"] = {
+            "rule_model_agreement": rule_model_agreement,
+            "model_check_reasons": model_check_reasons,
+        }
+        if (
+            needs_model_check
+            and rule_review_status == "approved"
+            and review_status == "approved"
+            and not rule_model_agreement
+        ):
+            review_status = "manual_review"
+            validation_errors = [
+                *validation_errors,
+                "Rule and model price facts disagree",
+            ]
+            confidence = min(confidence, 65)
         if (review_status != "approved" or confidence < OPENAI_PRICING_MIN_CONFIDENCE) and index + 1 < len(openai_extractors):
             log_info(
                 "pricing.openai.escalate",
@@ -10729,10 +11207,12 @@ async def process_pricing_task(
     approve_pricing: bool,
     dry_run: bool,
     claims_shadow_uploader: R2AssetUploader | None = None,
+    strict_auto_publish_enabled: bool = False,
+    strict_auto_publish_min_confidence: int = 82,
 ) -> str:
     result = PricingFetchResult(task.source_url, task.source_url, 0, "", "", "not_started")
     for attempt in range(max_retries + 1):
-        log_info(
+        log_debug(
             "pricing_task.fetch_attempt.start",
             task_id=task.task_id,
             slug=task.canonical_slug,
@@ -10740,7 +11220,8 @@ async def process_pricing_task(
             max_attempts=max_retries + 1,
         )
         result = await client.choose_pricing_page(task)
-        log_info(
+        pricing_fetch_log = log_debug if result.status and result.status < 500 else log_info
+        pricing_fetch_log(
             "pricing_task.fetch_attempt.done",
             task_id=task.task_id,
             slug=task.canonical_slug,
@@ -10829,9 +11310,43 @@ async def process_pricing_task(
     )
     payload["final_pipeline_stage"] = final_pipeline_stage
 
-    if review_status == "approved" and not approve_pricing:
+    verification = payload.get("verification") if isinstance(payload.get("verification"), dict) else {}
+    auto_approval = evaluate_strict_auto_approval(
+        payload,
+        review_status=review_status,
+        confidence=confidence,
+        validation_errors=validation_errors,
+        http_status=result.status,
+        page_status=result.page_status,
+        strict_source_context=(
+            is_strict_pricing_url(result.final_url)
+            and final_url_matches_source_context(task.source_url, result.final_url)
+        ),
+        model_used=bool(model_name),
+        rule_model_agreement=bool(verification.get("rule_model_agreement")),
+        min_confidence=strict_auto_publish_min_confidence,
+    )
+    payload["auto_approval"] = auto_approval.as_dict()
+    strict_auto_publish = strict_auto_publish_enabled and auto_approval.eligible
+
+    if strict_auto_publish:
+        log_info(
+            "pricing_task.strict_auto_publish.accepted",
+            task_id=task.task_id,
+            slug=task.canonical_slug,
+            policy_version=auto_approval.policy_version,
+            confidence=confidence,
+            final_pipeline_stage=final_pipeline_stage,
+            plans=len(payload.get("plans") or []),
+        )
+
+    if review_status == "approved" and not (approve_pricing or strict_auto_publish):
         review_status = "manual_review"
-        validation_errors = ["Python extraction pending manual approval"]
+        validation_errors = (
+            [f"Strict auto-publish blocked: {', '.join(auto_approval.reasons)}"]
+            if strict_auto_publish_enabled
+            else ["Python extraction pending manual approval"]
+        )
         confidence = min(confidence, 70)
 
     if dry_run:
@@ -10851,6 +11366,8 @@ async def process_pricing_task(
         return "stale"
     claims_bundle: PricingSnapshotBundle | None = None
     shadow_plan: SnapshotCapturePlan | None = None
+    shadow_persisted = False
+    shadow_claim_count = 0
     if claims_shadow_uploader is not None and result.html:
         try:
             claims_bundle = build_pricing_snapshot_bundle(
@@ -10907,6 +11424,8 @@ async def process_pricing_task(
                 claims_bundle,
                 shadow_plan,
             )
+            shadow_persisted = True
+            shadow_claim_count = len(claims_bundle.raw_claims)
             log_info(
                 "pricing_claims_shadow.persisted",
                 task_id=task.task_id,
@@ -10941,32 +11460,60 @@ async def process_pricing_task(
         return "succeeded" if completed else "stale"
 
     error = "; ".join(validation_errors)[:900] or result.error or "manual review"
+    if task.is_manual_review_replay and shadow_persisted:
+        error = pricing_claims_v2_replay_error(error, shadow_claim_count)
     completed = await store.finish_task(task, "manual_review", error, result)
     return "manual_review" if completed else "stale"
 
 
 async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = None) -> dict[str, int]:
     effective_limit = limit or config.asset_limit
+    concurrency = getattr(config, "asset_concurrency", config.concurrency)
+    reconciliation_limit = getattr(config, "enrichment_reconcile_limit", 100)
+    reconciliation_concurrency = getattr(
+        config,
+        "enrichment_reconcile_concurrency",
+        min(5, concurrency),
+    )
     log_info(
         "assets_runner.batch.start",
         limit=effective_limit,
-        concurrency=config.concurrency,
-        category_model=config.category_classification_model,
-        category_fallback_model=config.category_classification_fallback_model,
-        category_prompt_version=CATEGORY_CLASSIFICATION_PROMPT_VERSION,
+        concurrency=concurrency,
+        enrichment_reconcile_limit=reconciliation_limit,
+        enrichment_reconcile_concurrency=reconciliation_concurrency,
+        category_owner="taxonomy-worker",
     )
+    publication = {"selected": 0, "published": 0, "skipped": 0, "failed": 0}
+    if getattr(config, "catalog_auto_publish_enabled", True):
+        try:
+            publication.update(
+                await D1CatalogPublisher(
+                    d1,
+                    config.runner_instance_id,
+                ).publish_ready(
+                    getattr(config, "catalog_auto_publish_limit", 25)
+                )
+            )
+            log_info("catalog_auto_publish.batch.done", **publication)
+        except Exception as error:
+            publication["failed"] = 1
+            log_error("catalog_auto_publish.batch.failed", error=str(error)[:500])
+    else:
+        log_debug("catalog_auto_publish.disabled", kill_switch="CATALOG_AUTO_PUBLISH_ENABLED=0")
     browser_client = CloudflareBrowserRunAssetClient(config)
     uploader = R2AssetUploader(config)
     await uploader.check_access()
     store = D1AssetStore(d1)
-    category_options = await store.category_catalog()
+    revived = await store.revive_incomplete_dead_letter_tasks(effective_limit)
+    log_info("assets_runner.revive_incomplete_dead_letters.done", revived=revived)
     queued = await store.queue_missing_asset_tasks(effective_limit)
     log_info("assets_runner.queue_missing_asset_tasks.done", queued=queued)
     tasks = await store.claim_due_tasks(effective_limit, config.runner_instance_id)
     log_info("assets_runner.claim_due_tasks.done", claimed=len(tasks))
 
-    semaphore = asyncio.Semaphore(config.concurrency)
+    semaphore = asyncio.Semaphore(concurrency)
     counts = {
+        "asset_revived": revived,
         "asset_queued": queued,
         "claimed": len(tasks),
         "done": 0,
@@ -10975,6 +11522,11 @@ async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = Non
         "enrichment_ready": 0,
         "enrichment_blocked": 0,
         "enrichment_evaluated": 0,
+        "enrichment_has_more": 0,
+        "auto_publish_selected": publication["selected"],
+        "auto_publish_published": publication["published"],
+        "auto_publish_skipped": publication["skipped"],
+        "auto_publish_failed": publication["failed"],
     }
 
     async def guarded(task: AssetTask) -> None:
@@ -10987,7 +11539,6 @@ async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = Non
                     store,
                     config.r2_public_base_url,
                     config.max_retries,
-                    category_options,
                 )
             except Exception as error:
                 status = "failed"
@@ -11001,20 +11552,32 @@ async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = Non
                 if not await store.complete_task(task, "failed", str(error)[:900]):
                     status = "stale"
             counts[status] = counts.get(status, 0) + 1
-            log_info("asset_task.done", tool_id=task.tool_id, slug=task.canonical_slug, status=status)
+            log_task_result(
+                "asset_task.done",
+                status,
+                tool_id=task.tool_id,
+                slug=task.canonical_slug,
+            )
 
     enrichment = D1EnrichmentStore(d1)
     if tasks:
         await asyncio.gather(*(guarded(task) for task in tasks))
-        for tool_id in dict.fromkeys(task.tool_id for task in tasks):
-            readiness = await enrichment.evaluate_tool(tool_id)
-            if readiness in ("ready", "blocked"):
-                counts[f"enrichment_{readiness}"] += 1
+        task_reconciliation = await enrichment.evaluate_tools(
+            list(dict.fromkeys(task.tool_id for task in tasks)),
+            reconciliation_concurrency,
+        )
+        counts["enrichment_evaluated"] += task_reconciliation["evaluated"]
+        counts["enrichment_ready"] += task_reconciliation["ready"]
+        counts["enrichment_blocked"] += task_reconciliation["blocked"]
 
-    reconciliation = await enrichment.reconcile_active_tools(effective_limit)
+    reconciliation = await enrichment.reconcile_active_tools(
+        reconciliation_limit,
+        reconciliation_concurrency,
+    )
     counts["enrichment_evaluated"] += reconciliation["evaluated"]
     counts["enrichment_ready"] += reconciliation["ready"]
     counts["enrichment_blocked"] += reconciliation["blocked"]
+    counts["enrichment_has_more"] = reconciliation["has_more"]
 
     return counts
 
@@ -11031,7 +11594,8 @@ async def run_assets_once(config: Config, limit: int | None = None) -> dict[str,
 
 async def _run_once(config: Config, d1: D1Client, limit: int | None = None) -> dict[str, int]:
     effective_limit = limit or config.limit
-    log_info("runner.batch.start", limit=effective_limit, concurrency=config.concurrency)
+    concurrency = getattr(config, "traffic_concurrency", config.concurrency)
+    log_info("traffic_runner.batch.start", limit=effective_limit, concurrency=concurrency)
     store = D1TaskStore(d1)
     traffic_month = previous_traffic_month()
     if not traffic_release_probe_window_open(config):
@@ -11083,11 +11647,11 @@ async def _run_once(config: Config, d1: D1Client, limit: int | None = None) -> d
         }
 
     queued = await store.queue_missing_traffic_tasks(config.traffic_release_queue_limit, traffic_month)
-    log_info("runner.queue_missing_traffic_tasks.done", queued=queued, traffic_month=traffic_month)
+    log_info("traffic_runner.queue_missing_traffic_tasks.done", queued=queued, traffic_month=traffic_month)
     tasks = await store.claim_due_tasks(effective_limit, config.runner_instance_id)
-    log_info("runner.claim_due_tasks.done", claimed=len(tasks))
+    log_info("traffic_runner.claim_due_tasks.done", claimed=len(tasks))
 
-    semaphore = asyncio.Semaphore(config.concurrency)
+    semaphore = asyncio.Semaphore(concurrency)
     counts = {
         "traffic_queued": queued,
         "claimed": len(tasks),
@@ -11105,13 +11669,13 @@ async def _run_once(config: Config, d1: D1Client, limit: int | None = None) -> d
     async def guarded(task: TrafficTask) -> None:
         async with semaphore:
             try:
-                log_info("task.start", domain=task.normalized_domain, traffic_month=task.traffic_month)
+                log_debug("traffic_task.start", domain=task.normalized_domain, traffic_month=task.traffic_month)
                 status = await process_task(task, similarweb, d1, store, config.max_retries)
             except Exception as error:
                 status = "failed"
                 error_message = str(error)[:2000]
                 log_error(
-                    "task.failed_with_exception",
+                    "traffic_task.failed_with_exception",
                     domain=task.normalized_domain,
                     traffic_month=task.traffic_month,
                     error_type=type(error).__name__,
@@ -11123,7 +11687,12 @@ async def _run_once(config: Config, d1: D1Client, limit: int | None = None) -> d
                 ):
                     status = "stale"
             counts[status] = counts.get(status, 0) + 1
-            log_info("task.done", domain=task.normalized_domain, traffic_month=task.traffic_month, status=status)
+            log_task_result(
+                "traffic_task.done",
+                status,
+                domain=task.normalized_domain,
+                traffic_month=task.traffic_month,
+            )
 
     if tasks:
         await asyncio.gather(*(guarded(task) for task in tasks))
@@ -11151,6 +11720,7 @@ async def _run_pricing_once(
     timeout_seconds: int | None = None,
 ) -> dict[str, int]:
     effective_limit = limit or config.pricing_limit
+    concurrency = getattr(config, "pricing_concurrency", config.concurrency)
     assert_safe_pricing_claim_flags(
         shadow_enabled=config.pricing_claims_shadow,
         publish_enabled=config.pricing_claims_publish,
@@ -11158,11 +11728,17 @@ async def _run_pricing_once(
     log_info(
         "pricing_runner.batch.start",
         limit=effective_limit,
-        concurrency=config.concurrency,
+        concurrency=concurrency,
         dry_run=dry_run,
         approve_pricing=approve_pricing,
         pricing_claims_shadow=config.pricing_claims_shadow,
         pricing_claims_publish=config.pricing_claims_publish,
+        pricing_strict_auto_publish_enabled=getattr(
+            config, "pricing_strict_auto_publish_enabled", False
+        ),
+        pricing_strict_auto_publish_min_confidence=getattr(
+            config, "pricing_strict_auto_publish_min_confidence", 82
+        ),
     )
     store = D1PricingStore(d1)
     materialized = 0
@@ -11234,16 +11810,43 @@ async def _run_pricing_once(
         task_ids=task_ids,
         claim=not dry_run,
         lease_owner=config.runner_instance_id,
+        replay_manual_review=False,
     )
-    log_info("pricing_runner.claim_due_tasks.done", claimed=len(tasks), dry_run=dry_run)
+    if (
+        config.pricing_claims_shadow
+        and not dry_run
+        and not task_ids
+        and len(tasks) < effective_limit
+        and config.pricing_manual_review_replay_limit > 0
+    ):
+        replay_limit = min(
+            effective_limit - len(tasks),
+            config.pricing_manual_review_replay_limit,
+        )
+        tasks.extend(
+            await store.claim_due_tasks(
+                replay_limit,
+                claim=True,
+                lease_owner=config.runner_instance_id,
+                replay_manual_review=True,
+            )
+        )
+    manual_review_replayed = sum(1 for task in tasks if task.is_manual_review_replay)
+    log_info(
+        "pricing_runner.claim_due_tasks.done",
+        claimed=len(tasks),
+        manual_review_replayed=manual_review_replayed,
+        dry_run=dry_run,
+    )
 
-    semaphore = asyncio.Semaphore(config.concurrency)
+    semaphore = asyncio.Semaphore(concurrency)
     counts = {
         "queued": queued,
         "discovered_sources": discovered_sources,
         "materialized": materialized,
         "materialization_failed": materialization_failed,
         "claimed": len(tasks),
+        "manual_review_replayed": manual_review_replayed,
         "succeeded": 0,
         "manual_review": 0,
         "failed": 0,
@@ -11254,7 +11857,7 @@ async def _run_pricing_once(
     async def guarded(task: PricingTask) -> None:
         async with semaphore:
             try:
-                log_info("pricing_task.start", task_id=task.task_id, slug=task.canonical_slug)
+                log_debug("pricing_task.start", task_id=task.task_id, slug=task.canonical_slug)
                 status = await process_pricing_task(
                     task,
                     client,
@@ -11265,6 +11868,12 @@ async def _run_pricing_once(
                     approve_pricing=approve_pricing,
                     dry_run=dry_run,
                     claims_shadow_uploader=claims_shadow_uploader,
+                    strict_auto_publish_enabled=getattr(
+                        config, "pricing_strict_auto_publish_enabled", False
+                    ),
+                    strict_auto_publish_min_confidence=getattr(
+                        config, "pricing_strict_auto_publish_min_confidence", 82
+                    ),
                 )
             except Exception as error:
                 status = "failed" if dry_run else "manual_review"
@@ -11278,7 +11887,12 @@ async def _run_pricing_once(
                     if not await store.finish_task(task, "manual_review", str(error)[:900], None):
                         status = "stale"
             counts[status] = counts.get(status, 0) + 1
-            log_info("pricing_task.done", task_id=task.task_id, slug=task.canonical_slug, status=status)
+            log_task_result(
+                "pricing_task.done",
+                status,
+                task_id=task.task_id,
+                slug=task.canonical_slug,
+            )
 
     if tasks:
         await asyncio.gather(*(guarded(task) for task in tasks))
@@ -11294,6 +11908,9 @@ async def run_pricing_once(
     dry_run: bool = False,
     timeout_seconds: int | None = None,
 ) -> dict[str, int]:
+    if not getattr(config, "pricing_monitor_enabled", True):
+        log_info("pricing_runner.disabled", kill_switch="PRICING_MONITOR_ENABLED=0")
+        return {"disabled": 1}
     async with D1Client(config) as d1:
         if dry_run:
             return await _run_pricing_once(
@@ -11321,27 +11938,73 @@ async def run_pricing_once(
         )
 
 
+def assets_next_delay_seconds(
+    counts: dict[str, int],
+    batch_limit: int,
+    idle_interval_seconds: int,
+) -> int:
+    """Drain known backlog immediately and poll briefly only after a partial batch."""
+    claimed = max(0, int(counts.get("claimed") or 0))
+    queued = max(0, int(counts.get("asset_queued") or 0))
+    revived = max(0, int(counts.get("asset_revived") or 0))
+    effective_limit = max(1, int(batch_limit))
+
+    if claimed >= effective_limit or int(counts.get("enrichment_has_more") or 0):
+        return 0
+    if claimed > 0 or queued > 0 or revived > 0:
+        return min(max(1, int(idle_interval_seconds)), 5)
+    return max(1, int(idle_interval_seconds))
+
+
 async def run_assets_loop(config: Config, limit: int | None, interval_seconds: int) -> None:
-    log_info("assets_runner.loop.start", interval_seconds=interval_seconds)
+    effective_limit = limit or config.asset_limit
+    log_info(
+        "assets_runner.loop.start",
+        interval_seconds=interval_seconds,
+        batch_limit=effective_limit,
+        concurrency=getattr(config, "asset_concurrency", config.concurrency),
+        enrichment_reconcile_limit=getattr(config, "enrichment_reconcile_limit", 100),
+    )
     while True:
+        started_at = time.monotonic()
+        next_delay = interval_seconds
         try:
-            counts = await run_assets_once(config, limit)
-            log_info("assets_runner.batch.summary", **counts)
-        except Exception as error:
-            log_error("assets_runner.batch.failed", error=str(error)[:500])
-        await asyncio.sleep(interval_seconds)
-
-
-async def run_loop(config: Config, limit: int | None, interval_seconds: int) -> None:
-    log_info("runner.loop.start", interval_seconds=interval_seconds)
-    while True:
-        try:
-            counts = await run_once(config, limit)
-            log_info("runner.batch.summary", **counts)
+            counts = await run_assets_once(config, effective_limit)
+            log_info(
+                "assets_runner.batch.summary",
+                duration_ms=round((time.monotonic() - started_at) * 1000),
+                **counts,
+            )
+            next_delay = assets_next_delay_seconds(
+                counts,
+                effective_limit,
+                interval_seconds,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            log_error("runner.batch.failed", error=str(error)[:500])
+            log_error("assets_runner.batch.failed", error=str(error)[:500])
+        if next_delay == 0:
+            await asyncio.sleep(0)
+            continue
+        await asyncio.sleep(next_delay)
+
+
+async def run_loop(config: Config, limit: int | None, interval_seconds: int) -> None:
+    log_info("traffic_runner.loop.start", interval_seconds=interval_seconds)
+    while True:
+        started_at = time.monotonic()
+        try:
+            counts = await run_once(config, limit)
+            log_info(
+                "traffic_runner.batch.summary",
+                duration_ms=round((time.monotonic() - started_at) * 1000),
+                **counts,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            log_error("traffic_runner.batch.failed", error=str(error)[:500])
         await asyncio.sleep(interval_seconds)
 
 
@@ -11355,7 +12018,12 @@ async def run_pricing_loop(
     timeout_seconds: int | None,
 ) -> None:
     log_info("pricing_runner.loop.start", interval_seconds=interval_seconds)
+    if not getattr(config, "pricing_monitor_enabled", True):
+        log_info("pricing_runner.disabled", kill_switch="PRICING_MONITOR_ENABLED=0")
+        while True:
+            await asyncio.sleep(max(60, interval_seconds))
     while True:
+        started_at = time.monotonic()
         try:
             counts = await run_pricing_once(
                 config,
@@ -11365,7 +12033,11 @@ async def run_pricing_loop(
                 dry_run=dry_run,
                 timeout_seconds=timeout_seconds,
             )
-            log_info("pricing_runner.batch.summary", **counts)
+            log_info(
+                "pricing_runner.batch.summary",
+                duration_ms=round((time.monotonic() - started_at) * 1000),
+                **counts,
+            )
         except asyncio.CancelledError:
             raise
         except Exception as error:
@@ -11373,19 +12045,71 @@ async def run_pricing_loop(
         await asyncio.sleep(interval_seconds)
 
 
+def domain_state_next_delay_seconds(
+    counts: dict[str, int],
+    batch_limit: int,
+    idle_interval_seconds: int,
+) -> int:
+    """Drain full batches quickly, then back off when the queue is light or idle."""
+    configured_interval = max(1, int(idle_interval_seconds))
+    claimed = max(0, int(counts.get("claimed") or 0))
+    queued = max(0, int(counts.get("queued") or 0))
+    effective_limit = max(1, int(batch_limit))
+
+    if claimed >= effective_limit or queued >= effective_limit:
+        return configured_interval
+    if claimed > 0 or queued > 0:
+        return max(configured_interval, 10)
+    return max(configured_interval, 60)
+
+
 async def run_domain_state_loop(config: Config, limit: int | None, interval_seconds: int) -> None:
-    log_info("domain_state_runner.loop.start", interval_seconds=interval_seconds)
+    effective_limit = limit or config.domain_state_limit
+    log_info(
+        "domain_state_runner.loop.start",
+        interval_seconds=interval_seconds,
+        batch_limit=effective_limit,
+        max_age_days=config.domain_state_max_age_days,
+        requests_per_minute=getattr(
+            config,
+            "ahrefs_requests_per_minute",
+            AHREFS_DEFAULT_REQUESTS_PER_MINUTE,
+        ),
+    )
     while True:
+        started_at = time.monotonic()
+        next_delay = interval_seconds
         try:
-            counts = await run_domain_state_once(config, limit)
-            log_info("domain_state_runner.batch.summary", **counts)
+            counts = await run_domain_state_once(config, effective_limit)
+            log_info(
+                "domain_state_runner.batch.summary",
+                duration_ms=round((time.monotonic() - started_at) * 1000),
+                **counts,
+            )
+            next_delay = domain_state_next_delay_seconds(
+                counts,
+                effective_limit,
+                interval_seconds,
+            )
         except Exception as error:
             log_error("domain_state_runner.batch.failed", error=str(error)[:500])
-        await asyncio.sleep(interval_seconds)
+        await asyncio.sleep(next_delay)
 
 
 async def run_taxonomy_once(config: Config) -> dict[str, int]:
+    if not config.taxonomy_auto_enabled:
+        return {"disabled": 1}
+
     async def operation() -> dict[str, int]:
+        # Older tests and maintenance callers may pass a lightweight config
+        # object without this field; only the real loaded Config opts in.
+        if getattr(config, "taxonomy_batch_enabled", False):
+            from taxonomy_batch import run_openai_taxonomy_batch_once
+
+            return await run_openai_taxonomy_batch_once(
+                config,
+                config.taxonomy_limit,
+            )
         # Import inside the telemetered operation so packaging/import failures
         # are visible as failed taxonomy runs instead of disappearing in logs.
         from taxonomy_shadow import run_shadow_taxonomy
@@ -11394,7 +12118,18 @@ async def run_taxonomy_once(config: Config) -> dict[str, int]:
             config,
             config.taxonomy_limit,
             allow_unresolved_entity=True,
-            include_capabilities=False,
+            include_auto_non_product_recheck=getattr(
+                config, "taxonomy_recheck_auto_non_product", True
+            ),
+            include_capabilities=getattr(
+                config, "taxonomy_capabilities_enabled", True
+            ),
+            include_capability_backfill=getattr(
+                config, "taxonomy_capability_backfill_enabled", True
+            ),
+            capability_candidate_limit=getattr(
+                config, "taxonomy_capability_candidate_limit", 96
+            ),
             concurrency=config.taxonomy_concurrency,
             auto_accept_threshold=config.taxonomy_auto_accept_confidence,
         )
@@ -11408,26 +12143,152 @@ async def run_taxonomy_once(config: Config) -> dict[str, int]:
         )
 
 
-async def run_taxonomy_loop(config: Config) -> None:
+def taxonomy_next_delay_seconds(config: Config, counts: dict[str, int]) -> int:
+    """Poll only when drained; immediately continue while a full batch signals backlog."""
+    if int(counts.get("provider_blocked") or 0) > 0:
+        return int(config.taxonomy_provider_backoff_seconds)
+    if int(counts.get("auto_non_product_recheck_selected") or 0) > 0:
+        # Incident repair is intentionally paced so operators can inspect each
+        # batch and trip the kill switch before another provider-cost burst.
+        return int(config.taxonomy_interval_seconds)
+    if (
+        int(counts.get("capability_backfill_selected") or 0) > 0
+        or int(counts.get("capability_only_selected") or 0) > 0
+    ):
+        # Backfill is deliberately paced: one bounded model call per stored
+        # profile, with an operator-visible interval between paid batches.
+        return int(config.taxonomy_interval_seconds)
+    if int(counts.get("terminal_has_more") or 0) > 0:
+        # Lifecycle-only reconciliation spends no provider budget. Drain it
+        # immediately instead of leaving hundreds of terminal tools behind a
+        # five-minute taxonomy polling interval.
+        return 0
+    if int(counts.get("selected") or 0) >= int(config.taxonomy_limit):
+        return 0
+    return int(config.taxonomy_interval_seconds)
+
+
+def taxonomy_batch_has_activity(counts: dict[str, int]) -> bool:
+    """Return whether a taxonomy pass produced operator-relevant activity."""
+    activity_fields = (
+        "selected",
+        "succeeded",
+        "partial",
+        "failed",
+        "skipped",
+        "provider_blocked",
+        "deferred",
+        "anomaly_candidates",
+        "anomaly_scan_failed",
+        "reclassification_selected",
+        "reclassification_succeeded",
+        "reclassification_needs_manual",
+        "reclassification_failed",
+        "auto_non_product_recheck_selected",
+        "auto_non_product_recheck_succeeded",
+        "auto_non_product_recheck_partial",
+        "auto_non_product_recheck_failed",
+        "auto_non_product_recheck_skipped",
+        "auto_non_product_recheck_deferred",
+        "batches_submitted",
+        "batches_completed",
+        "batch_requests_completed",
+        "batch_requests_failed",
+        "submit_failed",
+        "submit_retries_scheduled",
+        "model_retries_resumed",
+        "source_retry_scheduled",
+        "source_retry_exhausted",
+        "terminal_selected",
+        "terminal_pending_review",
+        "terminal_rejected",
+    )
+    return any(int(counts.get(field) or 0) > 0 for field in activity_fields)
+
+
+def taxonomy_idle_heartbeat_due(
+    last_emitted_at: float | None,
+    now: float,
+    interval_seconds: int,
+) -> bool:
+    """Emit the first idle heartbeat, then no more than once per interval."""
+    return last_emitted_at is None or now - last_emitted_at >= max(1, interval_seconds)
+
+
+async def run_taxonomy_loop(
+    config: Config,
+    service_telemetry: RunnerTelemetry | None = None,
+) -> None:
+    idle_heartbeat_seconds = max(3600, int(config.taxonomy_interval_seconds))
     log_info(
         "taxonomy_runner.loop.start",
         interval_seconds=config.taxonomy_interval_seconds,
+        idle_heartbeat_seconds=idle_heartbeat_seconds,
         limit=config.taxonomy_limit,
         concurrency=config.taxonomy_concurrency,
         auto_accept_confidence=config.taxonomy_auto_accept_confidence,
+        recheck_auto_non_product=getattr(
+            config, "taxonomy_recheck_auto_non_product", True
+        ),
         primary_only=True,
     )
-    # The other four workloads all create telemetry rows and queue work at
-    # process start. Stagger taxonomy slightly to avoid making its first D1
-    # write compete with that startup burst.
-    await asyncio.sleep(10)
+    if not config.taxonomy_auto_enabled:
+        log_info("taxonomy_runner.disabled", kill_switch="TAXONOMY_AUTO_ENABLED=0")
+        while True:
+            await asyncio.sleep(max(60, config.taxonomy_interval_seconds))
+    # Only the deprecated combined profile needs startup staggering. The
+    # isolated taxonomy worker should begin immediately.
+    if len(tuple(getattr(config, "runner_workloads", ()) or ())) > 1:
+        await asyncio.sleep(10)
+    consecutive_idle_batches = 0
+    last_idle_log_at: float | None = None
     while True:
         delay = config.taxonomy_interval_seconds
+        backoff_reason: str | None = None
+        started_at = time.monotonic()
         try:
             counts = await run_taxonomy_once(config)
-            log_info("taxonomy_runner.batch.summary", **counts)
+            duration_ms = round((time.monotonic() - started_at) * 1000)
+            delay = taxonomy_next_delay_seconds(config, counts)
             if int(counts.get("provider_blocked") or 0) > 0:
-                delay = config.taxonomy_provider_backoff_seconds
+                backoff_reason = "taxonomy_provider_blocked"
+            if taxonomy_batch_has_activity(counts):
+                consecutive_idle_batches = 0
+                last_idle_log_at = None
+                log_info(
+                    "taxonomy_runner.batch.summary",
+                    duration_ms=duration_ms,
+                    **counts,
+                )
+            else:
+                consecutive_idle_batches += 1
+                now = time.monotonic()
+                if taxonomy_idle_heartbeat_due(
+                    last_idle_log_at,
+                    now,
+                    idle_heartbeat_seconds,
+                ):
+                    log_info(
+                        "taxonomy_runner.idle",
+                        duration_ms=duration_ms,
+                        consecutive_empty_batches=consecutive_idle_batches,
+                        next_poll_seconds=delay,
+                    )
+                    last_idle_log_at = now
+                else:
+                    log_debug(
+                        "taxonomy_runner.batch.idle",
+                        duration_ms=duration_ms,
+                        consecutive_empty_batches=consecutive_idle_batches,
+                        next_poll_seconds=delay,
+                    )
+            if delay == 0:
+                log_info(
+                    "taxonomy_runner.backlog.continue",
+                    selected=counts.get("selected", 0),
+                    limit=config.taxonomy_limit,
+                )
+            elif int(counts.get("provider_blocked") or 0) > 0:
                 log_error(
                     "taxonomy_runner.provider_backoff",
                     delay_seconds=delay,
@@ -11437,20 +12298,68 @@ async def run_taxonomy_loop(config: Config) -> None:
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            consecutive_idle_batches = 0
+            last_idle_log_at = None
             # Startup/telemetry failures are usually transient. Retrying soon
             # prevents a single D1 collision from hiding taxonomy for the full
             # normal 15-minute cadence.
             delay = min(60, config.taxonomy_interval_seconds)
             log_error("taxonomy_runner.batch.failed", error=str(error)[:500])
             log_info("taxonomy_runner.batch.retry_scheduled", delay_seconds=delay)
+        await report_service_schedule(
+            service_telemetry,
+            delay,
+            backoff_reason=backoff_reason,
+        )
         await asyncio.sleep(delay)
 
 
-async def run_all_loop(config: Config, limit: int | None, interval_seconds: int, timeout_seconds: int | None) -> None:
+async def run_periodic_facts_once(
+    config: Config,
+    traffic_limit: int | None = None,
+    domain_state_limit: int | None = None,
+) -> dict[str, int]:
+    traffic_counts, domain_counts = await asyncio.gather(
+        run_once(config, traffic_limit or config.limit),
+        run_domain_state_once(config, domain_state_limit or config.domain_state_limit),
+    )
+    return {
+        **{f"traffic_{key}": value for key, value in traffic_counts.items()},
+        **{f"domain_{key}": value for key, value in domain_counts.items()},
+    }
+
+
+async def run_periodic_facts_loop(
+    config: Config,
+    traffic_limit: int | None,
+    interval_seconds: int,
+) -> None:
+    traffic_interval = interval_seconds or config.poll_interval_seconds
+    domain_state_interval = getattr(config, "domain_state_poll_interval_seconds", 1)
+    log_info(
+        "periodic_facts_runner.loop.start",
+        traffic_interval_seconds=traffic_interval,
+        domain_state_interval_seconds=domain_state_interval,
+        traffic_concurrency=getattr(config, "traffic_concurrency", config.concurrency),
+        domain_concurrency=getattr(config, "domain_state_concurrency", config.concurrency),
+    )
+    await asyncio.gather(
+        run_loop(config, traffic_limit or config.limit, traffic_interval),
+        run_domain_state_loop(config, config.domain_state_limit, domain_state_interval),
+    )
+
+
+async def run_all_loop(
+    config: Config,
+    limit: int | None,
+    interval_seconds: int,
+    timeout_seconds: int | None,
+    service_telemetry: RunnerTelemetry | None = None,
+) -> None:
     shared_interval = interval_seconds or 300
     assets_interval = max(60, shared_interval // 2)
     traffic_interval = shared_interval
-    domain_state_interval = max(900, shared_interval * 3)
+    domain_state_interval = getattr(config, "domain_state_poll_interval_seconds", 1)
     pricing_interval = max(900, shared_interval * 3)
     log_info(
         "all_runner.loop.start",
@@ -11465,175 +12374,80 @@ async def run_all_loop(config: Config, limit: int | None, interval_seconds: int,
         run_assets_loop(config, config.asset_limit, assets_interval),
         run_loop(config, limit or config.limit, traffic_interval),
         run_domain_state_loop(config, config.domain_state_limit, domain_state_interval),
-        run_pricing_loop(config, config.pricing_limit, pricing_interval, None, False, False, timeout_seconds),
     ]
+    if getattr(config, "pricing_monitor_enabled", True):
+        loops.append(
+            run_pricing_loop(
+                config,
+                config.pricing_limit,
+                pricing_interval,
+                None,
+                False,
+                False,
+                timeout_seconds,
+            )
+        )
     if config.taxonomy_auto_enabled:
-        loops.append(run_taxonomy_loop(config))
+        loops.append(run_taxonomy_loop(config, service_telemetry))
     await asyncio.gather(*loops)
 
 
-async def backfill_published_categories(
-    config: Config,
-    limit: int | None = None,
-    *,
-    dry_run: bool = False,
-    tool_ids: list[int] | None = None,
-    page_size: int = 25,
-) -> dict[str, int]:
-    """Reclassify published tools that still carry pre-hierarchical category data.
-
-    Safety rules:
-    - only status=published
-    - never touch rejected
-    - never overwrite source=manual assignments
-    - only replace live categories after a successful L1 (and valid L2 if provided)
-    - failures keep the previous live categories and write audit/error only
-    - resume via category_classification_raw.backfill / hierarchical prompt markers
-    """
-    effective_limit = limit if limit is not None else 100
-    if effective_limit <= 0:
-        effective_limit = 100
-
-    counts = {
-        "scanned": 0,
-        "applied": 0,
-        "would_apply": 0,
-        "failed": 0,
-        "skipped": 0,
-        "unchanged": 0,
-    }
-    after_tool_id = 0
-
-    async with D1Client(config) as d1:
-        store = D1AssetStore(d1)
-        browser_client = CloudflareBrowserRunAssetClient(config)
-        catalog = await store.category_catalog()
-        log_info(
-            "published_category_backfill.start",
-            limit=effective_limit,
-            dry_run=dry_run,
-            tool_ids=len(tool_ids or []),
-            catalog_size=len(catalog),
-            backfill_version=PUBLISHED_CATEGORY_BACKFILL_VERSION,
-            prompt_version=CATEGORY_CLASSIFICATION_PROMPT_VERSION,
-            model=config.category_classification_model,
+def runtime_profile_for_args(args: argparse.Namespace) -> tuple[str, tuple[str, ...]]:
+    if args.periodic_facts:
+        return "periodic-facts-worker", ("traffic", "domain_state")
+    if args.assets:
+        return "assets-worker", ("assets", "enrichment", "catalog_publish")
+    if args.pricing:
+        return "pricing-monitor-worker", ("pricing",)
+    if args.taxonomy:
+        return "taxonomy-worker", ("taxonomy",)
+    if args.domain_state:
+        return "domain-facts-worker", ("domain_state",)
+    if args.all:
+        workloads = [
+            "assets",
+            "traffic",
+            "domain_state",
+            "pricing",
+            "taxonomy",
+            "enrichment",
+            "catalog_publish",
+        ]
+        return "tool-data-runner-legacy-all", tuple(workloads)
+    if any(
+        (
+            args.backfill_traffic_monthly,
+            args.build_market_snapshot,
+            args.activate_market_snapshot_id is not None,
+            args.shadow_taxonomy,
+            args.eval_gold,
         )
-
-        while counts["scanned"] < effective_limit:
-            remaining = min(page_size, effective_limit - counts["scanned"])
-            if remaining <= 0:
-                break
-            tasks = await store.published_legacy_category_tasks(
-                remaining,
-                after_tool_id=after_tool_id,
-                tool_ids=tool_ids,
-            )
-            if not tasks:
-                break
-
-            for task in tasks:
-                after_tool_id = max(after_tool_id, task.tool_id)
-                counts["scanned"] += 1
-                try:
-                    result = await browser_client.fetch_homepage_categories(task, catalog)
-                except Exception as error:
-                    counts["failed"] += 1
-                    message = str(error)[:500] or type(error).__name__
-                    log_error(
-                        "published_category_backfill.fetch_failed",
-                        tool_id=task.tool_id,
-                        slug=task.canonical_slug,
-                        error=message,
-                    )
-                    await store.record_published_category_backfill_failure(
-                        task,
-                        error=message,
-                        dry_run=dry_run,
-                    )
-                    continue
-
-                if not published_category_backfill_success(result):
-                    counts["failed"] += 1
-                    message = result.metadata_error or "category_backfill_invalid_result"
-                    log_error(
-                        "published_category_backfill.invalid_result",
-                        tool_id=task.tool_id,
-                        slug=task.canonical_slug,
-                        error=message,
-                        category_l1=result.category_l1,
-                        category_l2=result.category_l2,
-                    )
-                    await store.record_published_category_backfill_failure(
-                        task,
-                        error=message,
-                        raw_output=result.category_raw_output,
-                        dry_run=dry_run,
-                    )
-                    continue
-
-                try:
-                    summary = await store.apply_published_category_backfill(
-                        task,
-                        result,
-                        dry_run=dry_run,
-                    )
-                except Exception as error:
-                    counts["failed"] += 1
-                    message = str(error)[:500] or type(error).__name__
-                    log_error(
-                        "published_category_backfill.apply_failed",
-                        tool_id=task.tool_id,
-                        slug=task.canonical_slug,
-                        error=message,
-                    )
-                    await store.record_published_category_backfill_failure(
-                        task,
-                        error=message,
-                        raw_output=result.category_raw_output,
-                        dry_run=dry_run,
-                    )
-                    continue
-
-                old_ids = sorted(
-                    int(item["category_id"])
-                    for item in (summary.get("old") or {}).get("categories") or []
-                    if item.get("category_id")
-                )
-                new_ids = sorted(int(value) for value in (summary.get("new") or {}).get("category_ids") or [])
-                if old_ids == new_ids and int((summary.get("old") or {}).get("primary_category_id") or 0) == int(
-                    (summary.get("new") or {}).get("primary_category_id") or 0
-                ):
-                    counts["unchanged"] += 1
-                if dry_run:
-                    counts["would_apply"] += 1
-                else:
-                    counts["applied"] += 1
-                log_info(
-                    "published_category_backfill.item",
-                    tool_id=task.tool_id,
-                    slug=task.canonical_slug,
-                    dry_run=dry_run,
-                    applied=bool(summary.get("applied")),
-                    category_l1=result.category_l1,
-                    category_l2=result.category_l2,
-                    old_primary=(summary.get("old") or {}).get("primary_category_id"),
-                    new_primary=(summary.get("new") or {}).get("primary_category_id"),
-                )
-
-            # Explicit tool_ids lists are processed in one pass.
-            if tool_ids:
-                break
-
-            log_info(
-                "published_category_backfill.page",
-                after_tool_id=after_tool_id,
-                **counts,
-            )
-
-    return counts
+    ):
+        return "tool-data-maintenance", ()
+    return "traffic-worker", ("traffic",)
 
 
-def parse_args() -> argparse.Namespace:
+def apply_runtime_profile(config: Config, args: argparse.Namespace) -> Config:
+    default_service, workloads = runtime_profile_for_args(args)
+    if args.all and not getattr(config, "taxonomy_auto_enabled", False):
+        workloads = tuple(workload for workload in workloads if workload != "taxonomy")
+    if args.all and not getattr(config, "pricing_monitor_enabled", True):
+        workloads = tuple(workload for workload in workloads if workload != "pricing")
+    service_name = (os.getenv("RUNNER_SERVICE_NAME") or default_service).strip()
+    if not hasattr(config, "__dataclass_fields__"):
+        setattr(config, "runner_service_name", service_name)
+        setattr(config, "runner_workloads", workloads)
+        if not hasattr(config, "runner_instance_id"):
+            setattr(config, "runner_instance_id", f"runner-{uuid.uuid4().hex[:16]}")
+        return config
+    return replace(
+        config,
+        runner_service_name=service_name,
+        runner_workloads=workloads,
+    )
+
+
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Scheduled traffic, assets, and pricing runner")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="process one batch and exit")
@@ -11641,6 +12455,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--pricing", action="store_true", help="process pricing_tasks instead of traffic_tasks")
     parser.add_argument("--assets", action="store_true", help="process asset_tasks instead of traffic_tasks")
     parser.add_argument("--domain-state", action="store_true", help="process domain rating and whois creation date tasks")
+    parser.add_argument(
+        "--periodic-facts",
+        action="store_true",
+        help="run traffic and domain-state together as the periodic facts worker",
+    )
+    parser.add_argument(
+        "--taxonomy",
+        action="store_true",
+        help="run production taxonomy automation as an isolated worker",
+    )
     parser.add_argument(
         "--backfill-traffic-monthly",
         action="store_true",
@@ -11682,11 +12506,6 @@ def parse_args() -> argparse.Namespace:
             "candidate by id without rebuilding it; mutually exclusive with "
             "--build-market-snapshot"
         ),
-    )
-    parser.add_argument(
-        "--backfill-published-categories",
-        action="store_true",
-        help="reclassify published tools that still have pre-hierarchical category data",
     )
     parser.add_argument(
         "--shadow-taxonomy",
@@ -11736,68 +12555,68 @@ def parse_args() -> argparse.Namespace:
         default=None,
         help="simulate auto_accepted when provisional confidence >= threshold (default 0.85)",
     )
-    parser.add_argument("--all", action="store_true", help="run traffic, domain-state, pricing, and assets loops in one process")
+    parser.add_argument("--all", action="store_true", help="legacy: run every automatic workload in one process")
     parser.add_argument("--approve-pricing", action="store_true", help="write approved pricing extractions into active catalogs")
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="for pricing, market snapshot, category backfill, or Shadow taxonomy: run without writes",
+        help="for pricing, market snapshot, or Shadow taxonomy: run without writes",
     )
     parser.add_argument(
         "--task-id",
         type=int,
         action="append",
         default=[],
-        help="pricing task id, or published tool id with category/Shadow modes; can be repeated",
+        help="pricing task id, or published tool id with Shadow taxonomy/eval modes; can be repeated",
     )
     parser.add_argument("--timeout", type=int, default=None, help="pricing HTTP timeout in seconds")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--interval-seconds", type=int, default=None)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     selected = [
         args.pricing,
         args.assets,
         args.domain_state,
+        args.periodic_facts,
+        args.taxonomy,
         args.backfill_traffic_monthly,
         args.build_market_snapshot,
         args.activate_market_snapshot_id is not None,
-        args.backfill_published_categories,
         args.shadow_taxonomy,
         args.eval_gold,
         args.all,
     ]
     if sum(1 for value in selected if value) > 1:
         parser.error(
-            "--pricing, --assets, --domain-state, --backfill-traffic-monthly, "
+            "--pricing, --assets, --domain-state, --periodic-facts, --taxonomy, "
+            "--backfill-traffic-monthly, "
             "--build-market-snapshot, --activate-market-snapshot-id, "
-            "--backfill-published-categories, --shadow-taxonomy, "
+            "--shadow-taxonomy, "
             "--eval-gold, and --all are mutually exclusive"
         )
     if args.all and not args.loop:
         parser.error("--all requires --loop")
+    if args.interval_seconds is not None and args.interval_seconds <= 0:
+        parser.error("--interval-seconds must be positive")
     if args.approve_pricing:
         parser.error("--approve-pricing is retired; approve the stored extraction in ainav Admin")
     if args.approve_pricing and not args.pricing:
         parser.error("--approve-pricing requires --pricing")
     if args.task_id and not (
         args.pricing
-        or args.backfill_published_categories
         or args.shadow_taxonomy
         or args.eval_gold
     ):
         parser.error(
-            "--task-id requires --pricing, --backfill-published-categories, "
-            "--shadow-taxonomy, or --eval-gold"
+            "--task-id requires --pricing, --shadow-taxonomy, or --eval-gold"
         )
     if args.dry_run and not (
         args.pricing
         or args.build_market_snapshot
-        or args.backfill_published_categories
         or args.shadow_taxonomy
     ):
         parser.error(
-            "--dry-run requires --pricing, --build-market-snapshot, "
-            "--backfill-published-categories, or --shadow-taxonomy"
+            "--dry-run requires --pricing, --build-market-snapshot, or --shadow-taxonomy"
         )
     if args.market_traffic_month and not args.build_market_snapshot:
         parser.error("--market-traffic-month requires --build-market-snapshot")
@@ -11831,8 +12650,6 @@ def parse_args() -> argparse.Namespace:
         parser.error("--build-market-snapshot cannot be combined with --loop")
     if args.activate_market_snapshot_id is not None and args.loop:
         parser.error("--activate-market-snapshot-id cannot be combined with --loop")
-    if args.backfill_published_categories and args.loop:
-        parser.error("--backfill-published-categories cannot be combined with --loop")
     if args.shadow_taxonomy and args.loop:
         parser.error("--shadow-taxonomy cannot be combined with --loop")
     if args.eval_gold and args.loop:
@@ -11855,13 +12672,19 @@ def main() -> None:
             args.pricing
             or args.assets
             or args.domain_state
+            or args.taxonomy
             or args.backfill_traffic_monthly
             or args.build_market_snapshot
             or args.activate_market_snapshot_id is not None
-            or args.backfill_published_categories
             or args.shadow_taxonomy
             or args.eval_gold
         )
+    )
+    config = apply_runtime_profile(config, args)
+    configure_logging(
+        config.runner_service_name,
+        getattr(config, "runner_instance_id", "runner-cli"),
+        config.runner_workloads,
     )
     interval_seconds = args.interval_seconds or config.poll_interval_seconds
     if args.activate_market_snapshot_id is not None:
@@ -11895,17 +12718,6 @@ def main() -> None:
         )
         log_info("traffic_projection_backfill.summary", **counts)
         return
-    if args.backfill_published_categories:
-        counts = asyncio.run(
-            backfill_published_categories(
-                config,
-                args.limit,
-                dry_run=args.dry_run,
-                tool_ids=args.task_id or None,
-            )
-        )
-        log_info("published_category_backfill.summary", **counts)
-        return
     if args.shadow_taxonomy:
         from taxonomy_shadow import run_shadow_taxonomy
 
@@ -11918,6 +12730,7 @@ def main() -> None:
                 allow_unresolved_entity=args.allow_unresolved_entity,
                 after_tool_id=args.after_tool_id,
                 include_capabilities=not args.primary_only,
+                capability_candidate_limit=config.taxonomy_capability_candidate_limit,
                 concurrency=args.shadow_concurrency,
                 auto_accept_threshold=config.taxonomy_auto_accept_confidence,
             )
@@ -11950,13 +12763,54 @@ def main() -> None:
         )
         log_info("gold_eval.done", **result["summary"])
         return
+    if args.periodic_facts:
+        if args.loop:
+            asyncio.run(
+                run_with_service_heartbeat(
+                    config,
+                    lambda telemetry: run_periodic_facts_loop(
+                        config,
+                        args.limit,
+                        interval_seconds,
+                    ),
+                )
+            )
+            return
+        counts = asyncio.run(run_periodic_facts_once(config, args.limit))
+        log_info("periodic_facts_runner.batch.summary", **counts)
+        return
+    if args.taxonomy:
+        if args.loop:
+            asyncio.run(
+                run_with_service_heartbeat(
+                    config,
+                    lambda telemetry: run_taxonomy_loop(config, telemetry),
+                )
+            )
+            return
+        counts = asyncio.run(run_taxonomy_once(config))
+        log_info("taxonomy_runner.batch.summary", **counts)
+        return
     if args.all:
-        asyncio.run(run_all_loop(config, args.limit, interval_seconds, args.timeout))
+        log_info("all_runner.deprecated", replacement="split Dokploy worker profiles")
+        asyncio.run(
+            run_with_service_heartbeat(
+                config,
+                lambda telemetry: run_all_loop(
+                    config, args.limit, interval_seconds, args.timeout, telemetry
+                ),
+            )
+        )
         return
 
     if args.assets:
         if args.loop:
-            asyncio.run(run_assets_loop(config, args.limit, interval_seconds))
+            asyncio.run(
+                run_with_service_heartbeat(
+                    config,
+                    lambda telemetry: run_assets_loop(config, args.limit, interval_seconds),
+                )
+            )
             return
 
         counts = asyncio.run(run_assets_once(config, args.limit))
@@ -11965,7 +12819,16 @@ def main() -> None:
 
     if args.domain_state:
         if args.loop:
-            asyncio.run(run_domain_state_loop(config, args.limit, interval_seconds))
+            asyncio.run(
+                run_with_service_heartbeat(
+                    config,
+                    lambda telemetry: run_domain_state_loop(
+                        config,
+                        args.limit,
+                        args.interval_seconds or config.domain_state_poll_interval_seconds,
+                    ),
+                )
+            )
             return True
 
         counts = asyncio.run(run_domain_state_once(config, args.limit))
@@ -11975,14 +12838,17 @@ def main() -> None:
     if args.pricing:
         if args.loop:
             asyncio.run(
-                run_pricing_loop(
+                run_with_service_heartbeat(
                     config,
-                    args.limit,
-                    interval_seconds,
-                    args.task_id,
-                    args.approve_pricing,
-                    args.dry_run,
-                    args.timeout,
+                    lambda telemetry: run_pricing_loop(
+                        config,
+                        args.limit,
+                        interval_seconds,
+                        args.task_id,
+                        args.approve_pricing,
+                        args.dry_run,
+                        args.timeout,
+                    ),
                 )
             )
             return
@@ -12001,11 +12867,16 @@ def main() -> None:
         return
 
     if args.loop:
-        asyncio.run(run_loop(config, args.limit, interval_seconds))
+        asyncio.run(
+            run_with_service_heartbeat(
+                config,
+                lambda telemetry: run_loop(config, args.limit, interval_seconds),
+            )
+        )
         return
 
     counts = asyncio.run(run_once(config, args.limit))
-    log_info("runner.batch.summary", **counts)
+    log_info("traffic_runner.batch.summary", **counts)
 
 
 if __name__ == "__main__":
