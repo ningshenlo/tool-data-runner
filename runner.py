@@ -12158,6 +12158,11 @@ def taxonomy_next_delay_seconds(config: Config, counts: dict[str, int]) -> int:
         # Backfill is deliberately paced: one bounded model call per stored
         # profile, with an operator-visible interval between paid batches.
         return int(config.taxonomy_interval_seconds)
+    if int(counts.get("terminal_has_more") or 0) > 0:
+        # Lifecycle-only reconciliation spends no provider budget. Drain it
+        # immediately instead of leaving hundreds of terminal tools behind a
+        # five-minute taxonomy polling interval.
+        return 0
     if int(counts.get("selected") or 0) >= int(config.taxonomy_limit):
         return 0
     return int(config.taxonomy_interval_seconds)
@@ -12194,6 +12199,9 @@ def taxonomy_batch_has_activity(counts: dict[str, int]) -> bool:
         "model_retries_resumed",
         "source_retry_scheduled",
         "source_retry_exhausted",
+        "terminal_selected",
+        "terminal_pending_review",
+        "terminal_rejected",
     )
     return any(int(counts.get(field) or 0) > 0 for field in activity_fields)
 

@@ -970,6 +970,13 @@ class WorkerControlTests(unittest.IsolatedAsyncioTestCase):
             ),
             300,
         )
+        self.assertEqual(
+            runner.taxonomy_next_delay_seconds(
+                config,
+                {"selected": 0, "terminal_has_more": 1},
+            ),
+            0,
+        )
 
     def test_taxonomy_idle_detection_ignores_scan_only_bookkeeping(self) -> None:
         self.assertFalse(
@@ -995,6 +1002,11 @@ class WorkerControlTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(
             runner.taxonomy_batch_has_activity(
                 {"selected": 0, "model_retries_resumed": 1}
+            )
+        )
+        self.assertTrue(
+            runner.taxonomy_batch_has_activity(
+                {"selected": 0, "terminal_pending_review": 1}
             )
         )
 
