@@ -3496,7 +3496,7 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 batch_limit=25,
                 idle_interval_seconds=30,
             ),
-            30,
+            60,
         )
 
     async def test_telemetry_health_checks_only_the_latest_run_per_workload(self) -> None:

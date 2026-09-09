@@ -22,10 +22,12 @@ from decimal import Decimal, InvalidOperation
 from html.parser import HTMLParser
 from typing import Any
 from urllib.parse import quote, urljoin, urlsplit
+from pathlib import Path
 
 import httpx
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from dotenv import load_dotenv
+from d1_costguard import guard_endpoint, before_request, observe_response
 from anti_bot_signatures import detect_anti_bot_page
 from pricing.allowances import (
     extract_fixed_allowance_quotes,
@@ -946,7 +948,8 @@ def load_config(require_brightdata: bool = True) -> Config:
         r2_public_base_url=os.getenv("R2_PUBLIC_BASE_URL", "").rstrip("/"),
         runner_instance_id=os.getenv("RUNNER_INSTANCE_ID") or f"runner-{uuid.uuid4().hex[:16]}",
         runner_version=(
-            os.getenv("RUNNER_VERSION")
+            (Path(__file__).with_name("BUILD_REVISION").read_text().strip() if Path(__file__).with_name("BUILD_REVISION").exists() else "")
+            or os.getenv("RUNNER_VERSION")
             or os.getenv("DOKPLOY_COMMIT_SHA")
             or os.getenv("GIT_COMMIT_SHA")
             or os.getenv("SOURCE_COMMIT")
@@ -5080,9 +5083,11 @@ class D1Client:
             f"{D1_API_BASE}/accounts/{config.cloudflare_account_id}"
             f"/d1/database/{config.cloudflare_d1_database_id}/query"
         )
+        self.url = guard_endpoint(self.url)
         self.headers = {
             "Authorization": f"Bearer {config.cloudflare_api_token}",
             "Content-Type": "application/json",
+            "X-Sigpik-Service": os.getenv("RUNNER_SERVICE_NAME", "tool-data-runner"),
         }
         self.client = httpx.AsyncClient(timeout=30.0)
         self._market_country_schema_available: bool | None = None
@@ -5127,7 +5132,10 @@ class D1Client:
         request_meta = d1_request_metadata(body, operation)
         for attempt in range(max_attempts):
             try:
+                before_request(self.url)
                 response = await self.client.post(self.url, headers=self.headers, json=body)
+                if observe_response(self.url, response):
+                    raise self._response_error(response, request_meta, "cost_guard_stopped")
                 if response.status_code not in {429, 502, 503, 504}:
                     if response.is_error:
                         request_error = self._response_error(response, request_meta, "http_error")
@@ -11953,7 +11961,7 @@ def assets_next_delay_seconds(
         return 0
     if claimed > 0 or queued > 0 or revived > 0:
         return min(max(1, int(idle_interval_seconds)), 5)
-    return max(1, int(idle_interval_seconds))
+    return max(60, int(idle_interval_seconds))
 
 
 async def run_assets_loop(config: Config, limit: int | None, interval_seconds: int) -> None:
@@ -11984,6 +11992,7 @@ async def run_assets_loop(config: Config, limit: int | None, interval_seconds: i
             raise
         except Exception as error:
             log_error("assets_runner.batch.failed", error=str(error)[:500])
+            next_delay = max(60, interval_seconds)
         if next_delay == 0:
             await asyncio.sleep(0)
             continue
@@ -12093,6 +12102,7 @@ async def run_domain_state_loop(config: Config, limit: int | None, interval_seco
             )
         except Exception as error:
             log_error("domain_state_runner.batch.failed", error=str(error)[:500])
+            next_delay = max(60, interval_seconds)
         await asyncio.sleep(next_delay)
 
 

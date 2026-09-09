@@ -9,11 +9,14 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 COPY runner.py .
+COPY d1_costguard.py .
+COPY build_revision.py .
 COPY taxonomy_shadow.py .
 COPY taxonomy_batch.py .
 COPY anti_bot_signatures.py .
 COPY classification_anomalies.py .
 COPY pricing ./pricing
 COPY sitemap_monitor ./sitemap_monitor
+RUN python build_revision.py > BUILD_REVISION
 
 CMD ["python", "runner.py", "--all", "--loop", "--interval-seconds", "300"]

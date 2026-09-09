@@ -4,11 +4,13 @@ import asyncio
 import hashlib
 import hmac
 import json
+import os
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+from d1_costguard import guard_endpoint, before_request, observe_response
 
 from .comparability import (
     resource_family_counts_json,
@@ -48,9 +50,11 @@ class CloudflareD1Client:
             f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
             f"/d1/database/{database_id}/query"
         )
+        self.url = guard_endpoint(self.url)
         self.headers = {
             "Authorization": f"Bearer {api_token}",
             "Content-Type": "application/json",
+            "X-Sigpik-Service": "sitemap-worker",
         }
         self.client = httpx.AsyncClient(timeout=timeout_seconds)
 
@@ -80,7 +84,10 @@ class CloudflareD1Client:
         last_error: Exception | None = None
         for attempt in range(3):
             try:
+                before_request(self.url)
                 response = await self.client.post(self.url, headers=self.headers, json=body)
+                if observe_response(self.url, response):
+                    raise CloudflareApiError("D1 cost guard stopped; operator recovery required")
                 if response.status_code not in {429, 502, 503, 504}:
                     if response.is_error:
                         raise CloudflareApiError(
