@@ -371,5 +371,20 @@ async def run(args: argparse.Namespace) -> None:
             local_metadata.close()
 
 
+async def run_with_guard_backoff(args) -> None:
+    while True:
+        try:
+            await run(args)
+            return
+        except RuntimeError as error:
+            if not args.loop or "D1 cost guard" not in str(error):
+                raise
+            print(json.dumps({"event": "sitemap.cost_paused", "retry_seconds": 300}), flush=True)
+            await asyncio.sleep(300)
+
+
 def main() -> None:
-    asyncio.run(run(parse_args()))
+    revision_file = Path(__file__).resolve().parent.parent / "BUILD_REVISION"
+    if revision_file.exists():
+        print(json.dumps({"event": "sitemap.start", "build_revision": revision_file.read_text().strip()}), flush=True)
+    asyncio.run(run_with_guard_backoff(parse_args()))
