@@ -160,3 +160,23 @@ ON sitemap_runs(resource_id, started_at DESC, id DESC);
 
 CREATE INDEX IF NOT EXISTS idx_sitemap_runs_site_scan
 ON sitemap_runs(site_scan_id, resource_id);
+-- Cost incident 2026-09-09: schema-only additive indexes; no row deletion/update.
+-- The prior janitor scanned 2,087,947 rows for four statements (1,525,900 in run cleanup).
+CREATE INDEX IF NOT EXISTS idx_sitemap_runs_prunable_created
+ON sitemap_runs(created_at,id)
+WHERE result IN ('failed','not_modified','semantic_unchanged');
+
+CREATE INDEX IF NOT EXISTS idx_sitemap_scans_prunable_created
+ON sitemap_site_scans(created_at,id)
+WHERE comparability_status NOT IN ('resource_set_changed','possible_migration');
+
+CREATE INDEX IF NOT EXISTS idx_sitemap_sites_semantic_baseline
+ON sitemap_sites(semantic_baseline_scan_id);
+
+CREATE INDEX IF NOT EXISTS idx_sitemap_jobs_prunable_updated
+ON sitemap_jobs(updated_at,id)
+WHERE status IN ('succeeded','dead');
+
+CREATE INDEX IF NOT EXISTS idx_sitemap_jobs_active_updated
+ON sitemap_jobs(updated_at,id)
+WHERE status IN ('pending','retry','running');

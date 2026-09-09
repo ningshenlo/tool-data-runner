@@ -271,26 +271,31 @@ class CloudflareD1MetadataStore:
             [
                 (
                     """
+                    WITH candidate_jobs AS MATERIALIZED (
+                        SELECT id, site_id, schedule_version, scheduled_for, updated_at
+                        FROM sitemap_jobs INDEXED BY idx_sitemap_jobs_active_updated
+                        WHERE status IN ('pending', 'retry', 'running')
+                        ORDER BY updated_at, id
+                        LIMIT ?
+                    )
                     UPDATE sitemap_jobs
                     SET status = 'dead', finished_at = ?, dead_letter_at = ?,
                         last_error = 'superseded_schedule', lease_owner = NULL,
                         lease_token = NULL, lease_expires_at = NULL, updated_at = ?
                     WHERE id IN (
                         SELECT job.id
-                        FROM sitemap_jobs job
+                        FROM candidate_jobs job
                         JOIN sitemap_sites site ON site.id = job.site_id
-                        WHERE job.status IN ('pending', 'retry', 'running')
-                          AND (
+                        WHERE (
                             site.status <> 'active'
                             OR site.schedule_version <> job.schedule_version
                             OR job.scheduled_for < site.next_check_at
                           )
                         ORDER BY job.updated_at, job.id
-                        LIMIT ?
                     )
                     RETURNING id
                     """,
-                    [now_ms, now_ms, now_ms, limit],
+                    [limit, now_ms, now_ms, now_ms],
                 ),
                 (
                     """

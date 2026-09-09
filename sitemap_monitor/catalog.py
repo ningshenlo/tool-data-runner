@@ -25,25 +25,14 @@ class CatalogSiteSnapshot:
 
 
 PUBLISHED_CATALOG_SITE_PAGE_SQL = """
-WITH canonical_tools AS (
-    SELECT
-        id,
-        official_url,
-        normalized_domain,
-        row_number() OVER (
-            PARTITION BY lower(trim(normalized_domain))
-            ORDER BY id
-        ) AS domain_row
-    FROM tools
-    WHERE status = 'published'
+SELECT id, official_url, normalized_domain
+FROM tools
+WHERE id > ?
+      AND status = 'published'
       AND content_safety_status = 'safe'
       AND duplicate_of_tool_id IS NULL
       AND trim(official_url) <> ''
       AND trim(normalized_domain) <> ''
-)
-SELECT id, official_url, normalized_domain
-FROM canonical_tools
-WHERE domain_row = 1 AND id > ?
 ORDER BY id
 LIMIT ?
 """
@@ -68,7 +57,8 @@ async def load_published_catalog_sites(
     invalid_urls = 0
     source_rows = 0
     by_site_id: dict[str, str] = {}
-    while True:
+    seen_domains: set[str] = set()
+    for _page in range(100):
         result = await client.query(
             PUBLISHED_CATALOG_SITE_PAGE_SQL,
             [cursor_id, page_size],
@@ -83,6 +73,13 @@ async def load_published_catalog_sites(
             if row_id <= cursor_id:
                 raise RuntimeError("Published catalog cursor did not advance.")
             cursor_id = row_id
+            # Keep the first eligible id for each normalized domain across pages.
+            # This preserves SQL's prior canonical choice without sorting the
+            # entire catalog again for every page.
+            domain_key = str(row.get("normalized_domain") or "").strip().lower()
+            if domain_key in seen_domains:
+                continue
+            seen_domains.add(domain_key)
             source_rows += 1
             try:
                 homepage_url = _homepage_origin(str(row.get("official_url") or ""))
@@ -101,6 +98,8 @@ async def load_published_catalog_sites(
             by_site_id[site_id] = homepage_url
         if len(rows) < page_size:
             break
+    else:
+        raise RuntimeError("Published catalog exceeded the reviewed 100-page bound")
 
     return CatalogSiteSnapshot(
         duplicate_origins=duplicate_origins,
