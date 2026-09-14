@@ -41,6 +41,21 @@ class D1:
 
 
 class ExportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_new_market_bypasses_old_backoff_without_rewriting_frozen_exports(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, d1 = Path(temp), D1()
+            await producer.export_month(d1, root, '2026-08', [MARKET], NOW)
+            frozen = root / '2026-08/image-generation/complete.json'
+            before = frozen.read_bytes()
+            count = len(d1.calls)
+            added = {**MARKET, 'sector': 'presentations-visualization'}
+            await producer.export_month(d1, root, '2026-08', [MARKET, added], NOW + 1)
+            self.assertEqual(len(d1.calls), count + 2)
+            self.assertEqual(frozen.read_bytes(), before)
+            self.assertTrue((root / '2026-08/presentations-visualization/complete.json').exists())
+            await producer.export_month(d1, root, '2026-08', [MARKET, added], NOW + 2)
+            self.assertEqual(len(d1.calls), count + 2)
+
     async def test_market_inventory_is_read_only_and_throttles_success_and_failure(self):
         with tempfile.TemporaryDirectory() as temp:
             root, d1 = Path(temp), D1([{'slug': 'text-to-speech', 'name': 'Speech', 'candidates': 20, 'comparable': 19}])

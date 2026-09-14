@@ -62,13 +62,23 @@ refuses `release`.
 
 ## Markets and future maintenance
 
-The current generator supports music, image and video. Their category mappings
+The current generator supports music, image, video, speech/transcription and
+presentations/visualization. Their category mappings
 and dated supplemental coverage evidence are in `report-markets.json`. The
 first public edition remains music only; image/video drafts do not become public
 just because the worker generated them. Missing required-domain evidence blocks
 that market. Reuse authorization is edition-specific, not inherited by new months.
 Adding a new market requires an explicit sector definition, category/coverage
 rules and validation before enabling its monthly export.
+
+The two additional markets use `speech-text-conversion` and
+`presentations-visualization` primary taxonomy categories. Dated official-site
+evidence adds ElevenLabs and Gamma as supplemental candidates; required-domain
+checks still block drafts if their comparable traffic is absent. Scope notes
+explain their multiple products and whole-site measurement. These markets have
+no automatic reuse approval or public release registration. A changed market
+configuration bypasses the old polling delay once, while retaining all existing
+frozen exports byte-for-byte.
 
 `report-runtime/` is a vendored code package. It contains no report datasets or
 generated assets. `runtime-baseline.json` carries hashes and publication status

@@ -2,13 +2,15 @@ import { createHash } from 'node:crypto';
 import { validateReport } from '../../lib/reports/model.ts';
 
 export const SECTORS = {
+  'speech-text-conversion': { name: { en: 'Speech & transcription', 'zh-CN': '语音与文字互转' }, scopeName: { en: 'Speech and transcription platforms', 'zh-CN': '语音与文字互转相关平台' } },
+  'presentations-visualization': { name: { en: 'Presentations & visualization', 'zh-CN': '演示与可视化' }, scopeName: { en: 'Presentation and visualization platforms', 'zh-CN': '演示与可视化相关平台' } },
   'video-generation': { name: { en: 'Video generation', 'zh-CN': '视频生成' }, scopeName: { en: 'Video-related platforms', 'zh-CN': '视频生成相关平台' } },
   'image-generation': { name: { en: 'Image generation', 'zh-CN': '图像生成' }, scopeName: { en: 'Image-related platforms', 'zh-CN': '图像生成相关平台' } },
   'music-generation': { name: { en: 'Music generation', 'zh-CN': '音乐生成' }, scopeName: { en: 'Music-related platforms', 'zh-CN': '音乐生成相关平台' } },
 };
 export const CHECKS = ['totals', 'breadth', 'median', 'concentration', 'contributors'];
 // Explicit coverage checks, not an exhaustive list of products in each market.
-const COVERAGE_DOMAINS = { 'video-generation': ['runwayml.com'], 'image-generation': ['midjourney.com'], 'music-generation': ['suno.com', 'flowmusic.app', 'mureka.ai', 'udio.com'] };
+const COVERAGE_DOMAINS = { 'speech-text-conversion': ['elevenlabs.io', 'speechify.com', 'naturalreaders.com'], 'presentations-visualization': ['gamma.app', 'napkin.ai', 'beautiful.ai'], 'video-generation': ['runwayml.com'], 'image-generation': ['midjourney.com'], 'music-generation': ['suno.com', 'flowmusic.app', 'mureka.ai', 'udio.com'] };
 // Preserve v1 input defaults; newly scoped exports use the accepted shared design.
 const LEGACY_DEFAULT_TEMPLATES = { 'video-generation': 'classic-v1', 'image-generation': 'classic-v1', 'music-generation': 'editorial-v1' };
 const LEGACY_SECTORS = Object.keys(LEGACY_DEFAULT_TEMPLATES);

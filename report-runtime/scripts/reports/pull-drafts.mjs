@@ -1,4 +1,5 @@
 import fs from 'node:fs/promises';
+import { randomUUID } from 'node:crypto';
 import path from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { digest, insist, sha256, json } from './pipeline-core.mjs';
@@ -24,11 +25,20 @@ export function verifyManifest(manifest, key) {
   }
   return manifest;
 }
+async function renameStable(from, to) {
+  for (let attempt = 0; ; attempt++) {
+    try { await fs.rename(from, to); return; }
+    catch (error) {
+      if (!['EPERM', 'EACCES', 'EBUSY'].includes(error?.code) || attempt >= 5) throw error;
+      await new Promise(resolve => setTimeout(resolve, 50 * (attempt + 1)));
+    }
+  }
+}
 async function atomic(file, value) {
   await fs.mkdir(path.dirname(file), { recursive: true });
-  const temporary = file + '.' + process.pid + '.tmp';
+  const temporary = file + '.' + randomUUID() + '.tmp';
   await fs.writeFile(temporary, json(value));
-  await fs.rename(temporary, file);
+  await renameStable(temporary, file);
 }
 async function limitedBody(response) {
   insist(Number(response.headers.get('content-length') ?? 0) <= MAX_FILE, 'draft_file_too_large');
@@ -83,7 +93,9 @@ export async function pullDrafts({ root = ROOT, fetchImpl = fetch } = {}) {
         insist(manifest.reportIds[0] === `${row.sector}-${row.month}`, 'draft_identity_mismatch');
         const exists = await fs.access(path.join(folder, 'draft.json')).then(() => true, () => false);
         if (!exists) {
-          temporary = await fs.mkdtemp(path.join(parent, '.pull-'));
+          // Publish the manifest last; directory renames can fail on Windows.
+          temporary = folder;
+          await fs.mkdir(folder, { recursive: true });
           const entries = Object.entries(manifest.files); let total = 0;
           // Four requests at a time keep memory and server concurrency bounded.
           for (let offset = 0; offset < entries.length; offset += 4) {
@@ -93,18 +105,20 @@ export async function pullDrafts({ root = ROOT, fetchImpl = fetch } = {}) {
               total += bytes.length; insist(total <= 128 * 1024 * 1024, 'draft_bundle_too_large');
               const file = safeFile(temporary, name);
               await fs.mkdir(path.dirname(file), { recursive: true });
-              await fs.writeFile(file, bytes);
+              const staged = file + '.' + randomUUID() + '.tmp';
+              await fs.writeFile(staged, bytes);
+              await renameStable(staged, file);
             }));
             for (const result of results) if (result.status === 'rejected') throw result.reason;
           }
-          await fs.writeFile(path.join(temporary, 'draft.json'), json(manifest));
-          await fs.rename(temporary, folder); temporary = undefined;
+          await atomic(path.join(folder, 'draft.json'), manifest);
+          temporary = undefined;
         }
         // Cache hits still validate every downloaded file; never bless edited data.
         for (const name of Object.keys(manifest.files)) await readDraftFile(root, key, name);
         row.available = true;
       } catch (error) {
-        row.syncError = error?.message?.match(/^[a-z_0-9]+$/)?.[0] ?? 'draft_sync_failed';
+        row.syncError = error?.message?.match(/^[a-z_0-9]+$/)?.[0] ?? (typeof error?.code === 'string' ? error.code.toLowerCase() : 'draft_sync_failed');
         if (temporary) await fs.writeFile(path.join(temporary, 'FAILED.json'), json({ error: row.syncError }));
       }
     }

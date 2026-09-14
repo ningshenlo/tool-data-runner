@@ -18,7 +18,7 @@ import uuid
 
 SUCCESS = {"review", "unchanged", "published"}
 MONTH = re.compile(r"\d{4}-(?:0[1-9]|1[0-2])")
-SECTORS = {"music-generation", "image-generation", "video-generation"}
+SECTORS = {"music-generation", "image-generation", "video-generation", "speech-text-conversion", "presentations-visualization"}
 
 
 def read(file):

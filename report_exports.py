@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 SOURCE = "similarweb"  # Private provenance, never forwarded into public data.
 MONTH = re.compile(r"\d{4}-(?:0[1-9]|1[0-2])")
 SAFE_INTEGER = 9007199254740991
-KNOWN_SECTORS = {'music-generation', 'image-generation', 'video-generation'}
+KNOWN_SECTORS = {'music-generation', 'image-generation', 'video-generation', 'speech-text-conversion', 'presentations-visualization'}
 
 
 def encoded(value):
@@ -155,9 +155,10 @@ async def export_month(d1, root, month, markets, now, interval=3600):
     month_dir.mkdir(parents=True, exist_ok=True)
     state_file = month_dir / "export-status.json"
     previous = json.loads(state_file.read_text("utf-8")) if state_file.exists() else {}
-    if previous.get("nextCheckAt", 0) > now:
+    configuration = hashlib.sha256(encoded(markets)).hexdigest()
+    if previous.get('configuration') == configuration and previous.get("nextCheckAt", 0) > now:
         return previous
-    state = {"month": month, "checkedAt": now, "nextCheckAt": now + interval, "results": []}
+    state = {"month": month, "configuration": configuration, "checkedAt": now, "nextCheckAt": now + interval, "results": []}
     atomic_json(state_file, state)  # Persist backoff even when a query is interrupted.
     try:
         release = await d1.query("SELECT status FROM traffic_month_release_checks WHERE source = ? AND traffic_month = ?", [SOURCE, month + "-01"])

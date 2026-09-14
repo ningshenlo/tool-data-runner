@@ -96,6 +96,13 @@ class DraftStore:
             data = read(file)
             if MONTH.fullmatch(str(data.get('month', ''))):
                 readiness.append({'month': data['month'], 'checkedAt': data.get('checkedAt'), 'results': data.get('results', [])})
+                seen = {(r['month'], r['sector']) for r in rows}
+                for result in data.get('results', []):
+                    sector = result.get('sector', '')
+                    if SECTOR.fullmatch(sector) and (data['month'], sector) not in seen:
+                        rows.append({'month': data['month'], 'sector': sector,
+                                     'status': 'waiting' if result.get('status') == 'complete' else result.get('status', 'waiting'),
+                                     'reason': str(result.get('reason', 'Waiting for a complete reviewed draft'))[:500]})
         return {'schemaVersion': 1, 'reports': rows, 'marketInventory': inventory, 'readiness': readiness, 'deployed': False}
 
     def find(self, key):

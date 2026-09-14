@@ -18,6 +18,8 @@ export function reportMonth(month: string, locale: string) { const [y, m] = mont
 export function signed(value: number, digits = 2) { return `${value > 0 ? '+' : ''}${value.toFixed(digits)}`; }
 export function changePhrase(rate: number, locale: string) { return locale === 'zh-CN' ? rate === 0 ? '持平' : `${rate > 0 ? '增长' : '下降'} ${Math.abs(rate * 100).toFixed(1)}%` : rate === 0 ? 'were unchanged' : `${rate > 0 ? 'rose' : 'fell'} ${Math.abs(rate * 100).toFixed(1)}%`; }
 const productNames: Record<string, { en: string; 'zh-CN'?: string }> = {
+  'elevenlabs.io': { en: 'ElevenLabs' }, 'speechify.com': { en: 'Speechify' }, 'naturalreaders.com': { en: 'NaturalReader' },
+  'gamma.app': { en: 'Gamma' }, 'napkin.ai': { en: 'Napkin AI' }, 'beautiful.ai': { en: 'Beautiful.ai' },
   'suno.com': { en: 'Suno' },
   'midjourney.com': { en: 'Midjourney' },
   'davinci.ai': { en: 'DaVinci' }, 'higgsfield.ai': { en: 'Higgsfield' }, 'dreamina.capcut.com': { en: 'Dreamina' }, 'kling.ai': { en: 'Kling AI', 'zh-CN': '可灵 Kling AI' }, 'veed.io': { en: 'VEED' },
