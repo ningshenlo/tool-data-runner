@@ -9,6 +9,8 @@ class DockerImageContractTests(unittest.TestCase):
         )
         for module in (
             "runner.py",
+            "report_exports.py",
+            "report-markets.json",
             "taxonomy_shadow.py",
             "taxonomy_batch.py",
             "anti_bot_signatures.py",

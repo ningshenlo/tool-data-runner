@@ -27,6 +27,7 @@ from pathlib import Path
 import httpx
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from dotenv import load_dotenv
+from report_exports import export_ready_reports
 from d1_costguard import guard_endpoint, before_request, observe_response
 from anti_bot_signatures import detect_anti_bot_page
 from pricing.allowances import (
@@ -11710,12 +11711,22 @@ async def _run_once(config: Config, d1: D1Client, limit: int | None = None) -> d
 
 async def run_once(config: Config, limit: int | None = None) -> dict[str, int]:
     async with D1Client(config) as d1:
-        return await run_with_telemetry(
+        counts = await run_with_telemetry(
             config,
             d1,
             "traffic",
             lambda: _run_once(config, d1, limit),
         )
+        # Runs after collection, including idle batches. Rendering is independent;
+        # export failures never undo or misreport the traffic collection batch.
+        try:
+            counts.update(await export_ready_reports(d1, previous_traffic_month()))
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            counts["report_exports_blocked"] = 1
+            log_error("report_export.failed", error_type=type(error).__name__)
+        return counts
 
 
 async def _run_pricing_once(

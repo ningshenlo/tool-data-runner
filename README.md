@@ -341,3 +341,9 @@ python runner.py --eval-gold --gold-csv ../docs/taxonomy/gold-dataset-seed-draft
 `
 
 Reports land in docs/taxonomy/reports/ (gold-eval-latest.md / .json).
+
+
+## Automatic monthly report drafts
+
+The main Dokploy Compose file now builds and runs the report exporter and offline
+renderer from this repository. See [deployment, state and review instructions](docs/report-drafts.md).

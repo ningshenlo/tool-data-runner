@@ -1,0 +1,8 @@
+{
+  "schemaVersion": 1,
+  "markets": [
+    {"sector": "music-generation", "categorySlug": "music-generation", "supplements": [{"domain": "suno.com", "reason": "parent_category_assignment", "checkedOn": "2026-09-14", "evidenceUrl": "https://suno.com/"}], "editions": {"2026-08": {"reuse": {"policyVersion": "attribution-v1", "confirmedOn": "2026-09-14"}}}},
+    {"sector": "image-generation", "categorySlug": "basic-image-generation", "supplements": [{"domain": "midjourney.com", "reason": "category_snapshot_omission", "checkedOn": "2026-09-14", "evidenceUrl": "https://midjourney.com/"}], "scopeNotes": [{"domain": "midjourney.com", "description": {"en": "The official site offers image and video models; this report measures its whole-site Web visits.", "zh-CN": "官网提供图像与视频模型；本报告按整站 Web 访问量计量。"}, "checkedOn": "2026-09-14", "evidenceUrl": "https://midjourney.com/"}]},
+    {"sector": "video-generation", "categorySlug": "video-generation-conversion", "supplements": []}
+  ]
+}

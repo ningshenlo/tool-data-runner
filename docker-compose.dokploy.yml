@@ -2,6 +2,7 @@ x-runner-base: &runner-base
   build:
     context: .
     dockerfile: Dockerfile
+  pull_policy: build
   image: sigpik-tool-data-runner:${RUNNER_IMAGE_TAG:-latest}
   restart: unless-stopped
   init: true
@@ -50,12 +51,18 @@ services:
       TRAFFIC_RELEASE_PROBE_DOMAIN: ${TRAFFIC_RELEASE_PROBE_DOMAIN:-chatgpt.com}
       TRAFFIC_RELEASE_PROBE_START_DAY: ${TRAFFIC_RELEASE_PROBE_START_DAY:-7}
       TRAFFIC_RELEASE_PROBE_INTERVAL_SECONDS: ${TRAFFIC_RELEASE_PROBE_INTERVAL_SECONDS:-21600}
+      REPORT_EXPORT_ENABLED: ${REPORT_EXPORT_ENABLED:-1}
+      REPORT_EXPORT_ROOT: /report-exports
+      REPORT_EXPORT_INTERVAL_SECONDS: ${REPORT_EXPORT_INTERVAL_SECONDS:-3600}
       TRAFFIC_RELEASE_QUEUE_LIMIT: ${TRAFFIC_RELEASE_QUEUE_LIMIT:-5000}
       AHREF_API_KEY: ${AHREF_API_KEY:-}
       BRIGHTDATA_PROXY_HOST: ${BRIGHTDATA_PROXY_HOST:-brd.superproxy.io}
       BRIGHTDATA_PROXY_PORT: ${BRIGHTDATA_PROXY_PORT:-33335}
       BRIGHTDATA_PROXY_USER: ${BRIGHTDATA_PROXY_USER}
       BRIGHTDATA_PROXY_PASSWORD: ${BRIGHTDATA_PROXY_PASSWORD}
+
+    volumes:
+      - report-exports:/report-exports
 
   assets-worker:
     <<: *runner-base
@@ -210,3 +217,33 @@ services:
       OPENAI_TAXONOMY_L1_MIN_GAP: ${OPENAI_TAXONOMY_L1_MIN_GAP:-0.08}
       CLOUDFLARE_BROWSER_RENDERING_API_TOKEN: ${CLOUDFLARE_BROWSER_RENDERING_API_TOKEN:-}
       TAXONOMY_MAIN_CONTENT_MAX_CHARS: ${TAXONOMY_MAIN_CONTENT_MAX_CHARS:-10000}
+
+  report-draft-worker:
+    build:
+      context: .
+      dockerfile: Dockerfile.reports
+    image: sigpik-report-drafts:${RUNNER_IMAGE_TAG:-latest}
+    pull_policy: build
+    hostname: sigpik-report-drafts
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 40s
+    read_only: true
+    network_mode: none
+    tmpfs:
+      - /tmp:size=256m
+    volumes:
+      - report-exports:/exports:ro
+      - report-drafts:/app/work
+    healthcheck:
+      test: ["CMD", "python", "scripts/reports/healthcheck.py"]
+      interval: 60s
+      timeout: 5s
+      retries: 3
+      start_period: 120s
+
+volumes:
+  report-exports:
+    name: sigpik-report-exports
+  report-drafts:
+    name: sigpik-report-drafts
