@@ -42,6 +42,13 @@ export const SEO_SITE = {
  * suffix because the shared renderer appends it exactly once.
  */
 export const STATIC_SEO_PAGES = {
+  reportDrafts: {
+    path: '/reports/drafts', index: false, canonical: false, sitemap: false, reviewedAt: '2026-09-14',
+    copy: {
+      en: { title: 'Report draft review', description: 'Local preview of automatically generated report drafts awaiting review.' },
+      'zh-CN': { title: '报告草稿复核', description: '在本地查看自动生成的月度报告草稿、数据与图表，核对后进入发布流程。' },
+    },
+  },
   sharedPromotionReport: {
     path: '/share/reports/$token', index: false, canonical: false, sitemap: false, reviewedAt: '2026-09-12',
     copy: {

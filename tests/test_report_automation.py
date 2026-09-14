@@ -41,6 +41,24 @@ class D1:
 
 
 class ExportTests(unittest.IsolatedAsyncioTestCase):
+    async def test_market_inventory_is_read_only_and_throttles_success_and_failure(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root, d1 = Path(temp), D1([{'slug': 'text-to-speech', 'name': 'Speech', 'candidates': 20, 'comparable': 19}])
+            await producer.export_market_inventory(d1, root, '2026-08', NOW)
+            result = json.loads((root / '2026-08/market-inventory.json').read_text())
+            self.assertEqual(result['status'], 'checked')
+            self.assertEqual(result['markets'][0]['comparable'], 19)
+            self.assertEqual(d1.calls[0][1], [producer.SOURCE, '2026-08-01', producer.SOURCE, '2026-07-01'] * 2)
+            await producer.export_market_inventory(d1, root, '2026-08', NOW + 1)
+            self.assertEqual(len(d1.calls), 1)
+            d1.query = AsyncMock(side_effect=RuntimeError('synthetic private failure'))
+            await producer.export_market_inventory(d1, root, '2026-08', NOW + 3601)
+            await producer.export_market_inventory(d1, root, '2026-08', NOW + 3602)
+            self.assertEqual(d1.query.call_count, 1)
+            result = json.loads((root / '2026-08/market-inventory.json').read_text())
+            self.assertEqual(result['status'], 'blocked')
+            self.assertNotIn('synthetic private failure', json.dumps(result))
+
     async def test_disabled_hook_has_no_io(self):
         d1 = D1()
         await producer.export_ready_reports(d1, '2026-08-01', environ={})

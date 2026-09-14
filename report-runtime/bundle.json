@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "sourceCommit": "0316d696115fc288b1811011799a96668d791f73",
   "files": {
-    "config/seo.ts": "d724d401c5ef710641144b7359808d4c4257de3c9035d8f1c82ff02ece4ddab8",
+    "config/seo.ts": "9390c493483d25c6385d68d16121457947558c1fb5c20cfdcb7f8e3a698b7549",
     "content/reports/presentation.ts": "69a3f43db534d60324f49623db4f2dfc1e369da21d0dbc381a10c25ff250107a",
     "content/reports/registry.ts": "1a5e426b250ac16c3673ef5141347c1b80d1961f5a96fb0c4ad67f33bb2548e5",
     "lib/market-statistics.ts": "285f3434fe4eb5714f098d78a968d34f762e2653ba01ac4ea3acfec6d49100bb",
@@ -20,11 +20,12 @@
     "scripts/reports/pipeline-core.mjs": "b25397669810d9b4b9f6308199197f50ca418b124acbbd4425fa8be5634cf2e8",
     "scripts/reports/pipeline.mjs": "6c20eb6709b222c21a6b58f2b6f60dece93f2ace43889f8d5914b79644dfd52c",
     "scripts/reports/prepare-release.py": "f05e4760a2fb42cd4beb684fa4bf34f0d8b7511d7d038a87b4c703249aea1c4c",
+    "scripts/reports/pull-drafts.mjs": "29ec2680f2d6e55d542690cb56b98159c7d4207255e587bbe3549c27e656f1b4",
     "scripts/reports/render-assets.py": "a9374a45e2480b4a679fa7cc122e35330396789f2c7145ffeb3cbb9d9ab69ccc",
     "scripts/reports/requirements.txt": "bc3f21daf6a071a56dffc1e39af3f8be67fa18a2eb210083c6200355e645df11",
     "scripts/reports/runtime-baseline.mjs": "33636344fadc31b3f4d4970de70d1b863733c190db6b2e3548cbcfaa35b8e5ec",
     "scripts/reports/verify-assets.py": "7c384ae12ef02e1957749f5c1327d075ef6900152ccd86a0852605e30917550c",
     "scripts/reports/verify-preview.mjs": "8af15f8831d19a0cbd1086226e9161c1c12ced69ed61894e7299f132dbd98ffa"
   },
-  "bundleDigest": "a175f3fc94134a4ec9f4a9fa05d4d53dab24ec09f947f77a0e3e94fcaef54856"
+  "bundleDigest": "ebf915be935e05de953ab6d5d8fdeef161416b886231e37ff338be00a9c377dd"
 }

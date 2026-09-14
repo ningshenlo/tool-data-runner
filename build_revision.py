@@ -4,7 +4,7 @@ from pathlib import Path
 
 def revision(root=None):
     root = Path(root or Path(__file__).parent)
-    files = [root / name for name in ["runner.py", "report_exports.py", "report-markets.json", "d1_costguard.py", "taxonomy_shadow.py", "taxonomy_batch.py", "anti_bot_signatures.py", "classification_anomalies.py", "requirements.txt"]]
+    files = [root / name for name in ["runner.py", "report_exports.py", "report_review_api.py", "report-markets.json", "d1_costguard.py", "taxonomy_shadow.py", "taxonomy_batch.py", "anti_bot_signatures.py", "classification_anomalies.py", "requirements.txt"]]
     for folder in ["pricing", "sitemap_monitor"]:
         files.extend((root / folder).rglob("*.py"))
         files.extend((root / folder).rglob("*.sql"))

@@ -91,6 +91,36 @@ refresh the baseline and regenerate before review; never bypass its release hash
 check. Frozen monthly exports are retained rather than overwritten by corrections.
 A data correction therefore requires an explicit reviewed replacement workflow.
 
+## Authenticated local draft review
+
+The `report-review-api` service reads the existing report volumes through read-only
+mounts. It receives a separate random `REPORT_REVIEW_TOKEN` (at least 40 ASCII
+characters), and receives no D1, provider or publishing credentials. Set this
+secret in Dokploy before deploying the updated Compose; do not commit it.
+
+Route HTTPS host `back.rugchecker.com`, path `/__sigpik_report_review`, to service
+`report-review-api`, container port `8091`, with Strip Path disabled. Its endpoints
+live below `/__sigpik_report_review/v1`. Every endpoint requires the Bearer token;
+unauthenticated requests return 401. Only verified completed manifests and their
+declared files are downloadable. Mutation methods return 405. Responses are
+private/no-store/noindex, and credentials are never logged. Keep the existing
+offline renderer isolated; the review service cannot trigger a job or release.
+
+In the Sigpik workspace, store the endpoint and token in the ignored private
+`work/reports/remote-config.json`. Run `pnpm reports:pull`, or open the local
+`/reports` page. The Vite-only adapter checks for updates at most once a minute,
+verifies manifest and file hashes, and stores complete drafts under the ignored
+`work/reports/remote` directory. `/reports/drafts` provides local preview and direct
+PNG/CSV access. It returns not-found in production, has no canonical or sitemap
+entry, and cannot publish a draft. Copying approved files into the public site
+remains a separate release operation.
+
+With `REPORT_MARKET_INVENTORY_ENABLED=1`, the existing periodic producer also
+performs a bounded, hourly, read-only audit of speech/presentation categories.
+The private `market-inventory.json` result reports comparable samples, gaps and
+leading domains. It does not expand the supported market list or fetch provider
+data automatically. D1 guard failures remain blocked rather than bypassed.
+
 ## Build validation
 
 The `Report runtime` GitHub Actions workflow builds both images, runs the real

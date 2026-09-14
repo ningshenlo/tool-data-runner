@@ -189,6 +189,64 @@ async def export_month(d1, root, month, markets, now, interval=3600):
     return state
 
 
+async def export_market_inventory(d1, root, month, now):
+    """Bounded read-only readiness audit for the next two report markets."""
+    file = root / month / 'market-inventory.json'
+    if file.exists() and read_inventory_time(file) > now - 3600:
+        return
+    state = {'month': month, 'checkedAt': now, 'status': 'checking', 'markets': []}
+    atomic_json(file, state)
+    try:
+        sql = """
+        WITH candidates AS (
+          SELECT DISTINCT term.slug, term.name, t.normalized_domain AS domain
+          FROM tools t
+          JOIN current_tool_primary_taxonomy p ON p.tool_id = t.id
+          JOIN taxonomy_terms term ON term.id = p.term_id
+          WHERE t.status = 'published' AND t.content_safety_status = 'safe'
+            AND t.duplicate_of_tool_id IS NULL AND t.verification_status IN ('verified', 'pending')
+            AND t.staleness_status IN ('fresh', 'aging') AND term.status = 'active'
+            AND (term.slug LIKE '%speech%' OR term.slug LIKE '%presentation%')
+        ), measured AS (
+          SELECT c.*, cur.visits AS current_visits, prev.visits AS previous_visits,
+            cur.metrics_schema_version AS current_schema, prev.metrics_schema_version AS previous_schema,
+            task.status AS current_task, oldtask.status AS previous_task,
+            row_number() OVER (PARTITION BY c.slug ORDER BY cur.visits DESC, c.domain) AS position
+          FROM candidates c
+          LEFT JOIN domain_traffic_monthly cur ON cur.normalized_domain = c.domain AND cur.source = ? AND cur.traffic_month = ?
+          LEFT JOIN domain_traffic_monthly prev ON prev.normalized_domain = c.domain AND prev.source = ? AND prev.traffic_month = ?
+          LEFT JOIN traffic_tasks task ON task.normalized_domain = c.domain AND task.source = ? AND task.traffic_month = ?
+          LEFT JOIN traffic_tasks oldtask ON oldtask.normalized_domain = c.domain AND oldtask.source = ? AND oldtask.traffic_month = ?
+        )
+        SELECT slug, name, count(*) AS candidates,
+          sum(CASE WHEN current_visits IS NOT NULL AND previous_visits > 0 AND current_schema = 2 AND previous_schema = 2 THEN 1 ELSE 0 END) AS comparable,
+          sum(CASE WHEN current_visits IS NULL THEN 1 ELSE 0 END) AS missing_current,
+          sum(CASE WHEN previous_visits IS NULL THEN 1 ELSE 0 END) AS missing_baseline,
+          sum(CASE WHEN (current_task IS NOT NULL AND current_task NOT IN ('done','no_data','forbidden'))
+            OR (previous_task IS NOT NULL AND previous_task NOT IN ('done','no_data','forbidden')) THEN 1 ELSE 0 END) AS unsettled,
+          group_concat(CASE WHEN position <= 5 THEN domain END, ',') AS leading_domains
+        FROM measured GROUP BY slug, name ORDER BY comparable DESC, slug LIMIT 30
+        """
+        params = []
+        for offset in (0, -1, 0, -1):
+            params.extend([SOURCE, shift_month(month, offset) + '-01'])
+        state.update(status='checked', markets=await d1.query(sql, params))
+    except Exception as error:
+        state.update(status='blocked', reason=type(error).__name__)
+        if getattr(error, 'reason', None) == 'cost_guard_stopped':
+            state['reason'] = 'cost_guard_stopped'
+        if isinstance(getattr(error, 'status_code', None), int):
+            state['httpStatus'] = error.status_code
+    atomic_json(file, state)
+
+
+def read_inventory_time(file):
+    try:
+        return json.loads(file.read_text('utf-8')).get('checkedAt', 0)
+    except (ValueError, OSError):
+        return 0
+
+
 async def _export_ready_reports(d1, traffic_month, *, environ=None, now=None):
     env = os.environ if environ is None else environ
     if env.get("REPORT_EXPORT_ENABLED", "0") != "1":
@@ -204,6 +262,8 @@ async def _export_ready_reports(d1, traffic_month, *, environ=None, now=None):
     if month >= datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m"):
         raise ValueError("Only closed calendar months can be exported")
     root.mkdir(parents=True, exist_ok=True)
+    if env.get('REPORT_MARKET_INVENTORY_ENABLED') == '1':
+        await export_market_inventory(d1, root, month, now)
     months = sorted({month, *(p.name for p in root.iterdir() if p.is_dir() and MONTH.fullmatch(p.name) and p.name < month)})
     counts = {"report_exports_complete": 0, "report_exports_blocked": 0}
     for item in months:

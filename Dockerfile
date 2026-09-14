@@ -10,6 +10,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY runner.py .
 COPY report_exports.py .
+COPY report_review_api.py .
 COPY report-markets.json .
 COPY d1_costguard.py .
 COPY build_revision.py .
