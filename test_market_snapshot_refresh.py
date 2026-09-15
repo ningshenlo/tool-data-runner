@@ -193,6 +193,28 @@ class ActivationSqlTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await runner.resolve_market_snapshot_months(self.d1,'2026-08-01'),('2026-08-01',None))
 
 
+class RecoveryRegressionTests(unittest.IsolatedAsyncioTestCase):
+    def test_bounce_rate_roundoff_preserves_real_visits_and_raw_evidence(self):
+        payload = {'Engagments': {'BounceRate': 1.0000000000000002, 'Visits': 127}, 'EstimatedMonthlyVisits': {'2026-08-01': 127}}
+        row = runner.parse_monthly_rows(payload, 'example.test', '2026-08-01')[0]
+        self.assertEqual((row['visits'], row['bounce_rate']), (127, 1.0))
+        self.assertEqual(payload['Engagments']['BounceRate'], 1.0000000000000002)
+        for value, expected in [(0,0), (1,1), (0.543,0.543), (-1e-16,0), (1.01,None), (-0.01,None), (float('nan'),None), (float('inf'),None)]:
+            self.assertEqual(runner.parse_unit_ratio(value), expected)
+
+    async def test_sparse_page_boundaries_preserve_all_rows_and_parameter_positions(self):
+        db=sqlite3.connect(':memory:');db.row_factory=sqlite3.Row
+        try:
+            db.executescript('CREATE TABLE source(id INTEGER PRIMARY KEY, value INTEGER); CREATE TABLE destination(snapshot INTEGER, id INTEGER, value INTEGER, PRIMARY KEY(snapshot,id));')
+            ids=[1,49,50,51,83,99,100,150,1000]
+            db.executemany('INSERT INTO source VALUES(?,?)',[(i,i*2) for i in ids])
+            d1=stores.FakeD1(db)
+            await runner.run_market_snapshot_pages(d1,'INSERT INTO destination SELECT ?,id,value FROM source WHERE id>? AND id<=?',[7],[(0,50),(50,100),(100,1000)],page_param_index=1)
+            self.assertEqual([tuple(r) for r in db.execute('SELECT * FROM destination ORDER BY id')],[(7,i,i*2) for i in ids])
+        finally:
+            db.close()
+
+
 class HookTests(unittest.IsolatedAsyncioTestCase):
     async def test_idle_collection_publishes_and_publication_failure_does_not_break_exports(self):
         class Client:

@@ -6,6 +6,7 @@ import hmac
 import html
 import ipaddress
 import json
+import math
 import os
 import random
 import re
@@ -4377,6 +4378,13 @@ def estimate_visits_from_bps(visits: Any, traffic_share_bps: int) -> int | None:
     return (normalized_visits * traffic_share_bps + 5000) // 10000
 
 
+def parse_unit_ratio(value: Any) -> float | None:
+    ratio = to_number(value)
+    if ratio is None or not math.isfinite(ratio) or ratio < -1e-12 or ratio > 1 + 1e-12:
+        return None
+    return min(1.0, max(0.0, ratio))
+
+
 def parse_monthly_rows(payload: dict[str, Any], domain: str, requested_month: str) -> list[dict[str, Any]]:
     engagements = payload.get("Engagments") or {}
     estimated_visits = payload.get("EstimatedMonthlyVisits") or {}
@@ -4392,7 +4400,7 @@ def parse_monthly_rows(payload: dict[str, Any], domain: str, requested_month: st
         "engagement_visits": to_integer(engagements.get("Visits")),
         "global_rank": to_integer((payload.get("GlobalRank") or {}).get("Rank")),
         **parse_country_rank(payload),
-        "bounce_rate": to_number(engagements.get("BounceRate")),
+        "bounce_rate": parse_unit_ratio(engagements.get("BounceRate")),
         "pages_per_visit": to_number(engagements.get("PagePerVisit")),
         "avg_visit_duration_seconds": to_integer(engagements.get("TimeOnSite")),
         **parse_traffic_sources(payload),
@@ -5941,8 +5949,7 @@ async def build_market_snapshot_facet_rollups_from_d1(
     catalog_eligibility_revision: int,
     built_at: str,
 ) -> None:
-    await d1.batch(
-        [
+    statements = [
             (
                 "DELETE FROM taxonomy_market_snapshot_facet_rollups WHERE snapshot_id = ?",
                 [snapshot_id],
@@ -6011,6 +6018,7 @@ async def build_market_snapshot_facet_rollups_from_d1(
                   JOIN market_catalog_eligibility_revision revision
                     ON revision.id = 1 AND revision.revision = ?
                   WHERE country.snapshot_id = ?
+                    AND country.country_code = ?
                     AND {MARKET_SNAPSHOT_PUBLIC_TOOL_PREDICATE}
                   GROUP BY
                     country.snapshot_id,
@@ -6069,7 +6077,14 @@ async def build_market_snapshot_facet_rollups_from_d1(
                 ],
             ),
         ]
+    await d1.batch(statements[:3])
+    countries = await d1.query(
+        "SELECT DISTINCT country_code FROM tool_country_market_snapshots WHERE snapshot_id = ? ORDER BY country_code",
+        [snapshot_id],
     )
+    country_sql, country_params = statements[3]
+    for country in countries:
+        await d1.run(country_sql, [*country_params[:2], country['country_code'], *country_params[2:]])
 
 
 async def get_market_snapshot_coverage(d1: D1Client, snapshot_id: int) -> dict[str, int]:
@@ -6466,6 +6481,11 @@ async def activate_market_snapshot_from_d1(
     }
 
 
+async def run_market_snapshot_pages(d1, sql, params, ranges, *, page_param_index=0):
+    for lower, upper in ranges:
+        await d1.run(sql, [*params[:page_param_index], lower, upper, *params[page_param_index:]])
+
+
 async def build_market_snapshot_from_d1(
     d1: D1Client,
     traffic_month: str | None = None,
@@ -6501,9 +6521,17 @@ async def build_market_snapshot_from_d1(
         raise RuntimeError("Market snapshot builder did not return a snapshot id")
 
     try:
-        await d1.run(
+        eligible_ids = await d1.query(f"WITH {MARKET_VISIBLE_TOOLS_CTES} SELECT id FROM visible_tools ORDER BY id")
+        ids = [row['id'] for row in eligible_ids]
+        # Bound index writes and restrict traffic/rating reads to the same page.
+        # Candidate rows remain private until all pages and coverage gates pass.
+        ranges = [(ids[start - 1] if start else 0, ids[min(start + 49, len(ids) - 1)]) for start in range(0, len(ids), 50)]
+        await run_market_snapshot_pages(
+            d1,
             f"""
-            WITH {MARKET_VISIBLE_TOOLS_CTES}, current_raw AS (
+            WITH {MARKET_VISIBLE_TOOLS_CTES}, selected_tools AS MATERIALIZED (
+              SELECT * FROM visible_tools WHERE id > ? AND id <= ?
+            ), current_raw AS (
               SELECT
                 traffic.normalized_domain,
                 traffic.visits,
@@ -6524,6 +6552,7 @@ async def build_market_snapshot_from_d1(
                 ) AS paid_search_share
               FROM domain_traffic_monthly traffic
               WHERE traffic.source = ? AND traffic.traffic_month = ?
+                AND traffic.normalized_domain IN (SELECT normalized_domain FROM selected_tools)
             ), current_computed AS (
               SELECT
                 current_raw.*,
@@ -6549,6 +6578,7 @@ async def build_market_snapshot_from_d1(
               SELECT normalized_domain, visits, ai_visits
               FROM domain_traffic_monthly
               WHERE source = ? AND traffic_month = ?
+                AND normalized_domain IN (SELECT normalized_domain FROM selected_tools)
             ), rating_latest_ranked AS (
               SELECT
                 normalized_domain,
@@ -6561,6 +6591,7 @@ async def build_market_snapshot_from_d1(
                 ) AS latest_row
               FROM domain_rating_history
               WHERE source = ?
+                AND normalized_domain IN (SELECT normalized_domain FROM selected_tools)
             ), rating_latest AS (
               SELECT
                 normalized_domain,
@@ -6654,7 +6685,7 @@ async def build_market_snapshot_from_d1(
               rating.previous_date,
               current.captured_at,
               ?
-            FROM visible_tools tool
+            FROM selected_tools tool
             LEFT JOIN current_traffic current
               ON current.normalized_domain = tool.normalized_domain
             LEFT JOIN baseline_traffic baseline
@@ -6671,8 +6702,10 @@ async def build_market_snapshot_from_d1(
                 snapshot_id,
                 now,
             ],
+            ranges,
         )
-        await d1.run(
+        await run_market_snapshot_pages(
+            d1,
             """
             WITH country_estimates AS (
               SELECT
@@ -6695,6 +6728,7 @@ async def build_market_snapshot_from_d1(
                AND country.source = ?
                AND country.traffic_month = ?
               WHERE snapshot.snapshot_id = ?
+                AND snapshot.tool_id > ? AND snapshot.tool_id <= ?
             )
             INSERT INTO tool_country_market_snapshots (
               snapshot_id, tool_id, normalized_domain, country_code,
@@ -6722,6 +6756,8 @@ async def build_market_snapshot_from_d1(
             FROM country_estimates estimate
             """,
             [TRAFFIC_SOURCE, selected_month, snapshot_id, now],
+            ranges,
+            page_param_index=3,
         )
         await build_market_snapshot_facet_rollups_from_d1(
             d1,
