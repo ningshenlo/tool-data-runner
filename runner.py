@@ -27,7 +27,8 @@ from pathlib import Path
 import httpx
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from dotenv import load_dotenv
-from report_exports import export_ready_reports
+from report_exports import export_ready_reports, shift_month
+from market_snapshot_refresh import refresh_completed_market_snapshot
 from d1_costguard import guard_endpoint, before_request, observe_response
 from anti_bot_signatures import detect_anti_bot_page
 from pricing.allowances import (
@@ -5853,10 +5854,10 @@ async def resolve_market_snapshot_months(
          AND release.traffic_month = traffic.traffic_month
          AND release.status = 'available'
         WHERE traffic.source = ?
-          AND traffic.traffic_month < ?
+          AND traffic.traffic_month = ?
           AND traffic.visits IS NOT NULL
         """,
-        [TRAFFIC_SOURCE, selected_month],
+        [TRAFFIC_SOURCE, shift_month(selected_month[:7], -1) + '-01'],
     )
     baseline_month = (
         to_month_start(baseline_rows[0].get("traffic_month"))
@@ -6419,6 +6420,7 @@ async def activate_market_snapshot_from_d1(
                     WHERE candidate.id = ?
                       AND candidate.status = 'candidate'
                       AND candidate.catalog_eligibility_revision = revision.revision
+                      AND candidate.traffic_month >= market_snapshot_versions.traffic_month
                   )
                 """,
                 [
@@ -6434,6 +6436,12 @@ async def activate_market_snapshot_from_d1(
                 UPDATE market_snapshot_versions
                 SET status = 'active', activated_at = ?, retired_at = NULL, updated_at = ?
                 WHERE id = ? AND status = 'candidate'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM market_snapshot_versions newer
+                    WHERE newer.traffic_source = market_snapshot_versions.traffic_source
+                      AND newer.status = 'active'
+                      AND newer.traffic_month > market_snapshot_versions.traffic_month
+                  )
                   AND catalog_eligibility_revision = (
                     SELECT revision
                     FROM market_catalog_eligibility_revision
@@ -11717,6 +11725,21 @@ async def run_once(config: Config, limit: int | None = None) -> dict[str, int]:
             "traffic",
             lambda: _run_once(config, d1, limit),
         )
+        # Publication is independent of report exports and also runs on idle batches.
+        try:
+            publication = await refresh_completed_market_snapshot(
+                d1, source=TRAFFIC_SOURCE, visible_tools_ctes=MARKET_VISIBLE_TOOLS_CTES,
+                build=build_market_snapshot_from_d1, activate=activate_market_snapshot_from_d1,
+            )
+            for status in ("active", "waiting", "blocked"):
+                counts["market_snapshot_" + status] = int(publication["status"] == status)
+            if publication["status"] not in ("disabled", "throttled", "locked"):
+                log_info("market_snapshot.auto_publish", **publication)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            counts["market_snapshot_blocked"] = 1
+            log_error("market_snapshot.auto_publish.failed", error_type=type(error).__name__)
         # Runs after collection, including idle batches. Rendering is independent;
         # export failures never undo or misreport the traffic collection batch.
         try:

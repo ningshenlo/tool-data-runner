@@ -347,3 +347,24 @@ Reports land in docs/taxonomy/reports/ (gold-eval-latest.md / .json).
 
 The main Dokploy Compose file now builds and runs the report exporter and offline
 renderer from this repository. See [deployment, state and review instructions](docs/report-drafts.md).
+
+## Automatic monthly market publication
+
+The traffic batch now checks completed public-catalog months and builds/activates
+their immutable serving snapshot. Idle batches also check; report exports remain
+independent. Dokploy defaults MARKET_SNAPSHOT_AUTO_PUBLISH_ENABLED to 1. Set it
+explicitly to 1 in the production service; local .env.example keeps it at 0.
+MARKET_SNAPSHOT_CHECK_INTERVAL_SECONDS defaults to 3600 (minimum 300). The shared
+market-snapshots volume stores publication-status.json and the process lock.
+
+Only released, closed months newer than the active version are eligible. Every
+eligible domain must have materialized data or a genuine no_data/forbidden
+terminal outcome. Failed, unfinished or contradictory tasks block publication.
+The builder rechecks inputs, preserves the existing coverage gates and atomically
+switches versions. Older delayed jobs cannot roll back a newer active month.
+Previously published months are not automatically revised after later corrections.
+
+Read-only diagnosis: python scripts/check-market-publication.py --month YYYY-MM.
+Failures are recorded in publication-status.json and market_snapshot.auto_publish
+logs; they do not undo collection or stop report exports. Authorization for remote
+publication and deployment is still required before enabling a production run.

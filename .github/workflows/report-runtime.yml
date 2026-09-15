@@ -26,7 +26,7 @@ jobs:
           docker build -t report-test-renderer -f Dockerfile.reports .
       - name: Test collector entry point and scheduler contracts
         run: |
-          docker run --rm --network none -v "$PWD:/repo:ro" -w /repo report-test-collector python -m unittest test_docker_image_contract test_d1_guard_clients tests.test_report_automation tests.test_report_review_api
+          docker run --rm --network none -v "$PWD:/repo:ro" -w /repo report-test-collector python -m unittest test_market_snapshot_refresh test_docker_image_contract test_d1_guard_clients tests.test_report_automation tests.test_report_review_api
           docker run --rm --network none -v "$PWD:/repo:ro" -w /repo report-test-renderer node --test tests/report-runtime.test.mjs
       - name: Prepare synthetic completion events
         run: |

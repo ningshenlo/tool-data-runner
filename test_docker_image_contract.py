@@ -7,8 +7,10 @@ class DockerImageContractTests(unittest.TestCase):
         dockerfile = (Path(__file__).resolve().parent / "Dockerfile").read_text(
             encoding="utf-8"
         )
+        self.assertIn("COPY scripts/check-market-publication.py ./scripts/", dockerfile)
         for module in (
             "runner.py",
+            "market_snapshot_refresh.py",
             "report_exports.py",
             "report-markets.json",
             "taxonomy_shadow.py",

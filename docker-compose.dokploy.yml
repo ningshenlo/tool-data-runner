@@ -51,6 +51,9 @@ services:
       TRAFFIC_RELEASE_PROBE_DOMAIN: ${TRAFFIC_RELEASE_PROBE_DOMAIN:-chatgpt.com}
       TRAFFIC_RELEASE_PROBE_START_DAY: ${TRAFFIC_RELEASE_PROBE_START_DAY:-7}
       TRAFFIC_RELEASE_PROBE_INTERVAL_SECONDS: ${TRAFFIC_RELEASE_PROBE_INTERVAL_SECONDS:-21600}
+      MARKET_SNAPSHOT_AUTO_PUBLISH_ENABLED: ${MARKET_SNAPSHOT_AUTO_PUBLISH_ENABLED:-1}
+      MARKET_SNAPSHOT_CHECK_INTERVAL_SECONDS: ${MARKET_SNAPSHOT_CHECK_INTERVAL_SECONDS:-3600}
+      MARKET_SNAPSHOT_STATE_ROOT: /market-snapshots
       REPORT_EXPORT_ENABLED: ${REPORT_EXPORT_ENABLED:-1}
       REPORT_EXPORT_ROOT: /report-exports
       REPORT_MARKET_INVENTORY_ENABLED: "1"
@@ -64,6 +67,7 @@ services:
 
     volumes:
       - report-exports:/report-exports
+      - market-snapshots:/market-snapshots
 
   assets-worker:
     <<: *runner-base
@@ -264,6 +268,8 @@ services:
       - report-drafts:/app/work:ro
 
 volumes:
+  market-snapshots:
+    name: sigpik-market-snapshots
   report-exports:
     name: sigpik-report-exports
   report-drafts:
