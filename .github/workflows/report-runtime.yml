@@ -1,0 +1,42 @@
+name: Report runtime
+on:
+  push:
+    branches: [agent/reports-github-deploy-20260914, agent/fix-traffic-runner-observability]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline-report-smoke:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Verify bundle and Compose configuration
+        env:
+          REPORT_REVIEW_TOKEN: ci-only-placeholder-not-a-real-secret-1234567890
+        run: |
+          python scripts/sync-report-runtime.py --verify
+          docker compose -f docker-compose.dokploy.yml config --quiet
+      - name: Build collector and report images
+        run: |
+          docker build -t report-test-collector .
+          docker build -t report-test-renderer -f Dockerfile.reports .
+      - name: Test collector entry point and scheduler contracts
+        run: |
+          docker run --rm --network none -v "$PWD:/repo:ro" -w /repo report-test-collector python -m unittest test_market_snapshot_refresh test_docker_image_contract test_d1_guard_clients tests.test_report_automation tests.test_report_review_api
+          docker run --rm --network none -v "$PWD:/repo:ro" -w /repo report-test-renderer node --test tests/report-runtime.test.mjs
+      - name: Prepare synthetic completion events
+        run: |
+          docker volume create report-test-exports
+          docker volume create report-test-drafts
+          docker run --rm --network none --read-only --tmpfs /tmp -v "$PWD:/repo:ro" -v report-test-exports:/exports report-test-renderer python /repo/tests/report_smoke.py --prepare
+      - name: Render with read-only code and exports, then restart
+        run: |
+          docker run --rm --hostname sigpik-report-drafts --network none --read-only --tmpfs /tmp:size=256m -v "$PWD:/repo:ro" -v report-test-exports:/exports:ro -v report-test-drafts:/app/work report-test-renderer python /repo/tests/report_smoke.py
+      - name: Remove synthetic test volumes
+        if: always()
+        run: |
+          docker volume rm report-test-exports report-test-drafts || true

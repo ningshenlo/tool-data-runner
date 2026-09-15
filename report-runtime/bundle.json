@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "sourceCommit": "0316d696115fc288b1811011799a96668d791f73",
+  "files": {
+    "config/seo.ts": "9390c493483d25c6385d68d16121457947558c1fb5c20cfdcb7f8e3a698b7549",
+    "content/reports/presentation.ts": "7f7df61220d17660d6ef592b6c6230e3a96cacb9f0990fdf3c82d9c3523c5055",
+    "content/reports/registry.ts": "1a5e426b250ac16c3673ef5141347c1b80d1961f5a96fb0c4ad67f33bb2548e5",
+    "lib/market-statistics.ts": "285f3434fe4eb5714f098d78a968d34f762e2653ba01ac4ea3acfec6d49100bb",
+    "lib/reports/model.ts": "55cf27a384f01b760131f68d48a59294f4326195b224817aba319c5db417b93a",
+    "public/_headers": "98237e2ba916f700671ebcb923e58a9f35e89aede903f01992b9be9a21c14e43",
+    "public/brand/sigpik-logo.png": "9977249cf4beb2d226b254cc46c0e29b550e20435533dbf6b8407be5117e642c",
+    "runtime-baseline.json": "08b011cf8c3bb4a5718bfdf73f57e96d5ff2223033ee3f70c1a39aba6ca0ad97",
+    "scripts/reports/build-media.mjs": "ccd5f9e39d71e0d07647471ba93082c3f37fd9f0c4f2dca82f7a4645651b1903",
+    "scripts/reports/check-release-locks.mjs": "3fdae48ea3ab988ed2fbfbcc613f8b9302ff955d97527d59329ab0d4260e0915",
+    "scripts/reports/draft-lock.mjs": "ae8d5a2a566f1d8fb73468a4d275c8304e934ddef1cda36dc2f82f21d5dd50ba",
+    "scripts/reports/draft-worker.py": "287ca3919304f25dbb90ac47012798311e3674465ecf1ad6ae63f24dc26a25b4",
+    "scripts/reports/editorial_charts.py": "985bba1286698a76cc4f746b334d5b1d65a334d15417846ce1df8a358f7eb5a0",
+    "scripts/reports/healthcheck.py": "3f19719d0aa3f6a63f4e10817d90170d15d0565807da51af874e39eb73a08a79",
+    "scripts/reports/import-pilot.mjs": "27404b28e0b554619fd8697369286e798ac5aac19ad2b4953561d6138807a847",
+    "scripts/reports/pipeline-core.mjs": "0f28a237c11ffe952bc1595ece89e16d68d593076f1cf5e876cd77c43d4cdcf3",
+    "scripts/reports/pipeline.mjs": "6c20eb6709b222c21a6b58f2b6f60dece93f2ace43889f8d5914b79644dfd52c",
+    "scripts/reports/prepare-release.py": "f05e4760a2fb42cd4beb684fa4bf34f0d8b7511d7d038a87b4c703249aea1c4c",
+    "scripts/reports/pull-drafts.mjs": "3436007cb2ee3a2532bbcff5373078b07499cd3c38679d2a8e08b0ef8864079a",
+    "scripts/reports/render-assets.py": "a9374a45e2480b4a679fa7cc122e35330396789f2c7145ffeb3cbb9d9ab69ccc",
+    "scripts/reports/requirements.txt": "bc3f21daf6a071a56dffc1e39af3f8be67fa18a2eb210083c6200355e645df11",
+    "scripts/reports/runtime-baseline.mjs": "33636344fadc31b3f4d4970de70d1b863733c190db6b2e3548cbcfaa35b8e5ec",
+    "scripts/reports/verify-assets.py": "7c384ae12ef02e1957749f5c1327d075ef6900152ccd86a0852605e30917550c",
+    "scripts/reports/verify-preview.mjs": "8af15f8831d19a0cbd1086226e9161c1c12ced69ed61894e7299f132dbd98ffa"
+  },
+  "bundleDigest": "3cf5d42b76dd3e4c4c17f195583c78fb2f789c5aa211be14c48db272db0172ac"
+}

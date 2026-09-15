@@ -10,7 +10,6 @@ from pathlib import Path
 from taxonomy_eval import (
     EvalBundle,
     GoldRow,
-    LegacyView,
     Prediction,
     build_evaluation_report,
     is_auto_accepted,
@@ -92,7 +91,7 @@ class MetricTests(unittest.TestCase):
         pred2 = Prediction(tool_id=1, primary_slug="a", confidence=0.99, decision_status="unresolved")
         self.assertFalse(is_auto_accepted(pred2, threshold=0.5))
 
-    def test_report_metrics_and_diff(self):
+    def test_report_metrics(self):
         gold_rows = [
             GoldRow(
                 tool_id=43,
@@ -138,25 +137,10 @@ class MetricTests(unittest.TestCase):
                 capabilities=["text-to-speech"],
             ),
         }
-        legacy = {
-            43: LegacyView(
-                tool_id=43,
-                primary_slug="video",
-                inferred_leaf_slug="video-generation-conversion",
-                category_slugs=["video", "video-generation-conversion"],
-            ),
-            48: LegacyView(
-                tool_id=48,
-                primary_slug="audio",
-                inferred_leaf_slug="voice-generation-conversion",
-                category_slugs=["audio", "voice-generation-conversion"],
-            ),
-        }
         report = build_evaluation_report(
             EvalBundle(
                 gold_rows=gold_rows,
                 shadow=shadow,
-                legacy=legacy,
                 auto_accepted_threshold=0.85,
             )
         )
@@ -166,8 +150,8 @@ class MetricTests(unittest.TestCase):
         self.assertEqual(report["missing_shadow_n"], 1)
         self.assertEqual(metrics["auto_accepted_n"], 1)  # only 43 conf>=0.85
         self.assertEqual(metrics["auto_accepted_precision"], 1.0)
-        self.assertEqual(report["diff_summary"]["legacy_better_than_shadow"], 1)
-        self.assertEqual(report["diff_summary"]["shadow_match_gold"], 1)
+        self.assertEqual(report["evaluation_summary"]["shadow_match_gold"], 1)
+        self.assertEqual(report["evaluation_summary"]["shadow_mismatch_gold"], 1)
 
         md = render_markdown_report(report)
         self.assertIn("auto_accepted Precision", md)
