@@ -11,6 +11,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY runner.py .
 COPY report_exports.py .
 COPY market_snapshot_refresh.py .
+COPY search_demand_refresh.py .
+COPY search_demand_brand.py .
+COPY scripts/check-search-demand-publication.py ./scripts/
 COPY scripts/check-market-publication.py ./scripts/
 COPY report_review_api.py .
 COPY report-markets.json .

@@ -1,0 +1,1287 @@
+[
+  {
+    "name": "chatgpt / chatgpt.com",
+    "observations": [
+      {
+        "keyword": "chatgpt",
+        "normalized_domain": "chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.8
+      }
+    ],
+    "expected": {
+      "demand_type": "brand_navigational",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:exact",
+      "confidence": 0.98
+    }
+  },
+  {
+    "name": "chatgpt / app.chatgpt.com",
+    "observations": [
+      {
+        "keyword": "chatgpt",
+        "normalized_domain": "app.chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": null
+      }
+    ],
+    "expected": {
+      "demand_type": "brand_navigational",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:exact",
+      "confidence": 0.94
+    }
+  },
+  {
+    "name": "chatgpt / gemini.google.com",
+    "observations": [
+      {
+        "keyword": "chatgpt",
+        "normalized_domain": "gemini.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.2
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "chatgpt / notebooklm.google.com",
+    "observations": [
+      {
+        "keyword": "chatgpt",
+        "normalized_domain": "notebooklm.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.7
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "chatgpt / one.example",
+    "observations": [
+      {
+        "keyword": "chatgpt",
+        "normalized_domain": "one.example",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 1
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "chat gpt / chatgpt.com",
+    "observations": [
+      {
+        "keyword": "chat gpt",
+        "normalized_domain": "chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.8
+      }
+    ],
+    "expected": {
+      "demand_type": "brand_navigational",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:exact",
+      "confidence": 0.98
+    }
+  },
+  {
+    "name": "chat gpt / app.chatgpt.com",
+    "observations": [
+      {
+        "keyword": "chat gpt",
+        "normalized_domain": "app.chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": null
+      }
+    ],
+    "expected": {
+      "demand_type": "brand_navigational",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:exact",
+      "confidence": 0.94
+    }
+  },
+  {
+    "name": "chat gpt / gemini.google.com",
+    "observations": [
+      {
+        "keyword": "chat gpt",
+        "normalized_domain": "gemini.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.2
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "chat gpt / notebooklm.google.com",
+    "observations": [
+      {
+        "keyword": "chat gpt",
+        "normalized_domain": "notebooklm.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.7
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "chat gpt / one.example",
+    "observations": [
+      {
+        "keyword": "chat gpt",
+        "normalized_domain": "one.example",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 1
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "chat-gpt / chatgpt.com",
+    "observations": [
+      {
+        "keyword": "chat-gpt",
+        "normalized_domain": "chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.8
+      }
+    ],
+    "expected": {
+      "demand_type": "brand_navigational",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:exact",
+      "confidence": 0.98
+    }
+  },
+  {
+    "name": "chat-gpt / app.chatgpt.com",
+    "observations": [
+      {
+        "keyword": "chat-gpt",
+        "normalized_domain": "app.chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": null
+      }
+    ],
+    "expected": {
+      "demand_type": "brand_navigational",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:exact",
+      "confidence": 0.94
+    }
+  },
+  {
+    "name": "chat-gpt / gemini.google.com",
+    "observations": [
+      {
+        "keyword": "chat-gpt",
+        "normalized_domain": "gemini.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.2
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "chat-gpt / notebooklm.google.com",
+    "observations": [
+      {
+        "keyword": "chat-gpt",
+        "normalized_domain": "notebooklm.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.7
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "chat-gpt / one.example",
+    "observations": [
+      {
+        "keyword": "chat-gpt",
+        "normalized_domain": "one.example",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 1
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "chatgpt pricing / chatgpt.com",
+    "observations": [
+      {
+        "keyword": "chatgpt pricing",
+        "normalized_domain": "chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.8
+      }
+    ],
+    "expected": {
+      "demand_type": "brand_commercial",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:domain_in_keyword",
+      "confidence": 0.864
+    }
+  },
+  {
+    "name": "chatgpt pricing / app.chatgpt.com",
+    "observations": [
+      {
+        "keyword": "chatgpt pricing",
+        "normalized_domain": "app.chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": null
+      }
+    ],
+    "expected": {
+      "demand_type": "brand_commercial",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:domain_in_keyword",
+      "confidence": 0.72
+    }
+  },
+  {
+    "name": "chatgpt pricing / gemini.google.com",
+    "observations": [
+      {
+        "keyword": "chatgpt pricing",
+        "normalized_domain": "gemini.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.2
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "chatgpt pricing / notebooklm.google.com",
+    "observations": [
+      {
+        "keyword": "chatgpt pricing",
+        "normalized_domain": "notebooklm.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.7
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "chatgpt pricing / one.example",
+    "observations": [
+      {
+        "keyword": "chatgpt pricing",
+        "normalized_domain": "one.example",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 1
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "chatgpt alternatives / chatgpt.com",
+    "observations": [
+      {
+        "keyword": "chatgpt alternatives",
+        "normalized_domain": "chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.8
+      }
+    ],
+    "expected": {
+      "demand_type": "mixed",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:domain_in_keyword",
+      "confidence": 0.864
+    }
+  },
+  {
+    "name": "chatgpt alternatives / app.chatgpt.com",
+    "observations": [
+      {
+        "keyword": "chatgpt alternatives",
+        "normalized_domain": "app.chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": null
+      }
+    ],
+    "expected": {
+      "demand_type": "mixed",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:domain_in_keyword",
+      "confidence": 0.72
+    }
+  },
+  {
+    "name": "chatgpt alternatives / gemini.google.com",
+    "observations": [
+      {
+        "keyword": "chatgpt alternatives",
+        "normalized_domain": "gemini.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.2
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "chatgpt alternatives / notebooklm.google.com",
+    "observations": [
+      {
+        "keyword": "chatgpt alternatives",
+        "normalized_domain": "notebooklm.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.7
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "chatgpt alternatives / one.example",
+    "observations": [
+      {
+        "keyword": "chatgpt alternatives",
+        "normalized_domain": "one.example",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 1
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "like chatgpt / chatgpt.com",
+    "observations": [
+      {
+        "keyword": "like chatgpt",
+        "normalized_domain": "chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.8
+      }
+    ],
+    "expected": {
+      "demand_type": "mixed",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:domain_in_keyword",
+      "confidence": 0.864
+    }
+  },
+  {
+    "name": "like chatgpt / app.chatgpt.com",
+    "observations": [
+      {
+        "keyword": "like chatgpt",
+        "normalized_domain": "app.chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": null
+      }
+    ],
+    "expected": {
+      "demand_type": "mixed",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:domain_in_keyword",
+      "confidence": 0.72
+    }
+  },
+  {
+    "name": "like chatgpt / gemini.google.com",
+    "observations": [
+      {
+        "keyword": "like chatgpt",
+        "normalized_domain": "gemini.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.2
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "like chatgpt / notebooklm.google.com",
+    "observations": [
+      {
+        "keyword": "like chatgpt",
+        "normalized_domain": "notebooklm.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.7
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "like chatgpt / one.example",
+    "observations": [
+      {
+        "keyword": "like chatgpt",
+        "normalized_domain": "one.example",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 1
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "ai image generator / chatgpt.com",
+    "observations": [
+      {
+        "keyword": "ai image generator",
+        "normalized_domain": "chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.8
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "ai image generator / app.chatgpt.com",
+    "observations": [
+      {
+        "keyword": "ai image generator",
+        "normalized_domain": "app.chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": null
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "ai image generator / gemini.google.com",
+    "observations": [
+      {
+        "keyword": "ai image generator",
+        "normalized_domain": "gemini.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.2
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "ai image generator / notebooklm.google.com",
+    "observations": [
+      {
+        "keyword": "ai image generator",
+        "normalized_domain": "notebooklm.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.7
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "ai image generator / one.example",
+    "observations": [
+      {
+        "keyword": "ai image generator",
+        "normalized_domain": "one.example",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 1
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "gpt / chatgpt.com",
+    "observations": [
+      {
+        "keyword": "gpt",
+        "normalized_domain": "chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.8
+      }
+    ],
+    "expected": {
+      "demand_type": "brand_navigational",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:keyword_in_domain",
+      "confidence": 0.75
+    }
+  },
+  {
+    "name": "gpt / app.chatgpt.com",
+    "observations": [
+      {
+        "keyword": "gpt",
+        "normalized_domain": "app.chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": null
+      }
+    ],
+    "expected": {
+      "demand_type": "unknown",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:keyword_in_domain",
+      "confidence": 0.87
+    }
+  },
+  {
+    "name": "gpt / gemini.google.com",
+    "observations": [
+      {
+        "keyword": "gpt",
+        "normalized_domain": "gemini.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.2
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "gpt / notebooklm.google.com",
+    "observations": [
+      {
+        "keyword": "gpt",
+        "normalized_domain": "notebooklm.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.7
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "gpt / one.example",
+    "observations": [
+      {
+        "keyword": "gpt",
+        "normalized_domain": "one.example",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 1
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "ai / chatgpt.com",
+    "observations": [
+      {
+        "keyword": "ai",
+        "normalized_domain": "chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.8
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "ai / app.chatgpt.com",
+    "observations": [
+      {
+        "keyword": "ai",
+        "normalized_domain": "app.chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": null
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "ai / gemini.google.com",
+    "observations": [
+      {
+        "keyword": "ai",
+        "normalized_domain": "gemini.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.2
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "ai / notebooklm.google.com",
+    "observations": [
+      {
+        "keyword": "ai",
+        "normalized_domain": "notebooklm.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.7
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "ai / one.example",
+    "observations": [
+      {
+        "keyword": "ai",
+        "normalized_domain": "one.example",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 1
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "ＣｈａｔＧＰＴ / chatgpt.com",
+    "observations": [
+      {
+        "keyword": "ＣｈａｔＧＰＴ",
+        "normalized_domain": "chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.8
+      }
+    ],
+    "expected": {
+      "demand_type": "brand_navigational",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:exact",
+      "confidence": 0.98
+    }
+  },
+  {
+    "name": "ＣｈａｔＧＰＴ / app.chatgpt.com",
+    "observations": [
+      {
+        "keyword": "ＣｈａｔＧＰＴ",
+        "normalized_domain": "app.chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": null
+      }
+    ],
+    "expected": {
+      "demand_type": "brand_navigational",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:exact",
+      "confidence": 0.94
+    }
+  },
+  {
+    "name": "ＣｈａｔＧＰＴ / gemini.google.com",
+    "observations": [
+      {
+        "keyword": "ＣｈａｔＧＰＴ",
+        "normalized_domain": "gemini.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.2
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "ＣｈａｔＧＰＴ / notebooklm.google.com",
+    "observations": [
+      {
+        "keyword": "ＣｈａｔＧＰＴ",
+        "normalized_domain": "notebooklm.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.7
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "ＣｈａｔＧＰＴ / one.example",
+    "observations": [
+      {
+        "keyword": "ＣｈａｔＧＰＴ",
+        "normalized_domain": "one.example",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 1
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "gemini / chatgpt.com",
+    "observations": [
+      {
+        "keyword": "gemini",
+        "normalized_domain": "chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.8
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "gemini / app.chatgpt.com",
+    "observations": [
+      {
+        "keyword": "gemini",
+        "normalized_domain": "app.chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": null
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "gemini / gemini.google.com",
+    "observations": [
+      {
+        "keyword": "gemini",
+        "normalized_domain": "gemini.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.2
+      }
+    ],
+    "expected": {
+      "demand_type": "brand_navigational",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:exact",
+      "confidence": 0.95
+    }
+  },
+  {
+    "name": "gemini / notebooklm.google.com",
+    "observations": [
+      {
+        "keyword": "gemini",
+        "normalized_domain": "notebooklm.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.7
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "gemini / one.example",
+    "observations": [
+      {
+        "keyword": "gemini",
+        "normalized_domain": "one.example",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 1
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "one / chatgpt.com",
+    "observations": [
+      {
+        "keyword": "one",
+        "normalized_domain": "chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.8
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "one / app.chatgpt.com",
+    "observations": [
+      {
+        "keyword": "one",
+        "normalized_domain": "app.chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": null
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "one / gemini.google.com",
+    "observations": [
+      {
+        "keyword": "one",
+        "normalized_domain": "gemini.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.2
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "one / notebooklm.google.com",
+    "observations": [
+      {
+        "keyword": "one",
+        "normalized_domain": "notebooklm.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.7
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "one / one.example",
+    "observations": [
+      {
+        "keyword": "one",
+        "normalized_domain": "one.example",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 1
+      }
+    ],
+    "expected": {
+      "demand_type": "brand_navigational",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:exact",
+      "confidence": 0.99
+    }
+  },
+  {
+    "name": "notebook / chatgpt.com",
+    "observations": [
+      {
+        "keyword": "notebook",
+        "normalized_domain": "chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.8
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "notebook / app.chatgpt.com",
+    "observations": [
+      {
+        "keyword": "notebook",
+        "normalized_domain": "app.chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": null
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "notebook / gemini.google.com",
+    "observations": [
+      {
+        "keyword": "notebook",
+        "normalized_domain": "gemini.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.2
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "notebook / notebooklm.google.com",
+    "observations": [
+      {
+        "keyword": "notebook",
+        "normalized_domain": "notebooklm.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.7
+      }
+    ],
+    "expected": {
+      "demand_type": "brand_navigational",
+      "matched_tool_id": 1,
+      "classification_method": "domain_keyword_direct_v2:keyword_in_domain",
+      "confidence": 0.725
+    }
+  },
+  {
+    "name": "notebook / one.example",
+    "observations": [
+      {
+        "keyword": "notebook",
+        "normalized_domain": "one.example",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 1
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "café / chatgpt.com",
+    "observations": [
+      {
+        "keyword": "café",
+        "normalized_domain": "chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.8
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "café / app.chatgpt.com",
+    "observations": [
+      {
+        "keyword": "café",
+        "normalized_domain": "app.chatgpt.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": null
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "café / gemini.google.com",
+    "observations": [
+      {
+        "keyword": "café",
+        "normalized_domain": "gemini.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.2
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "café / notebooklm.google.com",
+    "observations": [
+      {
+        "keyword": "café",
+        "normalized_domain": "notebooklm.google.com",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 0.7
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "café / one.example",
+    "observations": [
+      {
+        "keyword": "café",
+        "normalized_domain": "one.example",
+        "product_id": 1,
+        "observed_traffic": 100,
+        "direct_share": 1
+      }
+    ],
+    "expected": {
+      "demand_type": "generic",
+      "matched_tool_id": null,
+      "classification_method": "domain_keyword_direct_v2:none",
+      "confidence": 0.8
+    }
+  },
+  {
+    "name": "strongest domain wins",
+    "observations": [
+      {
+        "keyword": "chatgpt",
+        "normalized_domain": "competitor.com",
+        "product_id": 1,
+        "observed_traffic": 10000,
+        "direct_share": 0.9
+      },
+      {
+        "keyword": "chatgpt",
+        "normalized_domain": "chatgpt.com",
+        "product_id": 2,
+        "observed_traffic": 10,
+        "direct_share": 0.1
+      }
+    ],
+    "expected": {
+      "demand_type": "brand_navigational",
+      "matched_tool_id": 2,
+      "classification_method": "domain_keyword_direct_v2:exact",
+      "confidence": 0.945
+    }
+  }
+]

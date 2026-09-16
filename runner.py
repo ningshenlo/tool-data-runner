@@ -30,6 +30,7 @@ from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from dotenv import load_dotenv
 from report_exports import export_ready_reports, shift_month
 from market_snapshot_refresh import refresh_completed_market_snapshot
+from search_demand_refresh import refresh_completed_search_demand
 from d1_costguard import guard_endpoint, before_request, observe_response
 from anti_bot_signatures import detect_anti_bot_page
 from pricing.allowances import (
@@ -11776,6 +11777,18 @@ async def run_once(config: Config, limit: int | None = None) -> dict[str, int]:
         except Exception as error:
             counts["market_snapshot_blocked"] = 1
             log_error("market_snapshot.auto_publish.failed", error_type=type(error).__name__)
+        # Catch up keyword projections even when the market month was published earlier.
+        try:
+            demand = await refresh_completed_search_demand(d1, source=TRAFFIC_SOURCE)
+            for status in ("active", "blocked"):
+                counts["search_demand_" + status] = int(demand["status"] == status)
+            if demand["status"] not in ("disabled", "throttled", "locked"):
+                log_info("search_demand.auto_publish", **demand)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            counts["search_demand_blocked"] = 1
+            log_error("search_demand.auto_publish.failed", error_type=type(error).__name__)
         # Runs after collection, including idle batches. Rendering is independent;
         # export failures never undo or misreport the traffic collection batch.
         try:

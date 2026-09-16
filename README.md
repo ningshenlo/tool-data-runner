@@ -348,6 +348,44 @@ Reports land in docs/taxonomy/reports/ (gold-eval-latest.md / .json).
 The main Dokploy Compose file now builds and runs the report exporter and offline
 renderer from this repository. See [deployment, state and review instructions](docs/report-drafts.md).
 
+## Automatic monthly search demand publication
+
+After each traffic batch (including idle batches), the collector catches up search
+demand for the oldest missing, closed month that already passed market publication.
+The published market snapshot fixes the product cohort; withdrawn/unsafe products
+are excluded. This keeps source availability separate from a complete release.
+
+`SEARCH_DEMAND_AUTO_PUBLISH_ENABLED` defaults to `1` in Compose; when unspecified
+it follows `MARKET_SNAPSHOT_AUTO_PUBLISH_ENABLED`. Checks run hourly by default
+(`SEARCH_DEMAND_CHECK_INTERVAL_SECONDS`, minimum 300 seconds). The lock and status
+live in `/market-snapshots/search-demand` on the existing shared durable volume.
+
+The task preserves stable keyword IDs, historical rows, and all current brand
+labels, including manual reviews. Only new labels use the existing v2 domain and
+direct-traffic policy. It writes canonical taxonomy term columns, never maps new
+terms back into legacy category IDs. Traffic is summed across observed products;
+search volume is the maximum sample value, not a sum. Missing previous months do
+not become zero or cross-month comparisons.
+
+Unpublished projections are written in batches of 100 records through the normal
+D1 cost guard. Every persisted observation, monthly metric and taxonomy aggregate
+is checked against the source plan. The source fingerprint is checked again, then
+one final coverage-row insert publishes the month. Failures preserve the previous
+public month; restart retries only unpublished data. Already published months are
+immutable for this job. Data corrections need a separate revision procedure.
+
+No new source requests, database migration, or frontend deployment are required.
+The existing two-minute page-data cache picks up a published month on subsequent
+requests. Diagnostic command (uses the collector's standard environment, read only):
+
+```sh
+python scripts/check-search-demand-publication.py --month 2026-08
+```
+
+Log event: `search_demand.auto_publish`. Status file:
+`/market-snapshots/search-demand/publication-status.json`. Disable the dedicated
+flag to pause this job without stopping traffic collection or market publication.
+
 ## Automatic monthly market publication
 
 The traffic batch now checks completed public-catalog months and builds/activates

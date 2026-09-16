@@ -8,9 +8,12 @@ class DockerImageContractTests(unittest.TestCase):
             encoding="utf-8"
         )
         self.assertIn("COPY scripts/check-market-publication.py ./scripts/", dockerfile)
+        self.assertIn("COPY scripts/check-search-demand-publication.py ./scripts/", dockerfile)
         for module in (
             "runner.py",
             "market_snapshot_refresh.py",
+            "search_demand_refresh.py",
+            "search_demand_brand.py",
             "report_exports.py",
             "report-markets.json",
             "taxonomy_shadow.py",
