@@ -10,7 +10,7 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from d1_costguard import guard_endpoint, before_request, observe_response
+from d1_costguard import guard_endpoint, before_request, observe_response, pause_error, CostGuardPause
 
 from .comparability import (
     resource_family_counts_json,
@@ -32,6 +32,10 @@ from .storage import _safe_object_key, job_id_for, stable_id
 
 
 class CloudflareApiError(RuntimeError):
+    pass
+
+
+class CloudflareBudgetPause(CloudflareApiError, CostGuardPause):
     pass
 
 
@@ -84,10 +88,11 @@ class CloudflareD1Client:
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                before_request(self.url)
+                before_request(self.url, "sitemap-worker")
                 response = await self.client.post(self.url, headers=self.headers, json=body)
-                if observe_response(self.url, response):
-                    raise CloudflareApiError("D1 cost guard stopped; operator recovery required")
+                if observe_response(self.url, response, "sitemap-worker"):
+                    pause = pause_error("sitemap-worker")
+                    raise CloudflareBudgetPause(pause.code, pause.retry_seconds, pause.recovery)
                 if response.status_code not in {429, 502, 503, 504}:
                     if response.is_error:
                         raise CloudflareApiError(

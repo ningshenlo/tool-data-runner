@@ -5143,9 +5143,9 @@ class D1Client:
         request_meta = d1_request_metadata(body, operation)
         for attempt in range(max_attempts):
             try:
-                before_request(self.url)
+                before_request(self.url, self.headers["X-Sigpik-Service"])
                 response = await self.client.post(self.url, headers=self.headers, json=body)
-                if observe_response(self.url, response):
+                if observe_response(self.url, response, self.headers["X-Sigpik-Service"]):
                     raise self._response_error(response, request_meta, "cost_guard_stopped")
                 if response.status_code not in {429, 502, 503, 504}:
                     if response.is_error:

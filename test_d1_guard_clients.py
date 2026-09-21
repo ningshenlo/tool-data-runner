@@ -11,16 +11,19 @@ from sitemap_monitor.cloudflare import CloudflareD1Client, CloudflareApiError
 class GuardClientTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         guard._paused_until = 0
+        guard._pauses.clear()
         self.environment = patch.dict(os.environ, {"RUNNER_SERVICE_NAME": "assets-worker"}, clear=True)
         self.environment.start()
 
     async def asyncTearDown(self):
         self.environment.stop()
         guard._paused_until = 0
+        guard._pauses.clear()
 
     async def test_both_clients_use_guard_and_budget_rejections_never_retry(self):
         for sitemap in [False, True]:
             guard._paused_until = 0
+            guard._pauses.clear()
             config = SimpleNamespace(cloudflare_account_id="account", cloudflare_d1_database_id=guard.PRODUCTION_DATABASE, cloudflare_api_token="test-token")
             client = CloudflareD1Client(account_id="account", database_id=guard.PRODUCTION_DATABASE, api_token="test-token") if sitemap else D1Client(config)
             await client.client.aclose()
