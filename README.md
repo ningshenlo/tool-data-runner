@@ -406,3 +406,8 @@ Read-only diagnosis: python scripts/check-market-publication.py --month YYYY-MM.
 Failures are recorded in publication-status.json and market_snapshot.auto_publish
 logs; they do not undo collection or stop report exports. Authorization for remote
 publication and deployment is still required before enabling a production run.
+
+
+### D1 connectivity (2026-09-24)
+
+Production runners use the Cloudflare D1 API directly with the existing account token. The per-query cost-control proxy and its cooldown ledger are retired. Optimized queue, taxonomy and sitemap SQL remain in the clients. Use Cloudflare billing and the existing budget alert for account spend.

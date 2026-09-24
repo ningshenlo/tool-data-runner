@@ -31,7 +31,6 @@ from dotenv import load_dotenv
 from report_exports import export_ready_reports, shift_month
 from market_snapshot_refresh import refresh_completed_market_snapshot
 from search_demand_refresh import refresh_completed_search_demand
-from d1_costguard import guard_endpoint, before_request, observe_response
 from anti_bot_signatures import detect_anti_bot_page
 from pricing.allowances import (
     extract_fixed_allowance_quotes,
@@ -5094,11 +5093,9 @@ class D1Client:
             f"{D1_API_BASE}/accounts/{config.cloudflare_account_id}"
             f"/d1/database/{config.cloudflare_d1_database_id}/query"
         )
-        self.url = guard_endpoint(self.url)
         self.headers = {
             "Authorization": f"Bearer {config.cloudflare_api_token}",
             "Content-Type": "application/json",
-            "X-Sigpik-Service": os.getenv("RUNNER_SERVICE_NAME", "tool-data-runner"),
         }
         self.client = httpx.AsyncClient(timeout=30.0)
         self._market_country_schema_available: bool | None = None
@@ -5143,10 +5140,7 @@ class D1Client:
         request_meta = d1_request_metadata(body, operation)
         for attempt in range(max_attempts):
             try:
-                before_request(self.url, self.headers["X-Sigpik-Service"])
                 response = await self.client.post(self.url, headers=self.headers, json=body)
-                if observe_response(self.url, response, self.headers["X-Sigpik-Service"]):
-                    raise self._response_error(response, request_meta, "cost_guard_stopped")
                 if response.status_code not in {429, 502, 503, 504}:
                     if response.is_error:
                         request_error = self._response_error(response, request_meta, "http_error")
@@ -7636,34 +7630,7 @@ class D1AssetStore:
         now = utc_now_iso()
         lease_expires_at = iso_delta(hours=1)
         rows = await self.d1.query(
-            """
-            SELECT
-              task.tool_id,
-              task.normalized_domain,
-              task.attempts,
-              task.max_attempts,
-              task.generation,
-              t.canonical_slug,
-              t.official_url
-            FROM asset_tasks task
-            JOIN tools t ON t.id = task.tool_id
-            WHERE task.source = ?
-              AND task.dead_letter_at IS NULL
-              AND task.attempts < task.max_attempts
-              AND (
-                (
-                  task.status IN ('queued', 'failed', 'sync_failed')
-                  AND (task.next_retry_at IS NULL OR task.next_retry_at <= ?)
-                )
-                OR (
-                  task.status = 'processing'
-                  AND task.lease_expires_at IS NOT NULL
-                  AND task.lease_expires_at <= ?
-                )
-              )
-            ORDER BY coalesce(task.next_retry_at, ''), task.updated_at
-            LIMIT ?
-            """,
+            "WITH ready_tasks AS MATERIALIZED (SELECT task.tool_id, task.normalized_domain, task.attempts, task.max_attempts, task.generation, t.canonical_slug, t.official_url, coalesce(task.next_retry_at, '') AS __due_at, task.updated_at AS __updated_at FROM asset_tasks task JOIN tools t ON t.id = task.tool_id WHERE task.source = ?1 AND task.dead_letter_at IS NULL AND task.attempts < task.max_attempts AND (task.status IN ('queued', 'failed', 'sync_failed') AND (task.next_retry_at IS NULL OR task.next_retry_at <= ?2)) ORDER BY coalesce(task.next_retry_at, ''), task.updated_at LIMIT ?4), expired_tasks AS MATERIALIZED (SELECT task.tool_id, task.normalized_domain, task.attempts, task.max_attempts, task.generation, t.canonical_slug, t.official_url, coalesce(task.next_retry_at, '') AS __due_at, task.updated_at AS __updated_at FROM asset_tasks task JOIN tools t ON t.id = task.tool_id WHERE task.source = ?1 AND task.dead_letter_at IS NULL AND task.attempts < task.max_attempts AND (task.status = 'processing' AND task.lease_expires_at IS NOT NULL AND task.lease_expires_at <= ?3) ORDER BY coalesce(task.next_retry_at, ''), task.updated_at LIMIT ?4)\n SELECT tool_id, normalized_domain, attempts, max_attempts, generation, canonical_slug, official_url FROM (SELECT * FROM ready_tasks UNION ALL SELECT * FROM expired_tasks)\n ORDER BY __due_at, __updated_at LIMIT ?4",
             [ASSET_SOURCE, now, now, limit],
         )
 
@@ -8474,26 +8441,7 @@ class D1TaskStore:
         now = utc_now_iso()
         lease_expires_at = iso_delta(hours=1)
         rows = await self.d1.query(
-            """
-            SELECT normalized_domain, source, traffic_month, attempts, max_attempts, generation
-            FROM traffic_tasks
-            WHERE source = ?
-              AND dead_letter_at IS NULL
-              AND attempts < max_attempts
-              AND (
-                (
-                  status IN ('queued', 'failed', 'sync_failed')
-                  AND (next_retry_at IS NULL OR next_retry_at <= ?)
-                )
-                OR (
-                  status = 'processing'
-                  AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at <= ?
-                )
-              )
-            ORDER BY coalesce(next_retry_at, ''), updated_at
-            LIMIT ?
-            """,
+            "WITH ready_tasks AS MATERIALIZED (SELECT normalized_domain, source, traffic_month, attempts, max_attempts, generation, coalesce(next_retry_at, '') AS __due_at, updated_at AS __updated_at FROM traffic_tasks WHERE source = ?1 AND dead_letter_at IS NULL AND attempts < max_attempts AND (status IN ('queued', 'failed', 'sync_failed') AND (next_retry_at IS NULL OR next_retry_at <= ?2)) ORDER BY coalesce(next_retry_at, ''), updated_at LIMIT ?4), expired_tasks AS MATERIALIZED (SELECT normalized_domain, source, traffic_month, attempts, max_attempts, generation, coalesce(next_retry_at, '') AS __due_at, updated_at AS __updated_at FROM traffic_tasks WHERE source = ?1 AND dead_letter_at IS NULL AND attempts < max_attempts AND (status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?3) ORDER BY coalesce(next_retry_at, ''), updated_at LIMIT ?4)\n SELECT normalized_domain, source, traffic_month, attempts, max_attempts, generation FROM (SELECT * FROM ready_tasks UNION ALL SELECT * FROM expired_tasks)\n ORDER BY __due_at, __updated_at LIMIT ?4",
             [TRAFFIC_SOURCE, now, now, limit],
         )
 
@@ -8792,40 +8740,7 @@ class D1DomainStateStore:
         now = utc_now_iso()
         lease_expires_at = iso_delta(minutes=15)
         rows = await self.d1.query(
-            """
-            UPDATE domain_state_tasks
-            SET status = 'processing',
-                attempts = attempts + 1,
-                last_started_at = ?,
-                next_retry_at = NULL,
-                last_error = NULL,
-                lease_owner = ?,
-                lease_token = lower(hex(randomblob(16))),
-                lease_expires_at = ?,
-                updated_at = ?
-            WHERE rowid IN (
-              SELECT rowid
-              FROM domain_state_tasks
-              WHERE source = ?
-                AND dead_letter_at IS NULL
-                AND attempts < max_attempts
-                AND (
-                  (
-                    status IN ('queued', 'failed', 'sync_failed')
-                    AND (next_retry_at IS NULL OR next_retry_at <= ?)
-                  )
-                  OR (
-                    status = 'processing'
-                    AND lease_expires_at IS NOT NULL
-                    AND lease_expires_at <= ?
-                  )
-                )
-              ORDER BY coalesce(next_retry_at, ''), updated_at, normalized_domain
-              LIMIT ?
-            )
-            RETURNING normalized_domain, attempts, max_attempts, generation, lease_token,
-                      fetch_domain_rating, fetch_rdap
-            """,
+            "UPDATE domain_state_tasks SET status = 'processing', attempts = attempts + 1, last_started_at = ?1, next_retry_at = NULL, last_error = NULL, lease_owner = ?2, lease_token = lower(hex(randomblob(16))), lease_expires_at = ?3, updated_at = ?4 WHERE rowid IN ( WITH ready_tasks AS MATERIALIZED (SELECT rowid AS __rid, coalesce(next_retry_at, '') AS __due_at, updated_at AS __updated_at, normalized_domain AS __domain FROM domain_state_tasks WHERE source = ?5 AND dead_letter_at IS NULL AND attempts < max_attempts AND (status IN ('queued', 'failed', 'sync_failed') AND (next_retry_at IS NULL OR next_retry_at <= ?6)) ORDER BY coalesce(next_retry_at, ''), updated_at, normalized_domain LIMIT ?8), expired_tasks AS MATERIALIZED (SELECT rowid AS __rid, coalesce(next_retry_at, '') AS __due_at, updated_at AS __updated_at, normalized_domain AS __domain FROM domain_state_tasks WHERE source = ?5 AND dead_letter_at IS NULL AND attempts < max_attempts AND (status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?7) ORDER BY coalesce(next_retry_at, ''), updated_at, normalized_domain LIMIT ?8)\n SELECT __rid FROM (SELECT * FROM ready_tasks UNION ALL SELECT * FROM expired_tasks)\n ORDER BY __due_at, __updated_at, __domain LIMIT ?8 ) RETURNING normalized_domain, attempts, max_attempts, generation, lease_token, fetch_domain_rating, fetch_rdap",
             [now, lease_owner, lease_expires_at, now, DOMAIN_STATE_SOURCE, now, now, limit],
         )
         return [

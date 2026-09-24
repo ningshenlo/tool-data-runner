@@ -10,7 +10,6 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from d1_costguard import guard_endpoint, before_request, observe_response, pause_error, CostGuardPause
 
 from .comparability import (
     resource_family_counts_json,
@@ -35,10 +34,6 @@ class CloudflareApiError(RuntimeError):
     pass
 
 
-class CloudflareBudgetPause(CloudflareApiError, CostGuardPause):
-    pass
-
-
 class CloudflareD1Client:
     def __init__(
         self,
@@ -54,11 +49,9 @@ class CloudflareD1Client:
             f"https://api.cloudflare.com/client/v4/accounts/{account_id}"
             f"/d1/database/{database_id}/query"
         )
-        self.url = guard_endpoint(self.url)
         self.headers = {
             "Authorization": f"Bearer {api_token}",
             "Content-Type": "application/json",
-            "X-Sigpik-Service": "sitemap-worker",
         }
         self.client = httpx.AsyncClient(timeout=timeout_seconds)
 
@@ -88,11 +81,7 @@ class CloudflareD1Client:
         last_error: Exception | None = None
         for attempt in range(3):
             try:
-                before_request(self.url, "sitemap-worker")
                 response = await self.client.post(self.url, headers=self.headers, json=body)
-                if observe_response(self.url, response, "sitemap-worker"):
-                    pause = pause_error("sitemap-worker")
-                    raise CloudflareBudgetPause(pause.code, pause.retry_seconds, pause.recovery)
                 if response.status_code not in {429, 502, 503, 504}:
                     if response.is_error:
                         raise CloudflareApiError(
@@ -320,31 +309,7 @@ class CloudflareD1MetadataStore:
                     [run_cutoff_ms, limit],
                 ),
                 (
-                    """
-                    DELETE FROM sitemap_site_scans
-                    WHERE id IN (
-                        SELECT scan.id
-                        FROM sitemap_site_scans scan
-                        WHERE scan.created_at < ?
-                          AND scan.comparability_status NOT IN (
-                            'resource_set_changed', 'possible_migration'
-                          )
-                          AND NOT EXISTS (
-                            SELECT 1
-                            FROM sitemap_sites site
-                            WHERE site.semantic_baseline_scan_id = scan.id
-                          )
-                          AND NOT EXISTS (
-                            SELECT 1
-                            FROM sitemap_runs run
-                            WHERE run.site_scan_id = scan.id
-                              AND run.result IN ('baseline', 'changed')
-                          )
-                        ORDER BY scan.created_at, scan.id
-                        LIMIT ?
-                    )
-                    RETURNING id
-                    """,
+                    "\n                    DELETE FROM sitemap_site_scans\n                    WHERE id IN (\n                        SELECT scan.id\n                        FROM sitemap_site_scans scan\n                        WHERE scan.created_at < ?\n                          AND scan.comparability_status NOT IN (\n                            'resource_set_changed', 'possible_migration'\n                          )\n                          AND NOT EXISTS (\n                            SELECT 1 FROM sitemap_site_scans dependent\n                            WHERE dependent.baseline_scan_id = scan.id\n                          )\n                          AND NOT EXISTS (\n                            SELECT 1\n                            FROM sitemap_sites site\n                            WHERE site.semantic_baseline_scan_id = scan.id\n                          )\n                          AND NOT EXISTS (\n                            SELECT 1\n                            FROM sitemap_runs run\n                            WHERE run.site_scan_id = scan.id\n                              AND run.result IN ('baseline', 'changed')\n                          )\n                        ORDER BY scan.created_at, scan.id\n                        LIMIT ?\n                    )\n                    RETURNING id\n                    ",
                     [scan_cutoff_ms, limit],
                 ),
                 (

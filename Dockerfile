@@ -17,7 +17,6 @@ COPY scripts/check-search-demand-publication.py ./scripts/
 COPY scripts/check-market-publication.py ./scripts/
 COPY report_review_api.py .
 COPY report-markets.json .
-COPY d1_costguard.py .
 COPY build_revision.py .
 COPY taxonomy_shadow.py .
 COPY taxonomy_batch.py .

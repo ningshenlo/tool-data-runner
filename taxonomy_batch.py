@@ -2852,19 +2852,7 @@ async def poll_active_batches(
     openai: OpenAIBatchClient,
 ) -> dict[str, int]:
     rows = await d1.query(
-        """
-        SELECT * FROM taxonomy_batch_jobs
-        WHERE openai_batch_id IS NOT NULL
-          AND (
-            status IN ('validating', 'in_progress', 'finalizing', 'cancelling')
-            OR EXISTS (
-              SELECT 1 FROM taxonomy_batch_requests request
-              WHERE request.job_id = taxonomy_batch_jobs.id
-                AND request.status IN ('queued', 'submitted')
-            )
-          )
-        ORDER BY id
-        """
+        "\n SELECT * FROM taxonomy_batch_jobs\n WHERE openai_batch_id IS NOT NULL AND id IN (\n   SELECT id FROM taxonomy_batch_jobs\n   WHERE status IN ('validating', 'in_progress', 'finalizing', 'cancelling')\n   UNION\n   SELECT job_id FROM taxonomy_batch_requests\n   WHERE status IN ('queued', 'submitted') AND job_id IS NOT NULL\n ) ORDER BY id"
     )
     counts = {
         "batches_polled": len(rows),
@@ -3012,22 +3000,7 @@ async def reconcile_recorded_results(
 ) -> int:
     """Finish a stage whose result was recorded before a process interruption."""
     rows = await d1.query(
-        """
-        SELECT r.*
-        FROM taxonomy_batch_requests r
-        JOIN taxonomy_batch_items i ON i.id = r.item_id
-        WHERE r.status IN ('succeeded', 'failed')
-          AND i.status = 'running'
-          AND i.current_stage = r.stage
-          AND NOT EXISTS (
-            SELECT 1 FROM taxonomy_batch_requests newer
-            WHERE newer.item_id = r.item_id
-              AND newer.stage = r.stage
-              AND newer.attempt > r.attempt
-          )
-        ORDER BY r.id
-        LIMIT 500
-        """
+        "\n SELECT r.* FROM taxonomy_batch_items i\n CROSS JOIN taxonomy_batch_requests r ON r.id = (\n   SELECT newest.id FROM taxonomy_batch_requests newest\n   WHERE newest.item_id = i.id AND newest.stage = i.current_stage\n   ORDER BY newest.attempt DESC LIMIT 1\n )\n WHERE i.status = 'running' AND r.status IN ('succeeded', 'failed')\n ORDER BY r.id LIMIT 500"
     )
     reconciled = 0
     for row in rows:

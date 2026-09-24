@@ -10,7 +10,6 @@ from dataclasses import asdict
 from pathlib import Path
 
 from dotenv import load_dotenv
-from d1_costguard import remaining_pause_seconds
 
 from .catalog import load_published_catalog_sites
 from .cloudflare import (
@@ -372,23 +371,8 @@ async def run(args: argparse.Namespace) -> None:
             local_metadata.close()
 
 
-async def run_with_guard_backoff(args) -> None:
-    while True:
-        try:
-            await run(args)
-            return
-        except RuntimeError as error:
-            if not args.loop or "D1 cost guard" not in str(error):
-                raise
-            delay = getattr(error, "retry_seconds", None) or remaining_pause_seconds("sitemap-worker") or 300
-            print(json.dumps({"event": "sitemap.cost_paused", "retry_seconds": delay,
-                              "reason": getattr(error, "code", "budget_paused"),
-                              "recovery": getattr(error, "recovery", "operator")}), flush=True)
-            await asyncio.sleep(delay)
-
-
 def main() -> None:
     revision_file = Path(__file__).resolve().parent.parent / "BUILD_REVISION"
     if revision_file.exists():
         print(json.dumps({"event": "sitemap.start", "build_revision": revision_file.read_text().strip()}), flush=True)
-    asyncio.run(run_with_guard_backoff(parse_args()))
+    asyncio.run(run(parse_args()))
