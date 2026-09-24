@@ -1,0 +1,37 @@
+# Sitemap observation cohort v1
+#
+# Source: ainav legacy primary category games-entertainment-lifestyle.
+# Frozen: 2026-08-14.
+# Active scope: 30 sites after the 2026-08-22 live sitemap eligibility audit.
+# Eight ineligible sites are quarantined in observation-cohort-v1-paused.txt.
+# This cohort is observation-only and must not publish Signals.
+https://www.cultiq.app/
+https://www.immutable.com/
+https://caveduck.io/en
+https://meowa.ai/
+https://www.hexagram.io/
+https://heycurio.com/
+https://aidungeon.com/
+https://www.dreamcargarage.app/
+https://aipartygames.com/
+https://www.rpggo.ai/
+https://www.unakin.ai/
+https://www.seeles.ai/
+https://supermanage.ai/
+https://www.questie.ai/
+https://ludo.ai/
+https://rosebud.ai/
+https://www.jabali.ai/
+https://fablefiesta.com/
+https://fables.gg/
+https://dualite.dev/
+https://www.videogame.ai/
+https://www.layer.ai/
+https://www.kaedim3d.com/
+https://gamebeast.gg/
+https://www.littleumbrella.gg/
+https://gdevelop.io/
+https://www.plutus.gg/
+https://www.ggpredict.io/
+https://codewisp.ai/
+https://playabl.ai/
