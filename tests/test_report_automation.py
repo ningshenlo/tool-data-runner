@@ -67,8 +67,10 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
             await producer.export_market_inventory(d1, root, '2026-08', NOW + 1)
             self.assertEqual(len(d1.calls), 1)
             d1.query = AsyncMock(side_effect=RuntimeError('synthetic private failure'))
-            await producer.export_market_inventory(d1, root, '2026-08', NOW + 3601)
-            await producer.export_market_inventory(d1, root, '2026-08', NOW + 3602)
+            await producer.export_market_inventory(d1, root, '2026-08', NOW + 21599)
+            self.assertEqual(d1.query.call_count, 0)
+            await producer.export_market_inventory(d1, root, '2026-08', NOW + 21600)
+            await producer.export_market_inventory(d1, root, '2026-08', NOW + 21601)
             self.assertEqual(d1.query.call_count, 1)
             result = json.loads((root / '2026-08/market-inventory.json').read_text())
             self.assertEqual(result['status'], 'blocked')
@@ -98,9 +100,11 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result['results'][0]['status'], 'waiting')
             self.assertFalse(list(root.rglob('complete.json')))
             await producer.export_month(d1, root, '2026-08', [MARKET], NOW + 10)
-            self.assertEqual(len(d1.calls), 2)  # Durable hourly backoff, no new queries.
+            self.assertEqual(len(d1.calls), 2)  # Durable six-hour backoff, no new queries.
             d1.rows = rows()
-            await producer.export_month(d1, root, '2026-08', [MARKET], NOW + 3601)
+            await producer.export_month(d1, root, '2026-08', [MARKET], NOW + 21599)
+            self.assertEqual(len(d1.calls), 2)
+            await producer.export_month(d1, root, '2026-08', [MARKET], NOW + 21600)
             self.assertEqual(len(list(root.rglob('complete.json'))), 1)
 
     async def test_completion_hashes_and_freeze(self):
@@ -114,7 +118,7 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
                 data = (manifest.parent / entry[kind]['file']).read_bytes()
                 self.assertEqual(producer.hashlib.sha256(data).hexdigest(), entry[kind]['sha256'])
             d1.rows[0]['current_visits'] += 99
-            await producer.export_month(d1, root, '2026-08', [MARKET], NOW + 3601)
+            await producer.export_month(d1, root, '2026-08', [MARKET], NOW + 21601)
             self.assertEqual(manifest.read_bytes(), original)
             self.assertEqual(sum('WITH candidates' in call[0] for call in d1.calls), 1)
 
@@ -152,6 +156,33 @@ class ExportTests(unittest.IsolatedAsyncioTestCase):
 
 
 class WorkerTests(unittest.TestCase):
+    def test_six_hour_polling_keeps_liveness_without_rescanning(self):
+        for environment, extra, interval in [({}, [], 21600),
+                ({'REPORT_DRAFT_INTERVAL_SECONDS': '43200'}, [], 43200),
+                ({'REPORT_DRAFT_INTERVAL_SECONDS': '60'}, ['--interval', '21600'], 21600)]:
+            with self.subTest(environment=environment, extra=extra), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                clock, polls, sleeps = [0.0], [], []
+                def poll(*args, **kwargs):
+                    polls.append(clock[0])
+                    if len(polls) == 2:
+                        raise StopIteration
+                    return []
+                def sleep(seconds):
+                    sleeps.append(seconds)
+                    clock[0] += seconds
+                argv = ['draft-worker.py', '--root', temp, '--exports', temp, '--state', str(root / 'state'), *extra]
+                with patch.dict(worker.os.environ, environment, clear=True), patch.object(sys, 'argv', argv), \
+                     patch.object(worker, 'poll', side_effect=poll), \
+                     patch.object(worker.time, 'monotonic', side_effect=lambda: clock[0]), \
+                     patch.object(worker.time, 'sleep', side_effect=sleep), patch.object(Path, 'touch') as heartbeat:
+                    with self.assertRaises(StopIteration):
+                        worker.main()
+                self.assertEqual(polls, [0, interval])
+                self.assertEqual(sum(sleeps), interval)
+                self.assertTrue(all(seconds <= 60 for seconds in sleeps))
+                self.assertEqual(heartbeat.call_count, len(sleeps))
+
     def test_completion_event_failures_retry_restart_and_market_isolation(self):
         with tempfile.TemporaryDirectory() as temp:
             root, calls = Path(temp), []

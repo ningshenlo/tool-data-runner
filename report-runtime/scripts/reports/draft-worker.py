@@ -173,7 +173,7 @@ def main():
     parser.add_argument("--exports", type=Path, default=os.environ.get("REPORT_EXPORT_ROOT"))
     parser.add_argument("--state", type=Path)
     parser.add_argument("--once", action="store_true")
-    parser.add_argument("--interval", type=int, default=60)
+    parser.add_argument("--interval", type=int, default=int(os.environ.get("REPORT_DRAFT_INTERVAL_SECONDS", "21600")))
     parser.add_argument("--timeout", type=int, default=1800)
     args = parser.parse_args()
     if not args.exports:
@@ -189,7 +189,16 @@ def main():
             if args.once:
                 states = [read(p) for p in state.glob('*/*/state.json')]
                 return 2 if any(r['status'] == 'blocked' for r in states) else 0
-            time.sleep(max(10, args.interval))
+            wait_for_next_poll(state, args.interval)
+
+
+def wait_for_next_poll(state_root, interval):
+    # Keep liveness fresh during the six-hour wait without scanning exports,
+    # hashing the rendering runtime or retrying report generation.
+    deadline = time.monotonic() + max(10, interval)
+    while (remaining := deadline - time.monotonic()) > 0:
+        time.sleep(min(60, remaining))
+        (state_root / "heartbeat.json").touch()
 
 
 if __name__ == "__main__":

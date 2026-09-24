@@ -12,16 +12,20 @@ checkout, desktop package, new API key or external scheduler is required.
    It uses the existing guarded D1 client and SELECTs only. The monthly release
    must be available and every candidate must have terminal collection evidence.
 3. It freezes hashed snapshot/traffic files and writes `complete.json` last.
-4. `report-draft-worker` polls the shared exports every 60 seconds. It validates
+4. `report-draft-worker` polls the shared exports every 6 hours (21,600 seconds). It validates
    completion hashes and coverage, then generates bilingual report data, copy,
    PNG charts, CSV downloads, a review document and a pending approval file.
 5. Completed input/runtime combinations are deduplicated across restarts.
-   Waiting/blocked markets retry independently with backoff from 5 minutes to
-   6 hours. A changed input or runtime is retried immediately. No report is
+   Waiting/blocked markets retry independently on a later poll, respecting
+   their persisted backoff. A changed input or runtime is retried on the next poll. No report is
    automatically installed into the website, indexed, published or deployed.
 
-The collector checks readiness at most once per hour per pending month by
-default. `REPORT_EXPORT_ENABLED=0` pauses new exports; existing queued exports
+The collector checks readiness at most once every 6 hours per pending month by
+default. `REPORT_EXPORT_INTERVAL_SECONDS=21600` controls both readiness and market
+inventory checks; `REPORT_DRAFT_INTERVAL_SECONDS=21600` controls draft polling
+(the CLI `--interval` can override it). The worker polls once at startup, then
+waits between polls. Its local liveness heartbeat still updates once a minute
+during that wait; it does not read report data or trigger generation. `REPORT_EXPORT_ENABLED=0` pauses new exports; existing queued exports
 can still be consumed. Stop `report-draft-worker` to pause rendering as well.
 Do not remove the named volumes when redeploying.
 
@@ -126,7 +130,7 @@ entry, and cannot publish a draft. Copying approved files into the public site
 remains a separate release operation.
 
 With `REPORT_MARKET_INVENTORY_ENABLED=1`, the existing periodic producer also
-performs a bounded, hourly, read-only audit of speech/presentation categories.
+performs a bounded, six-hourly, read-only audit of speech/presentation categories.
 The private `market-inventory.json` result reports comparable samples, gaps and
 leading domains. It does not expand the supported market list or fetch provider
 data automatically. D1 guard failures remain blocked rather than bypassed.

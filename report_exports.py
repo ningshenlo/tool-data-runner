@@ -150,7 +150,7 @@ def write_export(directory, batch):
     atomic_json(directory / "complete.json", {**batch, "sectors": [entry]})
 
 
-async def export_month(d1, root, month, markets, now, interval=3600):
+async def export_month(d1, root, month, markets, now, interval=21600):
     month_dir = root / month
     month_dir.mkdir(parents=True, exist_ok=True)
     state_file = month_dir / "export-status.json"
@@ -190,10 +190,10 @@ async def export_month(d1, root, month, markets, now, interval=3600):
     return state
 
 
-async def export_market_inventory(d1, root, month, now):
+async def export_market_inventory(d1, root, month, now, interval=21600):
     """Bounded read-only readiness audit for the next two report markets."""
     file = root / month / 'market-inventory.json'
-    if file.exists() and read_inventory_time(file) > now - 3600:
+    if file.exists() and read_inventory_time(file) > now - interval:
         return
     state = {'month': month, 'checkedAt': now, 'status': 'checking', 'markets': []}
     atomic_json(file, state)
@@ -263,14 +263,15 @@ async def _export_ready_reports(d1, traffic_month, *, environ=None, now=None):
     if month >= datetime.fromtimestamp(now, timezone.utc).strftime("%Y-%m"):
         raise ValueError("Only closed calendar months can be exported")
     root.mkdir(parents=True, exist_ok=True)
+    interval = max(300, int(env.get("REPORT_EXPORT_INTERVAL_SECONDS", "21600")))
     if env.get('REPORT_MARKET_INVENTORY_ENABLED') == '1':
-        await export_market_inventory(d1, root, month, now)
+        await export_market_inventory(d1, root, month, now, interval)
     months = sorted({month, *(p.name for p in root.iterdir() if p.is_dir() and MONTH.fullmatch(p.name) and p.name < month)})
     counts = {"report_exports_complete": 0, "report_exports_blocked": 0}
     for item in months:
         if all((root / item / m["sector"] / "complete.json").exists() for m in markets):
             continue
-        state = await export_month(d1, root, item, markets, now, max(300, int(env.get("REPORT_EXPORT_INTERVAL_SECONDS", "3600"))))
+        state = await export_month(d1, root, item, markets, now, interval)
         for result in state["results"]:
             for status in ("complete", "blocked"):
                 counts["report_exports_" + status] += int(result["status"] == status)

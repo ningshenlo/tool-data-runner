@@ -13,7 +13,7 @@
     "scripts/reports/build-media.mjs": "ccd5f9e39d71e0d07647471ba93082c3f37fd9f0c4f2dca82f7a4645651b1903",
     "scripts/reports/check-release-locks.mjs": "3fdae48ea3ab988ed2fbfbcc613f8b9302ff955d97527d59329ab0d4260e0915",
     "scripts/reports/draft-lock.mjs": "ae8d5a2a566f1d8fb73468a4d275c8304e934ddef1cda36dc2f82f21d5dd50ba",
-    "scripts/reports/draft-worker.py": "287ca3919304f25dbb90ac47012798311e3674465ecf1ad6ae63f24dc26a25b4",
+    "scripts/reports/draft-worker.py": "01bbca3d1aab9d5db8d5a61afd3019623406d6862477fd1f1feb05db19268d9e",
     "scripts/reports/editorial_charts.py": "985bba1286698a76cc4f746b334d5b1d65a334d15417846ce1df8a358f7eb5a0",
     "scripts/reports/healthcheck.py": "3f19719d0aa3f6a63f4e10817d90170d15d0565807da51af874e39eb73a08a79",
     "scripts/reports/import-pilot.mjs": "27404b28e0b554619fd8697369286e798ac5aac19ad2b4953561d6138807a847",
@@ -27,5 +27,5 @@
     "scripts/reports/verify-assets.py": "7c384ae12ef02e1957749f5c1327d075ef6900152ccd86a0852605e30917550c",
     "scripts/reports/verify-preview.mjs": "8af15f8831d19a0cbd1086226e9161c1c12ced69ed61894e7299f132dbd98ffa"
   },
-  "bundleDigest": "3cf5d42b76dd3e4c4c17f195583c78fb2f789c5aa211be14c48db272db0172ac"
+  "bundleDigest": "93907421232eed530d125152df65a5fa0fb6f11c3942f986a20f7d149bdbce29"
 }
