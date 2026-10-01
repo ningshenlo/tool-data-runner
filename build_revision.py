@@ -6,7 +6,7 @@ def revision(root=None):
     root = Path(root or Path(__file__).parent)
     files = [root / name for name in ["runner.py", "report_exports.py", "report_review_api.py", "report-markets.json", "taxonomy_shadow.py", "taxonomy_batch.py", "anti_bot_signatures.py", "classification_anomalies.py", "requirements.txt"]]
     files.extend(root / name for name in ["market_snapshot_refresh.py", "search_demand_refresh.py", "search_demand_brand.py"])
-    for folder in ["pricing", "sitemap_monitor"]:
+    for folder in ["sitemap_monitor"]:
         files.extend((root / folder).rglob("*.py"))
         files.extend((root / folder).rglob("*.sql"))
     digest = hashlib.sha256()

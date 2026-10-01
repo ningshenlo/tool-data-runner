@@ -1,6 +1,6 @@
 # Tool Data Runner
 
-Python runner for scheduled SimilarWeb traffic backfill, homepage asset capture, and pricing task execution.
+Python runner for scheduled SimilarWeb traffic backfill, homepage asset capture, domain facts, and taxonomy updates.
 
 The repository also contains the Phase 1 `sitemap_monitor` package. It discovers and
 recursively checks sitemap resources, uses HTTP validators, filters serialization-only
@@ -10,25 +10,7 @@ deterministic state/diff objects without using an LLM. See
 
 It uses the Cloudflare D1 `ainav` database as the task source and system of record. Traffic mode first verifies that Similarweb has published the target previous-month data through one configured probe domain. Only after that D1-backed release gate is available does it queue the catalog-wide traffic batch, fetch through the Bright Data proxy zone, store rows in `domain_traffic_snapshots` and `tool_traffic_monthly`, then update `traffic_tasks` and `tool_traffic_fetch_status`.
 
-Pricing mode consumes existing `pricing_tasks`, fetches public pricing pages with normal browser-like request headers, and stores `pricing_snapshots` and `pricing_extractions`. By default it leaves results in `manual_review`. Reviewers approve the stored extraction in ainav Admin; the runner then materializes that exact JSON into the active catalog. The separate strict auto-publish gate described below is opt-in.
-
-Pricing extraction runs deterministic rules first. If rules cannot produce a trusted structure and `OPENAI_API_KEY` or `OPENAI_API` is set, it falls back to OpenAI structured JSON extraction. The default model is `gpt-5.6-luna`; set `OPENAI_PRICING_FALLBACK_MODEL` only when a second model should be tried after invalid or low-confidence output.
-
-If static fetching and OpenAI still cannot produce trusted pricing from a likely pricing URL, pricing mode can use Cloudflare Browser Run to fetch rendered HTML, then rerun the same rule and OpenAI extraction path. Enable it with `CLOUDFLARE_BROWSER_RENDERING_ENABLED=1`. The Cloudflare token must include Browser Rendering edit access; set `CLOUDFLARE_BROWSER_RENDERING_API_TOKEN` if the normal D1 token does not have that permission.
-
-Pricing extraction payloads include `final_pipeline_stage` for tracking the final path: `rule`, `openai`, `browser_run_rule`, `browser_run_openai`, `contact_sales`, `manual_review`, or `browser_run_manual_review`.
-
-The evidence-bound pricing claims pipeline is guarded by two independent environment flags. `PRICING_CLAIMS_SHADOW=1` enables v2 shadow work without changing the active pricing catalog. `PRICING_CLAIMS_PUBLISH=1` is reserved for the later partial-publish cutover and is rejected unless shadow mode is also enabled. Both flags default to `0`; the initial Phase 0–2 implementation must not publish claims to production.
-
-Legacy catalog auto-publish has a separate, default-off gate: `PRICING_STRICT_AUTO_PUBLISH_ENABLED=1`. The strict policy accepts only simple public package prices with explicit ISO/symbol currency evidence, trusted pricing-page context, sufficient pricing text, no discount, commitment, seat, metered/overage charge, or starting-price semantics, and no validation errors. Fixed AI allowances such as included credits, tokens, generations, images, minutes, or API calls are treated as normal plan features and do not block a fixed subscription price. Model-derived output must also agree with the deterministic rule extractor on plan count and price facts. `PRICING_STRICT_AUTO_PUBLISH_MIN_CONFIDENCE` defaults to `82`. Keep the gate disabled until a production dry-run establishes the desired precision.
-
-AI plan allowances are normalized into the existing `plan_features` catalog table. Numeric limits store a canonical value, unit, and reset period (for example `10000`, `credit`, `month`); unlimited allowances remain explicit text values. Model-extracted features are retained for automatic publication only when the exact visible wording is found under the nearest preceding plan on the source page. Because features are part of the catalog version hash, an allowance change creates a new pricing catalog version even when the package price is unchanged.
-
-Migration `0088_pricing_capture_review_decoupling.sql` separates successful capture freshness from reviewed publication freshness. A successfully fetched extraction can remain in `manual_review` while the source receives its next collection date. Normal scheduling only applies this behavior to captures written with the new checkpoint, so deployment does not release the legacy backlog all at once. An approved extraction is materialized only while its snapshot is still the newest snapshot for that source.
-
-Shadow mode requires migration `0039_pricing_claims_pipeline.sql` and configured R2 credentials. It stores content-addressed HTML/text/structured-data/DOM-map artifacts, detects the pricing region, and records conservative Level 1 raw claims with DOM evidence. Deterministic normalization and entailment validation run per claim; ambiguous symbols such as bare `$` are never resolved from the diagnostic locale context. An unchanged region reuses existing R2 objects, and browser-rendered captures preserve both the original and rendered HTML. Shadow failures are logged and the legacy pricing extraction continues unchanged.
-
-While Shadow is enabled, each pricing batch fills unused capacity with eligible legacy `manual_review` tasks that do not yet carry the V2 replay checkpoint. Normal queued/retry work remains first priority. `RUNNER_PRICING_MANUAL_REVIEW_REPLAY_LIMIT` caps the old backlog per batch (default `5`; `0` is the replay kill switch) independently of the normal pricing batch limit. The runner writes that checkpoint only after the V2 snapshot and artifacts persist successfully, including the zero-Claim outcome, so the backlog is resumable and cannot loop forever. Failed V2 capture reuses the task's existing bounded attempt budget. This replay never approves the legacy extraction and never publishes a Claim.
+Price monitoring was retired on 2026-10-01. Collection, extraction, review, and publication entrypoints have been removed. Historical evidence is retained; migration `0128_retire_price_monitoring.sql` deactivates collection sources.
 
 Assets mode scans active catalog tools (`pending_enrich`, `pending_review`, and `published`) missing required asset or homepage facts, claims `asset_tasks`, captures homepage screenshots with Cloudflare Browser Run, uploads screenshots/favicons to R2, and writes assets, localization, content-safety, and key features. It does not classify or repair categories. Every assets batch also refreshes canonical readiness for the active catalog independently of whether an asset task was claimed, so an accepted taxonomy assignment or manual taxonomy decision can advance a `pending_enrich` tool to `pending_review`. The same worker automatically publishes bounded batches of `pending_review` tools that still pass the complete live-readiness predicate at commit time. Content-safety, screenshot, localization/name, feature, taxonomy, source, duplicate, or readiness failures remain in review. Each successful transition writes a policy- and runner-stamped `tool_change_log` entry before the status change in the same D1 batch.
 
@@ -54,11 +36,10 @@ Fill `.env` with:
 - DR cadence and provider budget: `RUNNER_DOMAIN_STATE_MAX_AGE_DAYS` (default `30`), `RUNNER_DOMAIN_POLL_INTERVAL_SECONDS` (default `1` while draining a full batch), and `RUNNER_AHREFS_REQUESTS_PER_MINUTE` (default `60`, hard-clamped to Ahrefs' documented ceiling). Polling backs off to at least 10 seconds after a partial batch and 60 seconds when idle, avoiding a full D1 queue scan every second. The free DR endpoint does not consume API units; HTTP 429 responses honor `Retry-After` before retrying.
   The limiter is process-local, so production should run one `periodic-facts-worker` replica. If that service is intentionally scaled out, divide the 60 requests/minute budget across replicas.
 - `BRIGHTDATA_PROXY_USER`, `BRIGHTDATA_PROXY_PASSWORD`: Bright Data proxy credentials for traffic mode.
-- Optional runner identity and tuning: stable `RUNNER_INSTANCE_ID`, `RUNNER_SERVICE_NAME`, deploy label `RUNNER_VERSION`, `RUNNER_LIMIT`, `RUNNER_PRICING_LIMIT`, `RUNNER_PRICING_MANUAL_REVIEW_REPLAY_LIMIT`, `RUNNER_PRICING_TIMEOUT_SECONDS`.
-- Workload concurrency: `RUNNER_TRAFFIC_CONCURRENCY`, `RUNNER_DOMAIN_CONCURRENCY`, `RUNNER_ASSET_CONCURRENCY`, and `RUNNER_PRICING_CONCURRENCY`. Each falls back to legacy `RUNNER_CONCURRENCY` when omitted.
+- Optional runner identity and tuning: stable `RUNNER_INSTANCE_ID`, `RUNNER_SERVICE_NAME`, deploy label `RUNNER_VERSION`, `RUNNER_LIMIT`.
+- Workload concurrency: `RUNNER_TRAFFIC_CONCURRENCY`, `RUNNER_DOMAIN_CONCURRENCY`, and `RUNNER_ASSET_CONCURRENCY`. Each falls back to legacy `RUNNER_CONCURRENCY` when omitted.
 - Logging: `RUNNER_LOG_LEVEL=info` emits lifecycle, batch summaries, failures, retries, and non-success task outcomes. Use `debug` temporarily for per-task success/start events.
 - Traffic release gate: `TRAFFIC_RELEASE_PROBE_DOMAIN` (default `chatgpt.com`), `TRAFFIC_RELEASE_PROBE_START_DAY` (default `7`), `TRAFFIC_RELEASE_PROBE_INTERVAL_SECONDS` (default `21600`), and `TRAFFIC_RELEASE_QUEUE_LIMIT` (default `5000`).
-- Optional pricing AI fallback: `OPENAI_API_KEY` or `OPENAI_API`, plus `OPENAI_PRICING_MODEL` and `OPENAI_PRICING_FALLBACK_MODEL`.
 - Optional rendered-page fallback: `CLOUDFLARE_BROWSER_RENDERING_ENABLED`, `CLOUDFLARE_BROWSER_RENDERING_API_TOKEN`, `CLOUDFLARE_BROWSER_RENDERING_TIMEOUT_SECONDS`.
 - Assets mode: `RUNNER_ASSET_LIMIT` (default `25`), `RUNNER_ASSET_CONCURRENCY` (default `10`), `RUNNER_ASSET_POLL_INTERVAL_SECONDS` (idle default `30`), `RUNNER_ENRICHMENT_RECONCILE_LIMIT` (default `100`), `RUNNER_ENRICHMENT_RECONCILE_CONCURRENCY` (default `5`), `CATALOG_AUTO_PUBLISH_ENABLED` (default `1`, emergency kill switch), `CATALOG_AUTO_PUBLISH_LIMIT` (default `25`, hard maximum `100`), `CLOUDFLARE_BROWSER_RENDERING_API_TOKEN`, `CLOUDFLARE_R2_ACCESS_KEY_ID`, `CLOUDFLARE_R2_SECRET_ACCESS_KEY`, `CLOUDFLARE_R2_BUCKET`, and optional `R2_PUBLIC_BASE_URL`. Full asset batches and unfinished enrichment reconciliation continue immediately; only partial or empty queues back off.
   Use the real R2 bucket name for `CLOUDFLARE_R2_BUCKET` (for example `sitesimgs`) and the public/custom domain for `R2_PUBLIC_BASE_URL` (for example `https://img.sigpik.com`). The D1 `tool_assets.storage_bucket` value remains `sitesimgs` for compatibility with the existing frontend.
@@ -99,7 +80,6 @@ docker compose -f docker-compose.dokploy.yml up -d
 |---|---|---|
 | `periodic-facts-worker` | `--periodic-facts --loop` | Similarweb traffic + Ahrefs DR/RDAP |
 | `assets-worker` | `--assets --loop` | assets + enrichment readiness + guarded catalog auto-publish |
-| `pricing-monitor-worker` | `--pricing --loop` | paused by default; pricing snapshots/extractions/Claims shadow when explicitly enabled |
 | `taxonomy-worker` | `--taxonomy --loop` | production primary taxonomy automation |
 
 An additional `sitemap-monitor-worker` profile is defined with a safe-off process
@@ -219,13 +199,6 @@ Taxonomy stages use only the configured trusted model chain; Workers AI is exclu
 from entity, L1 and leaf decisions. Anti-bot pages rejected by the pre-model quality
 gate use no model.
 
-Pricing monitoring is paused by default. Compose scales `pricing-monitor-worker`
-to zero with `PRICING_MONITOR_REPLICAS=0`, and `PRICING_MONITOR_ENABLED=0` is a
-second kill switch that prevents D1/provider work even if a container is started
-manually. Re-enable pricing only by setting both values to `1`.
-
-Pricing leaves new results in `manual_review` unless the default-off strict auto-publish policy accepts a low-risk extraction. The legacy `--approve-pricing` switch is rejected so an operator refetch cannot bypass either the policy or the audited Admin review.
-
 Run the combined periodic facts profile locally:
 
 ```bash
@@ -267,18 +240,6 @@ Run assets as a polling worker:
 
 ```bash
 python runner.py --assets --loop --interval-seconds 300
-```
-
-Process queued pricing tasks:
-
-```bash
-python runner.py --pricing --once --limit 10
-```
-
-Dry-run a specific pricing task without D1 writes:
-
-```bash
-python runner.py --pricing --once --task-id 126 --dry-run
 ```
 
 Build and promote a Market Explorer serving snapshot in separate, auditable steps:
