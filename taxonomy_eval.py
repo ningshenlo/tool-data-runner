@@ -1,7 +1,7 @@
-"""P2B Gold evaluation + legacy/shadow/gold difference reports.
+"""Gold evaluation for the canonical taxonomy classifier.
 
-Does not write production category tables. Reads product_taxonomy_assignments
-(shadow/legacy sources), tools/categories (legacy), and a Gold CSV.
+This command is read-only. It compares canonical taxonomy assignments and
+immutable classification runs with a Gold CSV.
 """
 
 from __future__ import annotations
@@ -85,16 +85,6 @@ class Prediction:
     model_name: str = ""
 
 
-@dataclass
-class LegacyView:
-    tool_id: int
-    primary_category_id: int | None = None
-    primary_slug: str = ""
-    category_slugs: list[str] = field(default_factory=list)
-    # Best-effort leaf: prefer non-parent category among tool_categories when possible
-    inferred_leaf_slug: str = ""
-
-
 def load_gold_csv(path: str | Path) -> list[GoldRow]:
     path = Path(path)
     rows: list[GoldRow] = []
@@ -171,7 +161,6 @@ def f1(precision: float, recall: float) -> float:
 class EvalBundle:
     gold_rows: list[GoldRow]
     shadow: dict[int, Prediction]
-    legacy: dict[int, LegacyView]
     auto_accepted_threshold: float = DEFAULT_AUTO_ACCEPTED_THRESHOLD
     generated_at: str = field(default_factory=utc_now_iso)
     prompt_version: str = ""
@@ -185,7 +174,6 @@ class EvalBundle:
 def build_evaluation_report(bundle: EvalBundle) -> dict[str, Any]:
     gold_rows = bundle.gold_rows
     shadow = bundle.shadow
-    legacy = bundle.legacy
     thr = bundle.auto_accepted_threshold
 
     n = len(gold_rows)
@@ -208,7 +196,6 @@ def build_evaluation_report(bundle: EvalBundle) -> dict[str, Any]:
     for gold in gold_rows:
         gold_label_counts[gold.primary_leaf_slug] += 1
         pred = shadow.get(gold.tool_id)
-        leg = legacy.get(gold.tool_id)
 
         if pred is None or not pred.primary_slug:
             missing_shadow += 1
@@ -258,18 +245,6 @@ def build_evaluation_report(bundle: EvalBundle) -> dict[str, Any]:
                 if c not in pred_caps:
                     cap_fn += 1
 
-        legacy_primary = leg.primary_slug if leg else ""
-        legacy_leaf = leg.inferred_leaf_slug if leg else ""
-        legacy_match_gold = primary_match(gold, legacy_leaf or legacy_primary) if (legacy_leaf or legacy_primary) else False
-        shadow_vs_legacy = ""
-        if pred_slug and (legacy_leaf or legacy_primary):
-            shadow_vs_legacy = (
-                "same"
-                if pred_slug in {legacy_leaf, legacy_primary}
-                or pred_slug == legacy_leaf
-                else "different"
-            )
-
         rows_out.append(
             {
                 "tool_id": gold.tool_id,
@@ -284,11 +259,6 @@ def build_evaluation_report(bundle: EvalBundle) -> dict[str, Any]:
                 "match_gold": match if pred_slug else False,
                 "auto_accepted_simulated": aa,
                 "must_not_violation": bool(pred_slug and pred_slug in gold.primary_must_not),
-                "legacy_primary_slug": legacy_primary,
-                "legacy_inferred_leaf": legacy_leaf,
-                "legacy_category_slugs": leg.category_slugs if leg else [],
-                "legacy_match_gold": legacy_match_gold,
-                "shadow_vs_legacy": shadow_vs_legacy,
                 "status": status,
                 "is_draft_gold": gold.is_draft,
                 "notes": gold.notes,
@@ -375,16 +345,10 @@ def build_evaluation_report(bundle: EvalBundle) -> dict[str, Any]:
         },
         "per_class": per_class,
         "confusion_mismatches": confuse_pairs[:50],
-        "diff_summary": {
+        "evaluation_summary": {
             "shadow_match_gold": sum(1 for r in rows_out if r["match_gold"]),
-            "legacy_match_gold": sum(1 for r in rows_out if r["legacy_match_gold"]),
-            "shadow_legacy_same": sum(1 for r in rows_out if r["shadow_vs_legacy"] == "same"),
-            "shadow_legacy_different": sum(1 for r in rows_out if r["shadow_vs_legacy"] == "different"),
-            "shadow_better_than_legacy": sum(
-                1 for r in rows_out if r["match_gold"] and not r["legacy_match_gold"]
-            ),
-            "legacy_better_than_shadow": sum(
-                1 for r in rows_out if r["legacy_match_gold"] and not r["match_gold"] and r["shadow_primary"]
+            "shadow_mismatch_gold": sum(
+                1 for r in rows_out if r["shadow_primary"] and not r["match_gold"]
             ),
         },
         "rows": rows_out,
@@ -400,7 +364,7 @@ def build_evaluation_report(bundle: EvalBundle) -> dict[str, Any]:
 
 def render_markdown_report(report: dict[str, Any]) -> str:
     m = report.get("metrics") or {}
-    d = report.get("diff_summary") or {}
+    d = report.get("evaluation_summary") or {}
     lines = [
         f"# Shadow Gold Evaluation ({report.get('report_version')})",
         "",
@@ -429,14 +393,10 @@ def render_markdown_report(report: dict[str, Any]) -> str:
         f"| Capability Recall | {m.get('capability_recall')} |",
         f"| Capability F1 | {m.get('capability_f1')} |",
         "",
-        "## Diff summary (legacy vs shadow vs gold)",
+        "## Evaluation summary",
         "",
         f"- shadow match gold: **{d.get('shadow_match_gold')}**",
-        f"- legacy match gold: **{d.get('legacy_match_gold')}**",
-        f"- shadow == legacy: {d.get('shadow_legacy_same')}",
-        f"- shadow != legacy: {d.get('shadow_legacy_different')}",
-        f"- shadow better than legacy: {d.get('shadow_better_than_legacy')}",
-        f"- legacy better than shadow: {d.get('legacy_better_than_shadow')}",
+        f"- shadow mismatch gold: **{d.get('shadow_mismatch_gold')}**",
         "",
         "## Confusion mismatches (gold → pred)",
         "",
@@ -464,12 +424,12 @@ def render_markdown_report(report: dict[str, Any]) -> str:
 
     lines.extend(["", "## Rows", ""])
     lines.append(
-        "| tool | gold | shadow | conf | AA? | match | legacy leaf | vs legacy | status |"
+        "| tool | gold | shadow | conf | AA? | match | status |"
     )
-    lines.append("|------|------|--------|-----:|:---:|:-----:|-------------|-----------|--------|")
+    lines.append("|------|------|--------|-----:|:---:|:-----:|--------|")
     for row in report.get("rows") or []:
         lines.append(
-            "| {tool_id}:{canonical_slug} | {gold_primary} | {shadow_primary} | {shadow_confidence} | {aa} | {match} | {legacy} | {svl} | {status} |".format(
+            "| {tool_id}:{canonical_slug} | {gold_primary} | {shadow_primary} | {shadow_confidence} | {aa} | {match} | {status} |".format(
                 tool_id=row.get("tool_id"),
                 canonical_slug=row.get("canonical_slug"),
                 gold_primary=row.get("gold_primary"),
@@ -479,8 +439,6 @@ def render_markdown_report(report: dict[str, Any]) -> str:
                 else "—",
                 aa="Y" if row.get("auto_accepted_simulated") else "",
                 match="Y" if row.get("match_gold") else "",
-                legacy=row.get("legacy_inferred_leaf") or row.get("legacy_primary_slug") or "—",
-                svl=row.get("shadow_vs_legacy") or "—",
                 status=row.get("status"),
             )
         )
@@ -570,25 +528,6 @@ FROM classification_runs
 WHERE tool_id IN ({placeholders})
 ORDER BY tool_id, id DESC
 """
-
-LEGACY_SQL = """
-SELECT
-  t.id AS tool_id,
-  t.primary_category_id,
-  pc.canonical_slug AS primary_slug,
-  tc.category_id,
-  c.canonical_slug AS category_slug,
-  c.parent_category_id,
-  parent.canonical_slug AS parent_slug
-FROM tools t
-LEFT JOIN categories pc ON pc.id = t.primary_category_id
-LEFT JOIN tool_categories tc ON tc.tool_id = t.id
-LEFT JOIN categories c ON c.id = tc.category_id
-LEFT JOIN categories parent ON parent.id = c.parent_category_id
-WHERE t.id IN ({placeholders})
-ORDER BY t.id, tc.category_id
-"""
-
 
 def _placeholders(n: int) -> str:
     return ",".join("?" for _ in range(n))
@@ -728,61 +667,6 @@ async def load_shadow_predictions(d1: Any, tool_ids: list[int]) -> dict[int, Pre
     return preds
 
 
-async def load_legacy_views(d1: Any, tool_ids: list[int]) -> dict[int, LegacyView]:
-    if not tool_ids:
-        return {}
-    ph = _placeholders(len(tool_ids))
-    rows = await d1.query(LEGACY_SQL.format(placeholders=ph), list(tool_ids))
-    by_tool: dict[int, LegacyView] = {}
-    children: dict[int, list[dict[str, Any]]] = defaultdict(list)
-
-    for row in rows:
-        tool_id = int(row.get("tool_id") or 0)
-        if tool_id <= 0:
-            continue
-        if tool_id not in by_tool:
-            primary_id = row.get("primary_category_id")
-            by_tool[tool_id] = LegacyView(
-                tool_id=tool_id,
-                primary_category_id=int(primary_id) if primary_id not in (None, "") else None,
-                primary_slug=clean_slug(row.get("primary_slug")),
-            )
-        cat_slug = clean_slug(row.get("category_slug"))
-        if cat_slug:
-            children[tool_id].append(
-                {
-                    "slug": cat_slug,
-                    "parent_slug": clean_slug(row.get("parent_slug")),
-                    "parent_category_id": row.get("parent_category_id"),
-                    "category_id": row.get("category_id"),
-                }
-            )
-
-    for tool_id, view in by_tool.items():
-        cats = children.get(tool_id, [])
-        slugs = []
-        for c in cats:
-            if c["slug"] and c["slug"] not in slugs:
-                slugs.append(c["slug"])
-        view.category_slugs = slugs
-        # Infer leaf: prefer category that has a parent among assigned set / not equal primary parent-only
-        leaf = ""
-        for c in cats:
-            if c["parent_slug"] and c["slug"] != view.primary_slug:
-                leaf = c["slug"]
-                break
-        if not leaf:
-            # any non-primary slug
-            for c in cats:
-                if c["slug"] and c["slug"] != view.primary_slug:
-                    leaf = c["slug"]
-                    break
-        if not leaf:
-            leaf = view.primary_slug
-        view.inferred_leaf_slug = leaf
-    return by_tool
-
-
 async def run_gold_evaluation(
     config: Any,
     *,
@@ -791,7 +675,7 @@ async def run_gold_evaluation(
     auto_accepted_threshold: float = DEFAULT_AUTO_ACCEPTED_THRESHOLD,
     tool_ids: list[int] | None = None,
 ) -> dict[str, Any]:
-    """Load Gold + D1 shadow/legacy, write JSON/MD reports, return summary metrics."""
+    """Load Gold and canonical taxonomy predictions, then write evaluation reports."""
     from runner import D1Client, log_info
 
     gold_rows = load_gold_csv(gold_csv)
@@ -804,7 +688,6 @@ async def run_gold_evaluation(
     ids = [g.tool_id for g in gold_rows]
     async with D1Client(config) as d1:
         shadow = await load_shadow_predictions(d1, ids)
-        legacy = await load_legacy_views(d1, ids)
 
     # Bind prompt/taxonomy from any shadow pred
     prompt_version = ""
@@ -820,7 +703,6 @@ async def run_gold_evaluation(
     bundle = EvalBundle(
         gold_rows=gold_rows,
         shadow=shadow,
-        legacy=legacy,
         auto_accepted_threshold=auto_accepted_threshold,
         prompt_version=prompt_version,
         taxonomy_version=taxonomy_version,

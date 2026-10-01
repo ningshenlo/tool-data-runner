@@ -1,0 +1,82 @@
+/report-assets/*
+  X-Content-Type-Options: nosniff
+
+/report-assets/previews/*
+  Cache-Control: no-store
+  X-Robots-Tag: noindex
+
+/report-assets/published/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/report-assets/video-generation/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/report-assets/image-generation/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/report-assets/music-generation/*
+  Cache-Control: public, max-age=31536000, immutable
+
+/report-assets/video-generation/2026-08/v1/en/sigpik-report-video-generation-2026-08-v1.zip
+  Content-Type: application/zip
+  Content-Disposition: attachment; filename="sigpik-report-video-generation-2026-08-v1.zip"
+
+/report-assets/video-generation/2026-08/v1/zh-cn/sigpik-report-video-generation-2026-08-v1.zip
+  Content-Type: application/zip
+  Content-Disposition: attachment; filename="sigpik-report-video-generation-2026-08-v1.zip"
+
+/report-assets/video-generation/2026-08/v1/en/summary.csv
+  Content-Type: text/csv; charset=utf-8
+  Content-Disposition: attachment; filename="summary.csv"
+
+/report-assets/video-generation/2026-08/v1/zh-cn/summary.csv
+  Content-Type: text/csv; charset=utf-8
+  Content-Disposition: attachment; filename="summary.csv"
+
+/report-assets/image-generation/2026-08/v1/en/sigpik-report-image-generation-2026-08-v1.zip
+  Content-Type: application/zip
+  Content-Disposition: attachment; filename="sigpik-report-image-generation-2026-08-v1.zip"
+
+/report-assets/image-generation/2026-08/v1/zh-cn/sigpik-report-image-generation-2026-08-v1.zip
+  Content-Type: application/zip
+  Content-Disposition: attachment; filename="sigpik-report-image-generation-2026-08-v1.zip"
+
+/report-assets/image-generation/2026-08/v1/en/summary.csv
+  Content-Type: text/csv; charset=utf-8
+  Content-Disposition: attachment; filename="summary.csv"
+
+/report-assets/image-generation/2026-08/v1/zh-cn/summary.csv
+  Content-Type: text/csv; charset=utf-8
+  Content-Disposition: attachment; filename="summary.csv"
+
+/report-assets/music-generation/2026-08/v1/en/sigpik-report-music-generation-2026-08-v1.zip
+  Content-Type: application/zip
+  Content-Disposition: attachment; filename="sigpik-report-music-generation-2026-08-v1.zip"
+
+/report-assets/music-generation/2026-08/v1/zh-cn/sigpik-report-music-generation-2026-08-v1.zip
+  Content-Type: application/zip
+  Content-Disposition: attachment; filename="sigpik-report-music-generation-2026-08-v1.zip"
+
+/report-assets/music-generation/2026-08/v1/en/summary.csv
+  Content-Type: text/csv; charset=utf-8
+  Content-Disposition: attachment; filename="summary.csv"
+
+/report-assets/music-generation/2026-08/v1/zh-cn/summary.csv
+  Content-Type: text/csv; charset=utf-8
+  Content-Disposition: attachment; filename="summary.csv"
+
+/report-assets/:channel/:sector/:month/:version/:locale/sigpik-report-*.zip
+  Content-Type: application/zip
+  Content-Disposition: attachment; filename="sigpik-report-:splat.zip"
+
+/report-assets/:channel/:sector/:month/:version/:locale/summary.csv
+  Content-Type: text/csv; charset=utf-8
+  Content-Disposition: attachment; filename="summary.csv"
+
+/report-assets/:channel/:sector/:month/:version/:locale/cohort.csv
+  Content-Type: text/csv; charset=utf-8
+  Content-Disposition: attachment; filename="cohort.csv"
+
+/report-assets/:channel/:sector/:month/:version/:locale/coverage.json
+  Content-Type: application/json; charset=utf-8
+  Content-Disposition: attachment; filename="coverage.json"

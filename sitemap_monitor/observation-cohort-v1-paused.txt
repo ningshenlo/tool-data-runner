@@ -1,0 +1,13 @@
+# Sitemap observation cohort v1 quarantine
+#
+# Audited: 2026-08-22.
+# These sites have no currently usable sitemap and must not consume scheduled
+# scan capacity. Historical D1 runs and failures are retained.
+https://travelagent-olive.vercel.app/
+https://www.hooper.gg/
+https://chess.unabotter.xyz/
+https://gptgames.io/
+https://clawlings.com/
+https://coplay.dev/
+https://incite.dev/
+https://www.withplayvision.ai/
