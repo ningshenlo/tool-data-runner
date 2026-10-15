@@ -52,7 +52,7 @@ TRAFFIC_METRICS_SCHEMA_VERSION = 2
 ASSET_SOURCE = "site_scraper"
 ASSET_DB_STORAGE_BUCKET = "sitesimgs"
 DEFAULT_R2_BUCKET = "sitesimgs"
-ASSET_REQUIREMENT_ORDER = ("content_safety", "screenshot", "favicon", "description", "key_features")
+ASSET_REQUIREMENT_ORDER = ("content_safety", "screenshot", "favicon", "description")
 AUTO_APPROVE_TOOL_NAME_CONFIDENCE = 85
 CATALOG_AUTO_PUBLISH_POLICY_VERSION = "catalog-auto-publish-v1"
 CATALOG_AUTO_PUBLISH_MAX_LIMIT = 100
@@ -2595,44 +2595,6 @@ class CloudflareBrowserRunAssetClient:
             content_safety_source=content_safety.source,
             metadata_error=metadata_error,
             metadata_retryable=metadata_retryable,
-        )
-
-    async def fetch_homepage_key_features(self, task: AssetTask) -> AssetFetchResult:
-        final_url, metadata = await self.fetch_structured_asset_data(
-            task,
-            stage="key features",
-            prompt=(
-                "Extract 1 to 6 concrete product capabilities from this product homepage. "
-                "Use short feature names and factual one-sentence descriptions."
-            ),
-            json_schema={
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "key_features": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": 6,
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "name": {"type": "string"},
-                                "description": {"type": "string"},
-                            },
-                            "required": ["name", "description"],
-                        },
-                    },
-                },
-                "required": ["key_features"],
-            },
-        )
-        key_features = clean_key_features(metadata.get("key_features"))
-        return AssetFetchResult(
-            final_url=final_url,
-            key_features=key_features,
-            metadata_error="" if key_features else "features_empty",
-            metadata_retryable=True,
         )
 
     async def capture_homepage_screenshot(self, task: AssetTask) -> AssetFetchResult:
@@ -5527,19 +5489,6 @@ def tool_live_ready_predicate(tool_alias: str) -> str:
               NOT IN ('needs_review', 'rejected')
           AND trim(coalesce(localization.short_description, '')) <> ''
       )
-      AND (
-        EXISTS (
-          SELECT 1 FROM tool_key_features feature
-          WHERE feature.tool_id = {tool_alias}.id
-        )
-        OR EXISTS (
-          SELECT 1 FROM tool_localizations localization
-          WHERE localization.tool_id = {tool_alias}.id
-            AND localization.translation_status = 'published'
-            AND localization.published_at IS NOT NULL
-            AND json_array_length(coalesce(localization.feature_highlights, '[]')) > 0
-        )
-      )
       AND {accepted_primary_taxonomy_predicate(tool_alias)}
       AND EXISTS (
         SELECT 1 FROM tool_sources source
@@ -5675,13 +5624,6 @@ class D1EnrichmentStore:
                   AND instr(l.name, '`') = 0
                   AND instr(lower(l.name), 'json-ld') = 0
               ) THEN 1 ELSE 0 END AS has_name_quality,
-              CASE WHEN EXISTS (SELECT 1 FROM tool_key_features f WHERE f.tool_id = t.id)
-                     OR EXISTS (
-                       SELECT 1 FROM tool_localizations l
-                       WHERE l.tool_id = t.id AND l.translation_status = 'published'
-                         AND l.published_at IS NOT NULL
-                         AND json_array_length(coalesce(l.feature_highlights, '[]')) > 0
-                     ) THEN 1 ELSE 0 END AS has_features,
               CASE WHEN {accepted_primary_taxonomy_predicate('t')}
                    THEN 1 ELSE 0 END AS has_category,
               CASE WHEN NOT {accepted_primary_taxonomy_predicate('t')} AND EXISTS (
@@ -5742,13 +5684,6 @@ class D1EnrichmentStore:
                   AND instr(l.name, '`') = 0
                   AND instr(lower(l.name), 'json-ld') = 0
               ) THEN 1 ELSE 0 END AS has_name_quality,
-              CASE WHEN EXISTS (SELECT 1 FROM tool_key_features f WHERE f.tool_id = t.id)
-                     OR EXISTS (
-                       SELECT 1 FROM tool_localizations l
-                       WHERE l.tool_id = t.id AND l.translation_status = 'published'
-                         AND l.published_at IS NOT NULL
-                         AND json_array_length(coalesce(l.feature_highlights, '[]')) > 0
-                     ) THEN 1 ELSE 0 END AS has_features,
               CASE WHEN {accepted_primary_taxonomy_predicate('t')}
                    THEN 1 ELSE 0 END AS has_category,
               0 AS category_needs_manual,
@@ -5790,7 +5725,6 @@ class D1EnrichmentStore:
                 ("screenshot", "has_screenshot"),
                 ("published_localization", "has_localization"),
                 ("name_quality", "has_name_quality"),
-                ("key_feature", "has_features"),
                 ("category", "has_category"),
                 ("source_evidence", "has_source"),
             )
@@ -5881,6 +5815,8 @@ class D1EnrichmentStore:
               AND (
                 state.evaluated_at IS NULL
                 OR t.updated_at > state.evaluated_at
+                OR instr(coalesce(state.blocking_json, ''), '"key_feature"') > 0
+                OR instr(coalesce(state.blocking_json, ''), '"key_features"') > 0
                 OR (
                   instr(coalesce(state.blocking_json, ''), '"category"') > 0
                   AND {accepted_primary_taxonomy_predicate('t')}
@@ -6008,21 +5944,6 @@ class D1AssetStore:
                     AND tl.translation_status = 'published'
                     AND tl.published_at IS NOT NULL
                     AND trim(coalesce(tl.short_description, '')) <> ''
-                )
-                OR (
-                  NOT EXISTS (
-                    SELECT 1
-                    FROM tool_key_features tkf
-                    WHERE tkf.tool_id = t.id
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM tool_localizations tl
-                    WHERE tl.tool_id = t.id
-                      AND tl.translation_status = 'published'
-                      AND tl.published_at IS NOT NULL
-                      AND json_array_length(coalesce(tl.feature_highlights, '[]')) > 0
-                  )
                 )
               )
               AND (
@@ -6350,82 +6271,6 @@ class D1AssetStore:
             ],
         )
 
-    async def save_tool_features(self, task: AssetTask, result: AssetFetchResult) -> None:
-        features = clean_key_features(result.key_features)
-        if not features:
-            return
-        await self.d1.run(
-            "DELETE FROM tool_key_features WHERE tool_id = ? AND source = ?",
-            [task.tool_id, ASSET_SOURCE],
-        )
-        for position, feature in enumerate(features):
-            await self.d1.run(
-                """
-                INSERT INTO tool_key_features (
-                  tool_id, feature_name, feature_description, position, source
-                )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                [task.tool_id, feature["name"], feature["description"] or None, position, ASSET_SOURCE],
-            )
-        feature_highlights = json.dumps(
-            [feature["name"] for feature in features],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        await self.d1.run(
-            """
-            UPDATE tool_localizations
-            SET feature_highlights = CASE
-                  WHEN json_array_length(coalesce(feature_highlights, '[]')) = 0
-                  THEN ?
-                  ELSE feature_highlights
-                END,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE tool_id = ?
-            """,
-            [feature_highlights, task.tool_id],
-        )
-
-    async def fallback_tool_content(self, task: AssetTask) -> tuple[str, str]:
-        rows = await self.d1.query(
-            """
-            SELECT name, short_description
-            FROM tool_localizations
-            WHERE tool_id = ?
-              AND translation_status = 'published'
-              AND published_at IS NOT NULL
-            ORDER BY CASE WHEN locale_code = 'en' THEN 0 ELSE 1 END
-            LIMIT 1
-            """,
-            [task.tool_id],
-        )
-        row = rows[0] if rows else {}
-        name = clean_asset_text(row.get("name"), 120) or canonical_slug_fallback_tool_name(task)
-        description = clean_asset_text(row.get("short_description"), 500)
-        if not description:
-            description = deterministic_fallback_description(task, "", name)
-        return name, description
-
-    async def save_deterministic_tool_features(
-        self,
-        task: AssetTask,
-        html_body: str = "",
-    ) -> bool:
-        name, description = await self.fallback_tool_content(task)
-        features = deterministic_fallback_key_features(name, description, html_body)
-        if not features:
-            return False
-        await self.save_tool_features(
-            task,
-            AssetFetchResult(
-                final_url=asset_page_url(task),
-                key_features=features,
-                metadata_retryable=False,
-            ),
-        )
-        return True
-
     async def missing_tool_enrichment_requirements(self, tool_id: int) -> list[str]:
         rows = await self.d1.query(
             f"""
@@ -6443,23 +6288,11 @@ class D1AssetStore:
                   AND trim(coalesce(tl.short_description, '')) <> ''
               ) THEN 1 ELSE 0 END AS has_description,
               CASE WHEN EXISTS (
-                SELECT 1
-                FROM tool_key_features tkf
-                WHERE tkf.tool_id = ?
-              ) OR EXISTS (
-                SELECT 1
-                FROM tool_localizations tl
-                WHERE tl.tool_id = ?
-                  AND tl.translation_status = 'published'
-                  AND tl.published_at IS NOT NULL
-                  AND json_array_length(coalesce(tl.feature_highlights, '[]')) > 0
-              ) THEN 1 ELSE 0 END AS has_features,
-              CASE WHEN EXISTS (
                 SELECT 1 FROM tools t
                 WHERE t.id = ? AND {accepted_primary_taxonomy_predicate('t')}
               ) THEN 1 ELSE 0 END AS has_category
             """,
-            [tool_id, tool_id, tool_id, tool_id, tool_id],
+            [tool_id, tool_id, tool_id],
         )
         row = rows[0] if rows else {}
         return [
@@ -6467,7 +6300,6 @@ class D1AssetStore:
             for name, column in (
                 ("content_safety", "has_content_safety"),
                 ("description", "has_description"),
-                ("key_features", "has_features"),
                 ("category", "has_category"),
             )
             if not int(row.get(column) or 0)
@@ -6503,26 +6335,12 @@ class D1AssetStore:
                   AND tl.translation_status = 'published'
                   AND tl.published_at IS NOT NULL
                   AND trim(coalesce(tl.short_description, '')) <> ''
-              ) THEN 1 ELSE 0 END AS has_description,
-              CASE WHEN EXISTS (
-                SELECT 1
-                FROM tool_key_features tkf
-                WHERE tkf.tool_id = ?
-              ) OR EXISTS (
-                SELECT 1
-                FROM tool_localizations tl
-                WHERE tl.tool_id = ?
-                  AND tl.translation_status = 'published'
-                  AND tl.published_at IS NOT NULL
-                  AND json_array_length(coalesce(tl.feature_highlights, '[]')) > 0
-              ) THEN 1 ELSE 0 END AS has_key_features
+              ) THEN 1 ELSE 0 END AS has_description
             """,
             [
                 tool_id,
                 tool_id,
                 ASSET_DB_STORAGE_BUCKET,
-                tool_id,
-                tool_id,
                 tool_id,
                 tool_id,
             ],
@@ -6533,7 +6351,6 @@ class D1AssetStore:
             "screenshot": "has_screenshot",
             "favicon": "has_favicon",
             "description": "has_description",
-            "key_features": "has_key_features",
         }
         missing = [
             requirement
@@ -7829,47 +7646,6 @@ async def process_asset_task(
                     if isinstance(error, (PageQualityError, ContentSafetyError)):
                         raise
                     record_stage_error("description", error)
-
-            if "key_features" in missing_before:
-                try:
-                    feature_result = await browser_client.fetch_homepage_key_features(task)
-                    if not await store.renew_lease(task):
-                        return "stale"
-                    if feature_result.key_features and not feature_result.metadata_error:
-                        await store.save_tool_features(task, feature_result)
-                    elif await store.save_deterministic_tool_features(
-                        task,
-                        core_result.html if core_result else "",
-                    ):
-                        log_info(
-                            "assets.key_features.deterministic_fallback",
-                            tool_id=task.tool_id,
-                            slug=task.canonical_slug,
-                            model_error=feature_result.metadata_error[:200],
-                        )
-                    else:
-                        record_stage_error(
-                            "key_features",
-                            feature_result.metadata_error or "features_empty",
-                            retryable=feature_result.metadata_retryable,
-                        )
-                except Exception as error:
-                    try:
-                        fallback_saved = await store.save_deterministic_tool_features(
-                            task,
-                            core_result.html if core_result else "",
-                        )
-                    except Exception:
-                        fallback_saved = False
-                    if fallback_saved:
-                        log_info(
-                            "assets.key_features.deterministic_fallback",
-                            tool_id=task.tool_id,
-                            slug=task.canonical_slug,
-                            model_error=str(error)[:200],
-                        )
-                    else:
-                        record_stage_error("key_features", error)
 
             if "screenshot" in missing_before:
                 try:

@@ -1538,7 +1538,7 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertIsNone(row)
 
-    async def test_asset_processing_retries_only_requirements_that_remain_missing(self) -> None:
+    async def test_missing_features_alone_does_not_queue_or_block_assets(self) -> None:
         tool_id = self.add_tool("asset-metadata-only")
         self.connection.executemany(
             """
@@ -1563,53 +1563,11 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.connection.commit()
 
         store = runner.D1AssetStore(self.d1)
-        self.assertEqual(await store.queue_missing_asset_tasks(10), 1)
-        task = (await store.claim_due_tasks(10, "asset-worker"))[0]
-
-        class StageRecordingClient:
-            def __init__(self) -> None:
-                self.feature_calls = 0
-
-            async def fetch_homepage_core_metadata(self, _: runner.AssetTask) -> runner.AssetFetchResult:
-                raise AssertionError("core metadata must not be fetched")
-
-            async def capture_homepage_screenshot(self, _: runner.AssetTask) -> runner.AssetFetchResult:
-                raise AssertionError("screenshot must not be fetched")
-
-            async def fetch_homepage_key_features(self, current_task: runner.AssetTask) -> runner.AssetFetchResult:
-                self.feature_calls += 1
-                return runner.AssetFetchResult(
-                    final_url=current_task.official_url,
-                    key_features=[{"name": "Feature one", "description": "Does one thing"}],
-                )
-
-        class RecordingUploader:
-            def __init__(self) -> None:
-                self.calls: list[str] = []
-
-            async def put_object(self, key: str, *_: Any) -> None:
-                self.calls.append(key)
-
-        browser_client = StageRecordingClient()
-        uploader = RecordingUploader()
-        with patch.object(runner.asyncio, "sleep", new=AsyncMock()):
-            status = await runner.process_asset_task(
-                task,
-                browser_client,
-                uploader,
-                store,
-                "https://img.example.test",
-                1,
-            )
-
-        self.assertEqual(status, "done")
-        self.assertEqual(browser_client.feature_calls, 1)
-        self.assertEqual(uploader.calls, [])
+        self.assertEqual(await store.queue_missing_asset_tasks(10), 0)
         self.assertEqual(await store.missing_asset_requirements(tool_id), [])
-        row = self.task_row("asset_tasks", "tool_id = ? AND source = ?", [tool_id, runner.ASSET_SOURCE])
-        self.assert_completed_lease(row, "done")
+        self.assertFalse(hasattr(runner.CloudflareBrowserRunAssetClient, 'fetch_homepage_key_features'))
 
-    async def test_asset_fallbacks_advance_a_qualified_tool_to_pending_review(self) -> None:
+    async def test_retired_features_do_not_bypass_name_review(self) -> None:
         tool_id = self.add_tool("auto-publish-ready")
         now = runner.utc_now_iso()
         self.seed_primary_taxonomy(tool_id)
@@ -1671,10 +1629,16 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(status, "done")
+        # Keep the fixture independent of name extraction policy revisions.
+        self.connection.execute("UPDATE tool_localizations SET name_review_status = 'needs_review' WHERE tool_id = ?", [tool_id])
+        self.connection.commit()
         readiness = await runner.D1EnrichmentStore(self.d1).evaluate_tool(tool_id)
-        self.assertEqual(readiness, "ready")
+        self.assertEqual(readiness, "blocked")
+        state = self.connection.execute("SELECT blocking_json FROM tool_enrichment_states WHERE tool_id = ?", [tool_id]).fetchone()
+        self.assertIn("name_quality", json.loads(state["blocking_json"]))
+        self.assertNotIn("key_feature", json.loads(state["blocking_json"]))
         tool = self.connection.execute("SELECT status FROM tools WHERE id = ?", [tool_id]).fetchone()
-        self.assertEqual(tool["status"], "pending_review")
+        self.assertEqual(tool["status"], "pending_enrich")
 
     async def test_successful_screenshot_is_not_recaptured_while_favicon_retries(self) -> None:
         tool_id = self.add_tool("asset-stage-once")
@@ -4058,10 +4022,6 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             [tool_id, runner.utc_now_iso()],
         )
         self.connection.execute(
-            "INSERT INTO tool_key_features (tool_id, feature_name) VALUES (?, 'Feature one')",
-            [tool_id],
-        )
-        self.connection.execute(
             """
             INSERT INTO tool_sources (tool_id, source_type, source_url, is_primary)
             VALUES (?, 'official_site', 'https://enrichment-flow.example', 1)
@@ -4070,9 +4030,13 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.connection.commit()
 
-        readiness = await runner.D1EnrichmentStore(self.d1).evaluate_tool(tool_id)
-
-        self.assertEqual(readiness, "ready")
+        self.connection.execute(
+            "INSERT INTO tool_enrichment_states (tool_id, readiness, blocking_json, evaluated_at) VALUES (?, 'blocked', ?, ?)",
+            [tool_id, '["key_feature"]', '2099-01-01T00:00:00.000Z'],
+        )
+        self.connection.commit()
+        result = await runner.D1EnrichmentStore(self.d1).reconcile_active_tools(100)
+        self.assertGreaterEqual(result["ready"], 1)
         tool = self.connection.execute("SELECT status FROM tools WHERE id = ?", [tool_id]).fetchone()
         self.assertEqual(tool["status"], "pending_review")
         state = self.connection.execute(
@@ -4085,6 +4049,9 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
     async def test_catalog_auto_publish_publishes_ready_tool_with_audit_once(self) -> None:
         tool_id = self.add_tool("catalog-auto-publish", status="pending_review")
         self.seed_publishable_tool(tool_id, "catalog-auto-publish")
+        self.connection.execute("DELETE FROM tool_key_features WHERE tool_id = ?", [tool_id])
+        self.connection.execute("UPDATE tool_localizations SET feature_highlights = '[]' WHERE tool_id = ?", [tool_id])
+        self.connection.commit()
         publisher = runner.D1CatalogPublisher(self.d1, "assets-worker-test")
 
         result = await publisher.publish_ready(10)
