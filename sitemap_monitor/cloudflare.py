@@ -42,6 +42,10 @@ class CloudflareD1Client:
         database_id: str,
         timeout_seconds: float = 30.0,
     ):
+        from postgres_legacy import transport_for
+        self._postgres = transport_for(database_id)
+        if self._postgres is not None:
+            return
         if not account_id or not api_token or not database_id:
             raise ValueError("Cloudflare D1 account, database, and token are required.")
         self.url = (
@@ -55,6 +59,9 @@ class CloudflareD1Client:
         self.client = httpx.AsyncClient(timeout=timeout_seconds)
 
     async def close(self) -> None:
+        if self._postgres is not None:
+            await self._postgres.close()
+            return
         await self.client.aclose()
 
     @staticmethod
@@ -77,6 +84,9 @@ class CloudflareD1Client:
         return str(payload.get("message") or payload)[:500]
 
     async def _request(self, body: object) -> list[dict[str, Any]]:
+        if self._postgres is not None:
+            if not isinstance(body,dict):raise ValueError('PostgreSQL request body must be a statement or batch')
+            return await self._postgres.request(body)
         last_error: Exception | None = None
         for attempt in range(3):
             try:
@@ -594,6 +604,8 @@ class CloudflareD1MetadataStore:
                 ORDER BY next_check_at, id
                 LIMIT ?
             )
+            AND status = 'active' AND next_check_at <= ?
+            AND (dispatch_lease_expires_at IS NULL OR dispatch_lease_expires_at <= ?)
             RETURNING id, homepage_url, check_interval_sec, schedule_version,
                       next_check_at, dispatch_lease_token
             """,
@@ -604,6 +616,8 @@ class CloudflareD1MetadataStore:
                 now_ms,
                 now_ms,
                 limit,
+                now_ms,
+                now_ms,
             ],
         )
         return tuple(
@@ -714,6 +728,8 @@ class CloudflareD1MetadataStore:
                 ORDER BY job.available_at, job.scheduled_for, job.id
                 LIMIT ?
             )
+            AND ((status IN ('pending', 'retry') AND attempts < max_attempts AND available_at <= ?)
+                 OR (status = 'running' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?))
             RETURNING *, (
                 SELECT homepage_url FROM sitemap_sites
                 WHERE sitemap_sites.id = sitemap_jobs.site_id
@@ -730,6 +746,8 @@ class CloudflareD1MetadataStore:
                 now_ms,
                 now_ms,
                 limit,
+                now_ms,
+                now_ms,
             ],
         )
         return tuple(

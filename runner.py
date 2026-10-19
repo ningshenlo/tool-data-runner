@@ -3557,6 +3557,11 @@ class DomainStateClient:
 
 class D1Client:
     def __init__(self, config: Config):
+        from postgres_legacy import transport_for
+        self._postgres = transport_for(config.cloudflare_d1_database_id)
+        self._market_country_schema_available: bool | None = None
+        if self._postgres is not None:
+            return
         self.url = (
             f"{D1_API_BASE}/accounts/{config.cloudflare_account_id}"
             f"/d1/database/{config.cloudflare_d1_database_id}/query"
@@ -3569,6 +3574,9 @@ class D1Client:
         self._market_country_schema_available: bool | None = None
 
     async def close(self) -> None:
+        if self._postgres is not None:
+            await self._postgres.close()
+            return
         await self.client.aclose()
 
     async def __aenter__(self) -> "D1Client":
@@ -3602,6 +3610,8 @@ class D1Client:
         *,
         operation: str | None = None,
     ) -> list[dict[str, Any]]:
+        if self._postgres is not None:
+            return await self._postgres.request(body)
         response: httpx.Response | None = None
         last_error: Exception | None = None
         max_attempts = 4 if retry_transient else 1
@@ -4553,7 +4563,7 @@ async def build_market_snapshot_facet_rollups_from_d1(
 async def get_market_snapshot_coverage(d1: D1Client, snapshot_id: int) -> dict[str, int]:
     rows = await d1.query(
         """
-        WITH target AS (SELECT ? AS snapshot_id)
+        WITH target AS (SELECT CAST(? AS INTEGER) AS snapshot_id)
         SELECT
           count(snapshot.tool_id) AS total_tools,
           coalesce(sum(CASE WHEN visits IS NOT NULL THEN 1 ELSE 0 END), 0) AS traffic_tools,
@@ -4693,6 +4703,7 @@ async def get_market_snapshot_coverage(d1: D1Client, snapshot_id: int) -> dict[s
         FROM target
         LEFT JOIN tool_market_snapshots snapshot
           ON snapshot.snapshot_id = target.snapshot_id
+        GROUP BY target.snapshot_id
         """,
         [snapshot_id],
     )
@@ -7051,7 +7062,7 @@ class D1DomainStateStore:
                   OR ds.last_crawled_at < ?
                   OR ds.rdap_checked_at IS NULL
                 )
-              GROUP BY t.normalized_domain
+              GROUP BY t.normalized_domain, ds.last_crawled_at, ds.rdap_checked_at
               ORDER BY CASE WHEN min(ds.last_crawled_at) IS NULL THEN 0 ELSE 1 END,
                        min(ds.last_crawled_at) ASC,
                        t.normalized_domain ASC
