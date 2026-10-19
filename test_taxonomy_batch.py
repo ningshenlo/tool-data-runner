@@ -755,7 +755,65 @@ class TaxonomyBatchStateMachineTests(unittest.IsolatedAsyncioTestCase):
             "SELECT prompt_version, provider, run_status FROM classification_runs"
         ).fetchone()
         self.assertEqual(run[1:], ("openai_batch_api", "succeeded"))
-        self.assertTrue(str(run[0]).startswith("openai-batch-"))
+        self.assertEqual(run[0], "test")  # Preserve the originating request version.
+
+    async def _quality_item(self):
+        quote = "Acme creates images from text."
+        profile = {"primary_job": {"value": "Creates images", "evidence": [{"quote": quote}]},
+                   "entity_decision": {"accepted": True, "kind": "independent_product"}}
+        l1 = {"l1_candidates": [{"slug": "image-generation", "confidence": 0.95}]}
+        cursor = self.connection.execute(
+            "INSERT INTO taxonomy_batch_items (tool_id,pipeline_version,prompt_version,taxonomy_version,source_url,profile_json,l1_json,existing_entity_kind,existing_entity_source) VALUES (10,'test','old-origin',2,'https://acme.example',?,?,'independent_product','auto')",
+            (json.dumps(profile),json.dumps(l1)))
+        self.connection.commit()
+        return cursor.lastrowid
+
+    async def test_escalation_without_grounded_evidence_cannot_publish(self):
+        item_id = await self._quality_item()
+        await enqueue_stage(self.d1,self.config,self.catalog,item_id=item_id,stage="leaf_escalation")
+        await self._apply("leaf_escalation", {"leaf_slug":"image-generators","confidence":0.99,
+            "reason":"Images", "evidence":[{"quote":"An invented quote that does not exist"}],"secondary_leaves":[]})
+        row = self.connection.execute("SELECT status,error FROM taxonomy_batch_items WHERE id=?",(item_id,)).fetchone()
+        self.assertEqual(row[0],"needs_review")
+        self.assertIn("missing_grounded_leaf_evidence",row[1])
+        self.assertEqual(self.connection.execute("SELECT count(*) FROM product_taxonomy_assignments").fetchone()[0],0)
+        self.assertEqual(self.connection.execute("SELECT count(*) FROM taxonomy_batch_requests WHERE stage='capability'").fetchone()[0],0)
+
+    async def test_half_confidence_finalizer_accepts_grounded_primary(self):
+        item_id = await self._quality_item()
+        self.connection.execute("UPDATE taxonomy_batch_items SET current_stage='capability',leaf_json=? WHERE id=?",
+            (json.dumps({"leaf_slug":"image-generators","confidence":0.5,
+                         "evidence":[{"quote":"Acme creates images from text."}]}),item_id))
+        self.connection.commit()
+        from taxonomy_batch import finalize_classification
+        await finalize_classification(self.d1,self.config,self.catalog,item_id)
+        primary = self.connection.execute(
+            "SELECT term_id,is_primary,decision_status,confidence FROM product_taxonomy_assignments WHERE is_primary=1").fetchone()
+        self.assertEqual(tuple(primary),(2,1,"auto_accepted",0.5))
+        self.assertEqual(self.connection.execute("SELECT status FROM taxonomy_batch_items WHERE id=?",(item_id,)).fetchone()[0],"succeeded")
+
+    async def test_low_confidence_escalation_does_not_replace_manual_primary(self):
+        item_id = await self._quality_item()
+        self.connection.execute("INSERT INTO product_taxonomy_assignments(tool_id,term_id,is_primary,confidence,decision_status,source,assigned_at,updated_at) VALUES(10,2,1,1,'verified','manual','2026','2026')")
+        self.connection.commit()
+        await enqueue_stage(self.d1,self.config,self.catalog,item_id=item_id,stage="leaf_escalation")
+        await self._apply("leaf_escalation", {"leaf_slug":"image-generators","confidence":0.49,
+            "reason":"Images", "evidence":[{"quote":"Acme creates images from text."}],"secondary_leaves":[]})
+        row = self.connection.execute("SELECT status,error FROM taxonomy_batch_items WHERE id=?",(item_id,)).fetchone()
+        self.assertEqual(row[0],"needs_review")
+        self.assertIn("low_primary_confidence",row[1])
+        primary=self.connection.execute("SELECT decision_status,source,is_primary FROM product_taxonomy_assignments").fetchone()
+        self.assertEqual(tuple(primary),("verified","manual",1))
+
+    async def test_resumed_finalizer_rechecks_quality_before_writing(self):
+        item_id = await self._quality_item()
+        self.connection.execute("UPDATE taxonomy_batch_items SET current_stage='capability',leaf_json=? WHERE id=?",
+            (json.dumps({"leaf_slug":"image-generators","confidence":0.99,"evidence":[]}),item_id))
+        self.connection.commit()
+        from taxonomy_batch import finalize_classification
+        await finalize_classification(self.d1,self.config,self.catalog,item_id)
+        self.assertEqual(self.connection.execute("SELECT status FROM taxonomy_batch_items WHERE id=?",(item_id,)).fetchone()[0],"needs_review")
+        self.assertEqual(self.connection.execute("SELECT count(*) FROM product_taxonomy_assignments").fetchone()[0],0)
 
     async def test_terminal_outcomes_leave_active_enrichment_with_audit(self):
         self.connection.execute(
@@ -1705,7 +1763,7 @@ class TaxonomyBatchSelectionTests(unittest.IsolatedAsyncioTestCase):
               tool_id, pipeline_version, prompt_version, taxonomy_version,
               status, retry_kind, next_retry_at
             ) VALUES (?, 'openai-batch-p2a-v1-2026-08-24',
-                      'openai-batch-markets-capabilities-v2-security-precision-2026-08-27',
+                      'openai-batch-markets-capabilities-v4-scoped-primary-evidence-2026-09-10',
                       2, 'pending', 'source', '2000-01-01T00:00:00Z')
             """,
             [(10,), (20,), (30,), (40,)],

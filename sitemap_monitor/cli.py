@@ -248,7 +248,7 @@ async def run(args: argparse.Namespace) -> None:
             api_token=os.environ["CLOUDFLARE_API_TOKEN"],
             database_id=os.environ["CLOUDFLARE_D1_DATABASE_ID"],
         )
-        cloudflare_metadata = CloudflareD1MetadataStore(d1_client)
+        cloudflare_metadata = CloudflareD1MetadataStore(d1_client, compact_resource_runs=True)
         metadata = cloudflare_metadata
         objects = cloudflare_objects
     else:

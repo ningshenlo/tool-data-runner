@@ -1,0 +1,8 @@
+**
+!Dockerfile.reports
+!scripts/
+!scripts/sync-report-runtime.py
+!report-runtime/
+!report-runtime/**
+**/__pycache__
+**/*.pyc

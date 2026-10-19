@@ -663,7 +663,7 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
                 if stage == "shadow_leaf":
                     return source_url, {
                         "leaf_slug": "text-to-video",
-                        "confidence": 0.88,
+                        "confidence": 0.50,
                         "reason": "primary job",
                         "evidence": [{"quote": "Generate videos from text"}],
                     }
@@ -689,6 +689,7 @@ class PrimaryOnlyPipelineTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, "succeeded")
         self.assertEqual(result.primary_slug, "text-to-video")
+        self.assertEqual(result.primary_confidence, 0.50)
         self.assertEqual(
             stages,
             ["shadow_profile_main_content", "shadow_l1_top2", "shadow_leaf"],

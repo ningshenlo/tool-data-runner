@@ -129,8 +129,10 @@ class CloudflareD1Client:
 
 
 class CloudflareD1MetadataStore:
-    def __init__(self, client: CloudflareD1Client):
+    def __init__(self, client: CloudflareD1Client, *, compact_resource_runs: bool = False):
         self.client = client
+        # 调度器保存整站扫描摘要，无变化资源无需另写逐条流水。
+        self.compact_resource_runs = compact_resource_runs
 
     async def close(self) -> None:
         await self.client.close()
@@ -311,6 +313,10 @@ class CloudflareD1MetadataStore:
                         WHERE scan.created_at < ?
                           AND scan.comparability_status NOT IN (
                             'resource_set_changed', 'possible_migration'
+                          )
+                          AND NOT EXISTS (
+                            SELECT 1 FROM sitemap_site_scans dependent
+                            WHERE dependent.baseline_scan_id = scan.id
                           )
                           AND NOT EXISTS (
                             SELECT 1
@@ -794,7 +800,7 @@ class CloudflareD1MetadataStore:
             (
                 """
                 UPDATE sitemap_sites
-                SET next_check_at = ?, last_attempt_at = ?, last_success_at = ?,
+                SET next_check_at = ?, last_checked_at = ?, last_attempt_at = ?, last_success_at = ?,
                     error_streak = 0, dispatch_lease_owner = NULL,
                     dispatch_lease_token = NULL,
                     dispatch_lease_expires_at = NULL,
@@ -810,6 +816,7 @@ class CloudflareD1MetadataStore:
                 """,
                 [
                     next_check_at_ms,
+                    finished_at_ms,
                     finished_at_ms,
                     finished_at_ms,
                     int(bool(comparability and comparability.promote_semantic_baseline)),
@@ -845,7 +852,7 @@ class CloudflareD1MetadataStore:
         if dead:
             site_sql = """
                 UPDATE sitemap_sites
-                SET next_check_at = ?, last_attempt_at = ?,
+                SET next_check_at = ?, last_checked_at = ?, last_attempt_at = ?,
                     error_streak = MAX(
                         error_streak,
                         COALESCE((
@@ -864,6 +871,7 @@ class CloudflareD1MetadataStore:
             site_params: list[object] = [
                 next_check_at_ms,
                 finished_at_ms,
+                finished_at_ms,
                 job.job_id,
                 finished_at_ms,
                 job.site_id,
@@ -874,7 +882,7 @@ class CloudflareD1MetadataStore:
         else:
             site_sql = """
                 UPDATE sitemap_sites
-                SET last_attempt_at = ?,
+                SET last_checked_at = ?, last_attempt_at = ?,
                     dispatch_lease_expires_at = ?, updated_at = ?
                 WHERE id = ? AND schedule_version = ?
                   AND EXISTS (
@@ -883,6 +891,7 @@ class CloudflareD1MetadataStore:
                   )
             """
             site_params = [
+                finished_at_ms,
                 finished_at_ms,
                 available_at_ms,
                 finished_at_ms,
@@ -965,8 +974,26 @@ class CloudflareD1MetadataStore:
         checked_at_ms: int,
         changed: bool,
     ) -> None:
-        await self.client.batch(
-            [
+        if self.compact_resource_runs and not changed:
+            # 既有资源只更新非索引状态列；父节点变化或首次采集仍走完整写入。
+            refreshed = await self.client.query(
+                """
+                UPDATE sitemap_resources
+                SET canonical_fetch_url = ?, type = ?, etag = ?, http_last_modified = ?,
+                    content_hash = ?, urlset_hash = ?, metadata_hash = ?, url_count = ?,
+                    current_state_key = ?, last_checked_at = ?, missing_streak = 0,
+                    error_streak = 0, updated_at = ?
+                WHERE id = ? AND site_id = ? AND (? IS NULL OR parent_id IS ?)
+                RETURNING id
+                """,
+                [canonical_fetch_url, state.sitemap_kind, state.etag, state.last_modified,
+                 state.content_hash, state.urlset_hash, state.metadata_hash, state.url_count,
+                 state.current_state_key, checked_at_ms, checked_at_ms,
+                 state.resource_id, site_id, parent_id, parent_id],
+            )
+            if refreshed.get("results"):
+                return
+        statements = [
                 (
                     """
                     INSERT INTO sitemap_resources (
@@ -1028,7 +1055,9 @@ class CloudflareD1MetadataStore:
                     [checked_at_ms, int(changed), checked_at_ms, checked_at_ms, site_id],
                 ),
             ]
-        )
+        if self.compact_resource_runs and not changed:
+            statements = statements[:1]
+        await self.client.batch(statements)
 
     async def mark_not_modified(
         self,
@@ -1040,8 +1069,7 @@ class CloudflareD1MetadataStore:
         etag: str | None,
         last_modified: str | None,
     ) -> None:
-        await self.client.batch(
-            [
+        statements = [
                 (
                     """
                     UPDATE sitemap_resources
@@ -1070,7 +1098,9 @@ class CloudflareD1MetadataStore:
                     [checked_at_ms, checked_at_ms, site_id],
                 ),
             ]
-        )
+        if self.compact_resource_runs:
+            statements = statements[:1]
+        await self.client.batch(statements)
 
     async def mark_failure(
         self,
@@ -1083,8 +1113,7 @@ class CloudflareD1MetadataStore:
         checked_at_ms: int,
         missing: bool,
     ) -> None:
-        await self.client.batch(
-            [
+        statements = [
                 (
                     """
                     INSERT INTO sitemap_resources (
@@ -1124,7 +1153,9 @@ class CloudflareD1MetadataStore:
                     [checked_at_ms, checked_at_ms, site_id],
                 ),
             ]
-        )
+        if self.compact_resource_runs:
+            statements = statements[:1]
+        await self.client.batch(statements)
 
     async def record_run(
         self,
@@ -1136,6 +1167,9 @@ class CloudflareD1MetadataStore:
         started_at_ms: int,
         site_scan_id: str | None = None,
     ) -> None:
+        if (self.compact_resource_runs and site_scan_id is not None
+                and outcome.result in {"not_modified", "semantic_unchanged"}):
+            return
         await self.client.query(
             """
             INSERT INTO sitemap_runs (

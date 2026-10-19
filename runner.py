@@ -6,6 +6,7 @@ import hmac
 import html
 import ipaddress
 import json
+import math
 import os
 import random
 import re
@@ -26,25 +27,12 @@ from urllib.parse import quote, urljoin, urlsplit
 import httpx
 from curl_cffi.requests import AsyncSession as CurlAsyncSession
 from dotenv import load_dotenv
+from report_exports import export_ready_reports, shift_month
+from market_snapshot_refresh import refresh_completed_market_snapshot
+from search_demand_refresh import refresh_completed_search_demand
 from anti_bot_signatures import detect_anti_bot_page
-from pricing.allowances import (
-    extract_fixed_allowance_quotes,
-    merge_evidenced_rule_features,
-    normalize_plan_feature,
-    retain_evidenced_plan_features,
-)
-from pricing.auto_approval import (
-    evaluate_strict_auto_approval,
-    has_fixed_ai_allowance,
-    has_metered_usage_charge,
-    pricing_payloads_agree,
-)
-from pricing.bundle import PricingSnapshotBundle, build_pricing_snapshot_bundle
-from pricing.claim_states import ClaimState, assert_claim_invariants
-from pricing.feature_flags import assert_safe_pricing_claim_flags
-from pricing.normalize import normalize_raw_claim
-from pricing.snapshot import SnapshotCapturePlan, plan_snapshot_capture
-from pricing.validate import validate_raw_claim
+from taxonomy_precision import MIN_AUTO_PRIMARY_CONFIDENCE
+from taxonomy_schema import strict_json_schema
 
 try:
     from fake_useragent import UserAgent
@@ -65,9 +53,9 @@ TRAFFIC_METRICS_SCHEMA_VERSION = 2
 ASSET_SOURCE = "site_scraper"
 ASSET_DB_STORAGE_BUCKET = "sitesimgs"
 DEFAULT_R2_BUCKET = "sitesimgs"
-ASSET_REQUIREMENT_ORDER = ("content_safety", "screenshot", "favicon", "description", "key_features")
+ASSET_REQUIREMENT_ORDER = ("content_safety", "screenshot", "favicon", "description")
 AUTO_APPROVE_TOOL_NAME_CONFIDENCE = 85
-CATALOG_AUTO_PUBLISH_POLICY_VERSION = "catalog-auto-publish-v1"
+CATALOG_AUTO_PUBLISH_POLICY_VERSION = "catalog-auto-publish-v2"
 CATALOG_AUTO_PUBLISH_MAX_LIMIT = 100
 REVIEW_TOOL_NAME_CONFIDENCE = 60
 ASSET_DEAD_LETTER_REVIVE_HOURS = 24
@@ -84,130 +72,14 @@ AHREFS_DEFAULT_REQUESTS_PER_MINUTE = 60
 AHREFS_MAX_REQUESTS_PER_MINUTE = 60
 IANA_RDAP_DNS = "https://data.iana.org/rdap/dns.json"
 RDAP_USER_AGENT = "traffic-runner-domain-whois/0.1"
-PRICING_EXTRACTOR_VERSION = "python-rule-pricing-v1"
-OPENAI_PRICING_EXTRACTOR_VERSION = "openai-structured-pricing-v1"
-OPENAI_API_BASE = "https://api.openai.com/v1"
-DEFAULT_OPENAI_PRICING_MODEL = "gpt-5.6-luna"
-DEFAULT_OPENAI_PRICING_FALLBACK_MODEL = ""
-OPENAI_PRICING_MIN_CONFIDENCE = 60
-DEFAULT_OPENAI_PRICING_TEXT_CHARS = 24000
-PRICING_CLAIMS_V2_REPLAY_MARKER = "pricing_claims_v2_replayed"
-PRICING_CLAIMS_V2_REPLAY_RUNNING_MARKER = "pricing_claims_v2_replay_running"
-BROWSER_RENDERING_TEXT_SCORE_THRESHOLD = 8
-PRICING_USER_AGENT = (
+BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"
 )
-_PRICING_UA_GENERATOR: Any | None = None
-MAX_PRICING_HTML_BYTES = 1_200_000
-MAX_PRICING_TEXT_CHARS = 180_000
+_BROWSER_UA_GENERATOR: Any | None = None
 MAX_HOMEPAGE_HTML_BYTES = 1_200_000
 HOMEPAGE_MAX_REDIRECTS = 8
 HOMEPAGE_BROWSER_6000_RETRY_DELAY_SECONDS = 6 * 60 * 60
-COMMON_PRICING_PATHS = (
-    "/pricing",
-    "/pricing/",
-    "/plans",
-    "/plans/",
-    "/subscribe",
-    "/subscribe/",
-    "/subscription",
-    "/subscription/",
-    "/subscriptions",
-    "/subscriptions/",
-    "/upgrade",
-    "/upgrade/",
-    "/pricing-page",
-    "/pricing-plans",
-    "/plans-pricing",
-    "/billing",
-)
-COMMON_CONTACT_SALES_PATHS = (
-    "/contact-sales",
-    "/book-a-demo",
-    "/book-a-demo-call",
-    "/request-demo",
-    "/demo",
-    "/contact",
-    "/contact-us",
-    "/enterprise",
-)
-BAD_PRICING_PATH_PARTS = {
-    "article",
-    "articles",
-    "blog",
-    "buy",
-    "cart",
-    "careers",
-    "case-study",
-    "case-studies",
-    "community",
-    "docs",
-    "guide",
-    "help",
-    "help-center",
-    "issues",
-    "legal",
-    "news",
-    "policy",
-    "privacy",
-    "privacy-policy",
-    "resources",
-    "release-note",
-    "release-notes",
-    "refund",
-    "search",
-    "shop",
-    "store",
-    "support",
-    "terms",
-    "terms-of-use",
-}
-PRICING_PATH_PARTS = {
-    "pricing",
-    "prices",
-    "plans",
-    "pricing-plans",
-    "plans-pricing",
-    "billing",
-    "subscribe",
-    "subscription",
-    "subscriptions",
-    "upgrade",
-}
-CONTACT_SALES_PATH_PARTS = {
-    "book-a-demo",
-    "book-a-demo-call",
-    "contact-sales",
-    "request-demo",
-    "schedule-demo",
-    "demo",
-    "contact",
-    "contact-us",
-    "enterprise",
-    "sales",
-}
-PRICING_PLAN_NAMES = (
-    "Free",
-    "Basic",
-    "Starter",
-    "Lite",
-    "Plus",
-    "Pro",
-    "Professional",
-    "Premium",
-    "Creator",
-    "Team",
-    "Business",
-    "Growth",
-    "Scale",
-    "Enterprise",
-)
-PRICE_RE = re.compile(
-    r"(?:(?P<currency1>US\$|\$|₹|USD|EUR|GBP|INR)\s*(?P<amount1>\d{1,7}(?:,\d{2,3})*(?:\.\d{1,4})?)|"
-    r"(?P<amount2>\d{1,7}(?:,\d{2,3})*(?:\.\d{1,4})?)\s*(?P<currency2>USD|EUR|GBP|INR))",
-    re.I,
-)
 COMMON_THREE_LABEL_SUFFIXES = {
     "co.uk",
     "com.au",
@@ -240,7 +112,6 @@ class Config:
     traffic_concurrency: int
     asset_concurrency: int
     domain_state_concurrency: int
-    pricing_concurrency: int
     max_retries: int
     poll_interval_seconds: int
     traffic_release_probe_domain: str
@@ -255,10 +126,6 @@ class Config:
     domain_state_limit: int
     domain_state_max_age_days: int
     domain_state_poll_interval_seconds: int
-    pricing_monitor_enabled: bool
-    pricing_limit: int
-    pricing_manual_review_replay_limit: int
-    pricing_timeout_seconds: int
     taxonomy_auto_enabled: bool
     taxonomy_recheck_auto_non_product: bool
     taxonomy_capabilities_enabled: bool
@@ -284,15 +151,7 @@ class Config:
     taxonomy_batch_retry_base_seconds: int
     taxonomy_batch_leaf_min_confidence: float
     taxonomy_batch_l1_min_gap: float
-    pricing_claims_shadow: bool
-    pricing_claims_publish: bool
-    pricing_strict_auto_publish_enabled: bool
-    pricing_strict_auto_publish_min_confidence: int
     openai_api_key: str
-    openai_pricing_model: str
-    openai_pricing_fallback_model: str
-    openai_pricing_timeout_seconds: int
-    openai_pricing_text_chars: int
     browser_rendering_api_token: str
     browser_rendering_enabled: bool
     browser_rendering_timeout_seconds: int
@@ -310,6 +169,11 @@ class Config:
     runner_version: str
     runner_service_name: str
     runner_workloads: tuple[str, ...]
+    jev_api_key: str = ""
+    taxonomy_capability_provider: str = "openai"
+    jev_min_confidence: float = 0.85
+    jev_timeout_seconds: int = 8
+    jev_capability_limit: int = 6
 
 
 @dataclass(frozen=True)
@@ -343,42 +207,6 @@ class DomainStateTask:
     lease_token: str
     fetch_domain_rating: bool
     fetch_rdap: bool
-
-
-@dataclass(frozen=True)
-class PricingTask:
-    task_id: int
-    pricing_source_id: int
-    tool_id: int
-    canonical_slug: str
-    source_url: str
-    official_url: str
-    attempts: int
-    max_attempts: int
-    generation: int
-    lease_token: str
-    is_manual_review_replay: bool = False
-
-
-@dataclass(frozen=True)
-class PricingSourceCandidate:
-    tool_id: int
-    canonical_slug: str
-    official_url: str
-
-
-@dataclass(frozen=True)
-class ReviewedPricingExtraction:
-    extraction_id: int
-    pricing_task_id: int
-    pricing_source_id: int
-    tool_id: int
-    canonical_slug: str
-    source_url: str
-    final_url: str
-    http_status: int
-    content_type: str
-    payload: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -563,18 +391,6 @@ class FaviconAsset:
     mime_type: str
 
 
-@dataclass(frozen=True)
-class PricingFetchResult:
-    url: str
-    final_url: str
-    status: int
-    content_type: str
-    html: str
-    error: str = ""
-    page_status: str = "found"
-    discovery_method: str = "source_url"
-
-
 def read_int_env(name: str, fallback: int) -> int:
     value = os.getenv(name)
     if not value:
@@ -738,7 +554,6 @@ def d1_request_metadata(body: dict[str, Any], operation: str | None = None) -> d
     }
 
 
-
 def load_config(require_brightdata: bool = True) -> Config:
     load_dotenv()
     shared_concurrency = max(1, read_int_env("RUNNER_CONCURRENCY", 5))
@@ -772,9 +587,6 @@ def load_config(require_brightdata: bool = True) -> Config:
         domain_state_concurrency=max(
             1, read_int_env("RUNNER_DOMAIN_CONCURRENCY", shared_concurrency)
         ),
-        pricing_concurrency=max(
-            1, read_int_env("RUNNER_PRICING_CONCURRENCY", shared_concurrency)
-        ),
         max_retries=read_int_env("RUNNER_MAX_RETRIES", 2),
         poll_interval_seconds=read_int_env("RUNNER_POLL_INTERVAL_SECONDS", 300),
         traffic_release_probe_domain=normalize_domain(os.getenv("TRAFFIC_RELEASE_PROBE_DOMAIN", "chatgpt.com")) or "chatgpt.com",
@@ -802,13 +614,11 @@ def load_config(require_brightdata: bool = True) -> Config:
         domain_state_poll_interval_seconds=max(
             1, read_int_env("RUNNER_DOMAIN_POLL_INTERVAL_SECONDS", 1)
         ),
-        pricing_monitor_enabled=read_bool_env("PRICING_MONITOR_ENABLED", False),
-        pricing_limit=read_int_env("RUNNER_PRICING_LIMIT", 20),
-        pricing_manual_review_replay_limit=max(
-            0,
-            read_int_env("RUNNER_PRICING_MANUAL_REVIEW_REPLAY_LIMIT", 5),
-        ),
-        pricing_timeout_seconds=read_int_env("RUNNER_PRICING_TIMEOUT_SECONDS", 20),
+        jev_api_key=(os.getenv("JEV_API_KEY") or os.getenv("jev_api_key") or os.getenv("TYPESAFE_API_KEY") or "").strip(),
+        taxonomy_capability_provider=os.getenv("TAXONOMY_CAPABILITY_PROVIDER", "openai").strip().lower(),
+        jev_min_confidence=min(1.0, max(0.5, read_float_env("JEV_MIN_CONFIDENCE", 0.85))),
+        jev_timeout_seconds=min(10, max(1, read_int_env("JEV_TIMEOUT_SECONDS", 8))),
+        jev_capability_limit=min(10, max(1, read_int_env("JEV_CAPABILITY_LIMIT", 6))),
         taxonomy_auto_enabled=read_bool_env("TAXONOMY_AUTO_ENABLED", True),
         taxonomy_recheck_auto_non_product=read_bool_env(
             "TAXONOMY_RECHECK_AUTO_NON_PRODUCT", False
@@ -832,7 +642,7 @@ def load_config(require_brightdata: bool = True) -> Config:
         ),
         taxonomy_auto_accept_confidence=min(
             1.0,
-            max(0.35, read_float_env("TAXONOMY_AUTO_ACCEPT_CONFIDENCE", 0.5)),
+            max(MIN_AUTO_PRIMARY_CONFIDENCE, read_float_env("TAXONOMY_AUTO_ACCEPT_CONFIDENCE", MIN_AUTO_PRIMARY_CONFIDENCE)),
         ),
         taxonomy_provider_backoff_seconds=max(
             900, read_int_env("RUNNER_TAXONOMY_PROVIDER_BACKOFF_SECONDS", 21600)
@@ -890,23 +700,7 @@ def load_config(require_brightdata: bool = True) -> Config:
             1.0,
             max(0.0, read_float_env("OPENAI_TAXONOMY_L1_MIN_GAP", 0.08)),
         ),
-        pricing_claims_shadow=read_bool_env("PRICING_CLAIMS_SHADOW", False),
-        pricing_claims_publish=read_bool_env("PRICING_CLAIMS_PUBLISH", False),
-        pricing_strict_auto_publish_enabled=read_bool_env(
-            "PRICING_STRICT_AUTO_PUBLISH_ENABLED", False
-        ),
-        pricing_strict_auto_publish_min_confidence=min(
-            100,
-            max(
-                80,
-                read_int_env("PRICING_STRICT_AUTO_PUBLISH_MIN_CONFIDENCE", 82),
-            ),
-        ),
         openai_api_key=os.getenv("OPENAI_API_KEY") or os.getenv("OPENAI_API", ""),
-        openai_pricing_model=os.getenv("OPENAI_PRICING_MODEL", DEFAULT_OPENAI_PRICING_MODEL),
-        openai_pricing_fallback_model=os.getenv("OPENAI_PRICING_FALLBACK_MODEL", DEFAULT_OPENAI_PRICING_FALLBACK_MODEL),
-        openai_pricing_timeout_seconds=read_int_env("OPENAI_PRICING_TIMEOUT_SECONDS", 45),
-        openai_pricing_text_chars=read_int_env("OPENAI_PRICING_TEXT_CHARS", DEFAULT_OPENAI_PRICING_TEXT_CHARS),
         browser_rendering_api_token=os.getenv("CLOUDFLARE_BROWSER_RENDERING_API_TOKEN") or os.environ["CLOUDFLARE_API_TOKEN"],
         browser_rendering_enabled=read_bool_env("CLOUDFLARE_BROWSER_RENDERING_ENABLED", False),
         browser_rendering_timeout_seconds=read_int_env("CLOUDFLARE_BROWSER_RENDERING_TIMEOUT_SECONDS", 45),
@@ -1014,220 +808,15 @@ def iso_delta(**kwargs: Any) -> str:
     return (datetime.now(timezone.utc) + timedelta(**kwargs)).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-class PricingHtmlParser(HTMLParser):
-    def __init__(self) -> None:
-        super().__init__()
-        self.text_parts: list[str] = []
-        self.links: list[str] = []
-        self.jsonld_scripts: list[str] = []
-        self._ignore_depth = 0
-        self._jsonld_depth = 0
-        self._jsonld_parts: list[str] = []
-
-    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        tag = tag.lower()
-        attr = {name.lower(): value or "" for name, value in attrs}
-        if tag == "script":
-            if attr.get("type", "").lower() == "application/ld+json":
-                self._jsonld_depth += 1
-                self._jsonld_parts = []
-            else:
-                self._ignore_depth += 1
-            return
-        if tag in {"style", "noscript", "svg"}:
-            self._ignore_depth += 1
-            return
-        if tag == "a" and attr.get("href"):
-            self.links.append(attr["href"])
-        if tag in {"br", "p", "div", "li", "tr", "td", "th", "section", "article", "h1", "h2", "h3", "h4"}:
-            self.text_parts.append("\n")
-
-    def handle_endtag(self, tag: str) -> None:
-        tag = tag.lower()
-        if tag == "script" and self._jsonld_depth:
-            self._jsonld_depth -= 1
-            script = "".join(self._jsonld_parts).strip()
-            if script:
-                self.jsonld_scripts.append(script)
-            self._jsonld_parts = []
-            return
-        if tag in {"script", "style", "noscript", "svg"} and self._ignore_depth:
-            self._ignore_depth -= 1
-            return
-        if tag in {"p", "div", "li", "tr", "section", "article", "h1", "h2", "h3", "h4"}:
-            self.text_parts.append("\n")
-
-    def handle_data(self, data: str) -> None:
-        if self._jsonld_depth:
-            self._jsonld_parts.append(data)
-        elif not self._ignore_depth:
-            self.text_parts.append(data)
-
-    @property
-    def text(self) -> str:
-        lines = []
-        for line in html.unescape("".join(self.text_parts)).splitlines():
-            cleaned = re.sub(r"\s+", " ", line).strip()
-            if cleaned:
-                lines.append(cleaned)
-        return "\n".join(lines)[:MAX_PRICING_TEXT_CHARS]
-
-
 def sha256_text(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="replace")).hexdigest()
 
 
-def normalize_pricing_url(value: str) -> str:
-    parsed = urlsplit(value if "://" in value else f"https://{value}")
-    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-        raise ValueError(f"invalid URL: {value}")
-    return parsed.geturl()
-
-
-def pricing_url_origin(value: str) -> str:
-    parsed = urlsplit(normalize_pricing_url(value))
-    return f"{parsed.scheme}://{parsed.netloc}"
-
-
-def is_bad_pricing_url(value: str) -> bool:
-    parsed = urlsplit(value)
-    parts = {part.lower() for part in parsed.path.split("/") if part}
-    if parts & BAD_PRICING_PATH_PARTS:
-        return True
-    if any(part.endswith("-policy") or part.endswith("-terms") for part in parts):
-        return True
-    return any(part.startswith("api-") or part.endswith("-api") for part in parts)
-
-
-def is_pricing_path_part(part: str) -> bool:
-    normalized = part.lower()
-    return (
-        normalized in PRICING_PATH_PARTS
-        or "pricing" in normalized
-        or normalized in {"price", "plans", "billing", "upgrade"}
-    )
-
-
-def is_pricing_fragment(fragment: str) -> bool:
-    normalized = fragment.lower().strip()
-    return normalized in {"pricing", "plans", "price", "billing", "subscribe", "subscription"} or "pricing" in normalized
-
-
-def is_strict_pricing_url(value: str) -> bool:
-    parsed = urlsplit(value)
-    parts = {part.lower() for part in parsed.path.split("/") if part}
-    if is_bad_pricing_url(value):
-        return False
-    if is_pricing_fragment(parsed.fragment):
-        return True
-    if not parts:
-        return False
-    return any(is_pricing_path_part(part) for part in parts)
-
-
-def is_contact_sales_url(value: str) -> bool:
-    parsed = urlsplit(value)
-    parts = {part.lower() for part in parsed.path.split("/") if part}
-    if not parts or is_bad_pricing_url(value):
-        return False
-    return bool(parts & CONTACT_SALES_PATH_PARTS)
-
-
-def pricing_url_score(value: str) -> int:
-    try:
-        parsed = urlsplit(value)
-    except ValueError:
-        return -1000
-    parts = [part.lower() for part in parsed.path.split("/") if part]
-    if not parts:
-        return 75 if is_pricing_fragment(parsed.fragment) else -50
-    if is_bad_pricing_url(value):
-        return -200
-
-    score = 0
-    depth = len(parts)
-    if depth == 1:
-        score += 35
-    elif depth == 2:
-        score += 20
-    elif depth >= 4:
-        score -= 25
-
-    for part in parts:
-        if part in {"pricing", "pricing-page", "pricing-plans", "plans-pricing"}:
-            score += 100
-        elif "pricing" in part:
-            score += 85
-        elif part in {"plans", "billing", "upgrade", "subscribe", "subscription", "subscriptions"}:
-            score += 55
-        elif part in {"enterprise", "contact-sales", "contact"}:
-            score -= 20
-
-    if is_pricing_fragment(parsed.fragment):
-        score += 75
-    if parsed.query:
-        score -= 5
-    return score
-
-
-def contact_sales_url_score(value: str) -> int:
-    if not is_contact_sales_url(value):
-        return -1000
-    parsed = urlsplit(value)
-    parts = [part.lower() for part in parsed.path.split("/") if part]
-    score = 0
-    for part in parts:
-        if part in {"contact-sales", "book-a-demo", "book-a-demo-call", "request-demo", "schedule-demo"}:
-            score += 90
-        elif part == "demo":
-            score += 70
-        elif part in {"enterprise", "sales"}:
-            score += 55
-        elif part in {"contact", "contact-us"}:
-            score += 35
-    score -= max(0, len(parts) - 2) * 10
-    return score
-
-
-def source_context_parts(source_url: str) -> set[str]:
-    generic = PRICING_PATH_PARTS | {"feature", "features", "product", "products", "en", "us", "www"}
+def browser_request_headers(url: str) -> dict[str, str]:
+    parsed = urlsplit(url)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
     return {
-        part
-        for part in (segment.lower() for segment in urlsplit(source_url).path.split("/") if segment)
-        if part not in generic and len(part) > 2
-    }
-
-
-def final_url_matches_source_context(source_url: str, final_url: str) -> bool:
-    required_parts = source_context_parts(source_url)
-    if not required_parts:
-        return True
-    final_parts = {part.lower() for part in urlsplit(final_url).path.split("/") if part}
-    return required_parts.issubset(final_parts)
-
-
-def random_pricing_user_agent() -> str:
-    global _PRICING_UA_GENERATOR
-    if UserAgent is not None:
-        try:
-            if _PRICING_UA_GENERATOR is None:
-                _PRICING_UA_GENERATOR = UserAgent(
-                    browsers=["Chrome", "Edge"],
-                    platforms=["desktop"],
-                    fallback=PRICING_USER_AGENT,
-                )
-            user_agent = _PRICING_UA_GENERATOR.random
-            if user_agent:
-                return str(user_agent)
-        except Exception:
-            pass
-    return PRICING_USER_AGENT
-
-
-def pricing_request_headers(url: str) -> dict[str, str]:
-    origin = pricing_url_origin(url)
-    return {
-        "User-Agent": random_pricing_user_agent(),
+        "User-Agent": random_browser_user_agent(),
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
         "Cache-Control": "no-cache",
@@ -1239,6 +828,25 @@ def pricing_request_headers(url: str) -> dict[str, str]:
         "Sec-Fetch-Site": "same-origin",
         "Sec-Fetch-User": "?1",
     }
+
+
+
+def random_browser_user_agent() -> str:
+    global _BROWSER_UA_GENERATOR
+    if UserAgent is not None:
+        try:
+            if _BROWSER_UA_GENERATOR is None:
+                _BROWSER_UA_GENERATOR = UserAgent(
+                    browsers=["Chrome", "Edge"],
+                    platforms=["desktop"],
+                    fallback=BROWSER_USER_AGENT,
+                )
+            user_agent = _BROWSER_UA_GENERATOR.random
+            if user_agent:
+                return str(user_agent)
+        except Exception:
+            pass
+    return BROWSER_USER_AGENT
 
 
 def asset_page_url(task: AssetTask) -> str:
@@ -1364,9 +972,15 @@ def build_browser_response_format(
         return {"type": "json_object"}
 
     schema_name = re.sub(r"[^a-z0-9_]+", "_", (stage or "extraction").lower()).strip("_")[:64] or "extraction"
-    # If caller already passed an OpenAI envelope, keep it.
+    # OpenAI strict mode also requires every nested property to be required.
+    # Preserve caller input: the same schema may be reused by another provider.
     if isinstance(json_schema, dict) and isinstance(json_schema.get("schema"), dict) and "name" in json_schema:
-        return {"type": "json_schema", "json_schema": json_schema}
+        envelope = dict(json_schema)
+        if model_id.startswith("openai/") and envelope.get("strict", False):
+            envelope["schema"] = strict_json_schema(envelope["schema"])
+        return {"type": "json_schema", "json_schema": envelope}
+    if model_id.startswith("openai/"):
+        json_schema = strict_json_schema(json_schema)
 
     return {
         "type": "json_schema",
@@ -1594,20 +1208,6 @@ def deterministic_fallback_description(
     return f"{name} is an AI product available from {task.normalized_domain}."[:500]
 
 
-def pricing_claims_v2_replay_error(error: str | None, claims_count: int) -> str:
-    detail = (error or "manual review").strip() or "manual review"
-    return f"{PRICING_CLAIMS_V2_REPLAY_MARKER}:claims={max(0, claims_count)}; {detail}"[:900]
-
-
-def pricing_claims_v2_replay_detail(error: str | None) -> str | None:
-    value = (error or "").strip()
-    marker_prefix = f"{PRICING_CLAIMS_V2_REPLAY_MARKER}:"
-    if not value.startswith(marker_prefix):
-        return value or None
-    _, separator, detail = value.partition("; ")
-    return detail.strip() if separator and detail.strip() else None
-
-
 def deterministic_fallback_key_features(
     product_name: str,
     description: str,
@@ -1668,7 +1268,7 @@ _ERROR_TITLE_RE = re.compile(
 )
 _GENERIC_PAGE_NAME_RE = re.compile(r"^(?:home|homepage|welcome|index|default\s+page)$", re.I)
 _MARKETING_PAGE_NAME_RE = re.compile(r"^(?:best|free|online|official)\b", re.I)
-_TITLE_SEPARATOR_RE = re.compile(r"\s+(?:\||[–—·])\s+|\s+-\s+|:\s+")
+_TITLE_SEPARATOR_RE = re.compile(r"\s*[|｜–—]\s*|\s+[·-]\s+|[:：]\s+")
 
 
 _HOMEPAGE_EXCLUDED_TAGS = {
@@ -1928,18 +1528,23 @@ def invalid_tool_name_reason(value: Any) -> str:
         return "access_denied_name"
     if _ERROR_TITLE_RE.search(name):
         return "error_page_name"
-    if _GENERIC_PAGE_NAME_RE.fullmatch(name):
+    if _GENERIC_PAGE_NAME_RE.fullmatch(name) or re.fullmatch(r"sign\s*in|log\s*in|pricing|contact|about(?:\s+us)?", name, re.I):
         return "generic_page_name"
     if len(name) > 80:
         return "name_too_long"
-    if "|" in name or re.search(r"\s[–—]\s", name):
+    if _TITLE_SEPARATOR_RE.search(name):
         return "unsplit_page_title"
     if _MARKETING_PAGE_NAME_RE.search(name) and len(name.split()) >= 4:
         return "marketing_page_title"
+    if re.search(r"^\d+[+%]?\s", name) and len(name.split()) >= 4:
+        return "marketing_page_title"
+    if len(name.split()) > 8:
+        return "name_too_many_words"
     return ""
 
 
-def _json_ld_product_names(html_body: str) -> list[str]:
+def _json_ld_product_names(html_body: str, hostname: str = "") -> list[str]:
+    html_body = re.sub(r"<!--[\s\S]*?-->", " ", html_body or "")
     names: list[str] = []
     accepted_types = {
         "product",
@@ -1947,6 +1552,7 @@ def _json_ld_product_names(html_body: str) -> list[str]:
         "webapplication",
         "mobileapplication",
         "webapp",
+        "website",
     }
 
     def visit(value: Any) -> None:
@@ -1959,11 +1565,18 @@ def _json_ld_product_names(html_body: str) -> list[str]:
         raw_type = value.get("@type")
         types = raw_type if isinstance(raw_type, list) else [raw_type]
         normalized_types = {str(item or "").replace(" ", "").lower() for item in types}
-        if normalized_types & accepted_types:
+        same_site = True
+        if hostname and value.get("url"):
+            try:
+                candidate_host = urlsplit(urljoin(f"https://{hostname}", str(value["url"]))).hostname or ""
+                same_site = candidate_host.lower().removeprefix("www.") == hostname.lower().removeprefix("www.")
+            except ValueError:
+                same_site = False
+        if same_site and normalized_types & accepted_types:
             name = clean_asset_text(value.get("name"), 120)
             if name:
                 names.append(name)
-        for key in ("@graph", "mainEntity", "itemListElement"):
+        for key in ("@graph", "mainEntity"):
             if key in value:
                 visit(value[key])
 
@@ -1973,7 +1586,7 @@ def _json_ld_product_names(html_body: str) -> list[str]:
         re.I,
     ):
         try:
-            visit(json.loads(html.unescape(match.group(1)).strip()))
+            visit(json.loads(match.group(1).strip()))
         except (TypeError, ValueError, json.JSONDecodeError):
             continue
     return list(dict.fromkeys(names))
@@ -1985,13 +1598,14 @@ def _domain_brand_label(hostname: str) -> str:
 
 
 def _compact_name(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", value.lower())
+    return "".join(char for char in value.lower() if char.isalnum())
 
 
 def _matches_domain_brand(name: str, hostname: str) -> bool:
     name_key = _compact_name(name)
-    domain_key = _compact_name(_domain_brand_label(hostname))
-    return bool(name_key and domain_key and (domain_key in name_key or name_key in domain_key))
+    host = hostname.lower().removeprefix("www.")
+    domain_key = _compact_name(host.split(".")[0])
+    return len(domain_key) >= 3 and domain_key not in {"app", "api", "docs", "blog"} and name_key in {domain_key, f"{domain_key}ai", _compact_name(host)}
 
 
 def domain_fallback_tool_name(hostname: str) -> str:
@@ -2011,17 +1625,17 @@ def resolve_tool_name(
     model_evidence: Any = "",
 ) -> ToolNameResolution:
     deterministic_page_title = (
-        read_html_meta(html_body, {"og:title", "twitter:title"})
-        or read_html_title(html_body)
+        read_html_title(html_body)
+        or read_html_meta(html_body, {"og:title", "twitter:title"})
     )
     model_title = clean_asset_text(model_page_title, 200)
     if re.search(r"</?(?:title|meta)\b|-->|json-ld.{0,80}hreflang", model_title, re.I):
         model_title = ""
-    page_title = model_title or deterministic_page_title
+    page_title = deterministic_page_title or model_title
     candidates: list[tuple[str, str, int, str]] = []
 
-    for value in _json_ld_product_names(html_body):
-        candidates.append((value, "json_ld_product", 95, "Product/SoftwareApplication.name"))
+    for value in _json_ld_product_names(html_body, hostname):
+        candidates.append((value, "json_ld_product", 95, "Product/SoftwareApplication/WebSite.name"))
 
     application_name = read_html_meta(html_body, {"application-name", "apple-mobile-web-app-title"})
     if application_name:
@@ -2032,7 +1646,7 @@ def resolve_tool_name(
         candidates.append((site_name, "open_graph_site_name", 82, "og:site_name"))
 
     product_name = clean_asset_text(model_product_name, 120)
-    if product_name:
+    if product_name and _compact_name(product_name) in _compact_name(html_body):
         try:
             stated_confidence = max(0, min(100, int(float(model_confidence or 0))))
         except (TypeError, ValueError):
@@ -2040,7 +1654,7 @@ def resolve_tool_name(
         model_score = max(70, min(90, stated_confidence or 78))
         candidates.append((
             product_name,
-            clean_asset_text(model_source, 60) or "model_product_name",
+            "model_product_name",
             model_score,
             clean_asset_text(model_evidence, 240) or "model extraction",
         ))
@@ -2051,10 +1665,8 @@ def resolve_tool_name(
             candidates.append((candidate, "page_title_segment", 72, f"page title: {page_title[:160]}"))
 
     scored: list[tuple[int, str, str, str]] = []
-    for value, source, base_score, evidence in candidates:
-        reason = invalid_tool_name_reason(value)
-        if reason:
-            continue
+    eligible = [item for item in candidates if not invalid_tool_name_reason(item[0])]
+    for value, source, base_score, evidence in eligible:
         score = base_score
         if _matches_domain_brand(value, hostname):
             score += 15
@@ -2062,6 +1674,12 @@ def resolve_tool_name(
             score -= 15
         if len(value.split()) > 8:
             score -= 10
+        origins = {origin for other, origin, _, _ in eligible
+                   if _compact_name(other) == _compact_name(value) and origin != "model_product_name"}
+        if not _matches_domain_brand(value, hostname) and len(origins) < 2:
+            score = min(score, 84)
+        if source == "page_title_segment" and not deterministic_page_title:
+            score = min(score, 84)
         scored.append((max(0, min(100, score)), value, source, evidence))
 
     if scored:
@@ -2072,7 +1690,12 @@ def resolve_tool_name(
         source = "domain_fallback"
         evidence = f"hostname={hostname}"
 
-    if confidence >= AUTO_APPROVE_TOOL_NAME_CONFIDENCE:
+    conflict = any(origin != "page_title_segment" and _compact_name(value) != _compact_name(name)
+                   for value, origin, _, _ in eligible)
+    if conflict:
+        confidence = min(confidence, 84)
+        evidence += "; conflicting name metadata: review required"
+    if confidence >= AUTO_APPROVE_TOOL_NAME_CONFIDENCE and not conflict:
         review_status = "auto_approved"
     elif confidence >= REVIEW_TOOL_NAME_CONFIDENCE:
         review_status = "needs_review"
@@ -2276,895 +1899,6 @@ def asset_public_url(base_url: str, object_key: str) -> str | None:
     return f"{normalized_base}/{encoded_path}"
 
 
-def parse_pricing_html(value: str) -> PricingHtmlParser:
-    parser = PricingHtmlParser()
-    parser.feed(value or "")
-    return parser
-
-
-def pricing_text_quality(text: str) -> int:
-    lower = text.lower()
-    score = 0
-    score += len(re.findall(r"\$\s?\d|usd\s?\d", lower)) * 3
-    score += len(re.findall(r"\bpricing|plans?|monthly|yearly|per month|per user|contact sales|enterprise\b", lower))
-    score -= len(re.findall(r"\bblog|privacy|terms|careers|cookie|shopping|purchase|cart\b", lower)) * 2
-    return score
-
-
-def extract_sitemap_locs(sitemap_body: str) -> list[str]:
-    body = sitemap_body.strip()
-    if not body:
-        return []
-    locs: list[str] = []
-    try:
-        root = ET.fromstring(body)
-        for element in root.iter():
-            if element.tag.endswith("loc") and element.text:
-                locs.append(element.text.strip())
-    except ET.ParseError:
-        locs.extend(match.group(1).strip() for match in re.finditer(r"<loc>\s*([^<]+?)\s*</loc>", body, re.I))
-    return [loc for loc in locs if loc.startswith(("http://", "https://"))]
-
-
-def add_pricing_candidate(urls: list[str], seen: set[str], candidate: str, origin: str) -> None:
-    try:
-        normalized = normalize_pricing_url(candidate)
-    except ValueError:
-        return
-    if urlsplit(normalized).netloc != urlsplit(origin).netloc:
-        return
-    if not is_pricing_fragment(urlsplit(normalized).fragment):
-        normalized = normalized.split("#", 1)[0]
-    key = normalized.rstrip("/")
-    if key in seen:
-        return
-    if not is_strict_pricing_url(normalized):
-        return
-    seen.add(key)
-    urls.append(normalized)
-
-
-def add_contact_sales_candidate(urls: list[str], seen: set[str], candidate: str, origin: str) -> None:
-    try:
-        normalized = normalize_pricing_url(candidate).split("#", 1)[0]
-    except ValueError:
-        return
-    if urlsplit(normalized).netloc != urlsplit(origin).netloc:
-        return
-    key = normalized.rstrip("/")
-    if key in seen or not is_contact_sales_url(normalized):
-        return
-    seen.add(key)
-    urls.append(normalized)
-
-
-def discover_pricing_urls(base_url: str, html_body: str, sitemap_body: str = "") -> list[str]:
-    origin = pricing_url_origin(base_url)
-    parser = parse_pricing_html(html_body)
-    urls: list[str] = []
-    seen: set[str] = set()
-    for href in parser.links:
-        add_pricing_candidate(urls, seen, urljoin(base_url, href), origin)
-    if re.search(r"\bpricing|plans?\b", parser.text, re.I):
-        add_pricing_candidate(urls, seen, urljoin(origin, "/#pricing"), origin)
-    for loc in extract_sitemap_locs(sitemap_body):
-        add_pricing_candidate(urls, seen, loc, origin)
-    for path in COMMON_PRICING_PATHS:
-        add_pricing_candidate(urls, seen, urljoin(origin, path), origin)
-    urls.sort(key=pricing_url_score, reverse=True)
-    return urls[:12]
-
-
-def discover_contact_sales_urls(base_url: str, html_body: str, sitemap_body: str = "") -> list[str]:
-    origin = pricing_url_origin(base_url)
-    parser = parse_pricing_html(html_body)
-    urls: list[str] = []
-    seen: set[str] = set()
-    for href in parser.links:
-        add_contact_sales_candidate(urls, seen, urljoin(base_url, href), origin)
-    for loc in extract_sitemap_locs(sitemap_body):
-        add_contact_sales_candidate(urls, seen, loc, origin)
-    for path in COMMON_CONTACT_SALES_PATHS:
-        add_contact_sales_candidate(urls, seen, urljoin(origin, path), origin)
-    urls.sort(key=contact_sales_url_score, reverse=True)
-    return urls[:8]
-
-
-def read_decimal(value: Any) -> str | None:
-    try:
-        amount = Decimal(str(value).replace(",", "").strip())
-    except (InvalidOperation, ValueError):
-        return None
-    if amount < 0:
-        return None
-    return format(amount.normalize(), "f")
-
-
-def decimal_value(value: Any) -> Decimal:
-    try:
-        return Decimal(str(value or "0").replace(",", "").strip())
-    except (InvalidOperation, ValueError):
-        return Decimal("0")
-
-
-def normalize_currency(value: str | None) -> str:
-    raw = (value or "$").upper().replace("US$", "USD").replace("$", "USD").replace("\u20b9", "INR")
-    if raw in {"USD", "EUR", "GBP", "INR"}:
-        return raw
-    return "USD"
-
-
-def clean_snippet(value: str, limit: int = 180) -> str:
-    cleaned = re.sub(r"\s+", " ", html.unescape(value or "")).strip()
-    return cleaned[:limit].strip()
-
-
-def infer_interval(context: str) -> str | None:
-    lower = context.lower()
-    if re.search(r"/\s*yr\b|per year|yearly|annually|annual|/year|\byr\b", lower):
-        return "yearly"
-    if re.search(r"/\s*mo\b|per month|monthly|/month|\bmo\b", lower):
-        return "monthly"
-    return None
-
-
-def infer_unit(context: str) -> str | None:
-    lower = context.lower()
-    if "per user" in lower or "/user" in lower:
-        return "user"
-    if "per seat" in lower or "/seat" in lower:
-        return "seat"
-    return None
-
-
-def is_polluted_context(context: str) -> bool:
-    lower = context.lower()
-    return has_metered_usage_charge(context) or bool(
-        re.search(
-            r"\b(under|shopping|purchase|cart|invoice|discount|save|coupon|refund|tax|blog|privacy|terms|"
-            r"api pricing|model price)\b",
-            lower,
-        )
-    )
-
-
-def choose_plan_name(context_before_price: str, fallback_index: int) -> str:
-    before = clean_snippet(context_before_price, 220)
-    lower = before.lower()
-    last_name = ""
-    last_pos = -1
-    for name in PRICING_PLAN_NAMES:
-        pos = lower.rfind(name.lower())
-        if pos > last_pos:
-            last_name = name
-            last_pos = pos
-    if last_name:
-        return last_name
-
-    lines = [clean_snippet(line, 80) for line in before.split("\n") if clean_snippet(line, 80)]
-    for line in reversed(lines[-4:]):
-        words = line.split()
-        if 1 <= len(words) <= 4 and not is_polluted_context(line):
-            return line
-    return f"Plan {fallback_index}"
-
-
-def price_sort_key(plan: dict[str, Any]) -> tuple[int, Decimal]:
-    price = (plan.get("prices") or [{}])[0]
-    amount = decimal_value(price.get("amount"))
-    if amount == 0:
-        return (0, amount)
-    if price.get("billing_interval") == "monthly":
-        return (1, amount)
-    if price.get("billing_interval") == "yearly":
-        return (2, amount)
-    return (3, amount)
-
-
-def display_text_has_explicit_price(value: str) -> bool:
-    return bool(PRICE_RE.search(value or ""))
-
-
-def validate_plan_price_integrity(plans: list[dict[str, Any]]) -> list[str]:
-    errors: list[str] = []
-    for plan in plans:
-        name = clean_snippet(str(plan.get("name") or plan.get("source_plan_key") or "Unknown"), 80)
-        prices = list(plan.get("prices") or [])
-        if not prices:
-            errors.append(f"Plan has no price row: {name}")
-            continue
-        for price in prices:
-            display_text = str(price.get("display_text") or "")
-            has_display_price = display_text_has_explicit_price(display_text)
-            amount = price.get("amount")
-            currency = price.get("currency")
-            is_custom_quote = bool(price.get("custom_quote")) or price.get("kind") == "custom_quote"
-            if has_display_price and (amount in (None, "") or not currency):
-                errors.append(f"Explicit price text missing structured amount/currency: {name}")
-            if has_display_price and is_custom_quote:
-                errors.append(f"Explicit price text marked as custom quote: {name}")
-            if not is_custom_quote and amount not in (None, "") and not currency:
-                errors.append(f"Structured price missing currency: {name}")
-    return sorted(set(errors))
-
-
-def comparable_plan_name(value: str) -> str:
-    name = re.sub(r"[^a-z0-9]+", " ", (value or "").lower()).strip()
-    name = re.sub(r"\bplan\b", "", name).strip()
-    return re.sub(r"\s+", " ", name)
-
-
-def public_price_map(plans: list[dict[str, Any]]) -> dict[str, tuple[str, str, str]]:
-    prices: dict[str, tuple[str, str, str]] = {}
-    for plan in plans:
-        name = comparable_plan_name(str(plan.get("name") or plan.get("source_plan_key") or ""))
-        if not name:
-            continue
-        for price in list(plan.get("prices") or [])[:1]:
-            if price.get("custom_quote"):
-                continue
-            amount = read_decimal(price.get("amount"))
-            currency = str(price.get("currency") or "").upper()
-            if amount is not None and currency:
-                prices[name] = (amount, currency, str(plan.get("name") or name))
-    return prices
-
-
-def validate_jsonld_visible_price_conflicts(
-    jsonld_plans: list[dict[str, Any]],
-    visible_plans: list[dict[str, Any]],
-) -> list[str]:
-    errors: list[str] = []
-    jsonld_prices = public_price_map(jsonld_plans)
-    visible_prices = public_price_map(visible_plans)
-    for key, (jsonld_amount, jsonld_currency, display_name) in jsonld_prices.items():
-        visible = visible_prices.get(key)
-        if not visible:
-            continue
-        visible_amount, visible_currency, _ = visible
-        if (jsonld_amount, jsonld_currency) != (visible_amount, visible_currency):
-            errors.append(
-                f"JSON-LD price conflicts with visible text for {display_name}: "
-                f"{jsonld_amount} {jsonld_currency} vs {visible_amount} {visible_currency}"
-            )
-    return errors
-
-
-def should_verify_rule_pricing_with_openai(
-    payload: dict[str, Any],
-    text_score: int,
-    page_status: str,
-) -> tuple[bool, list[str]]:
-    if page_status != "found":
-        return False, []
-    plans = list(payload.get("plans") or [])
-    reasons: list[str] = []
-    if not plans:
-        return True, ["rules_found_no_plans"]
-    names = [str(plan.get("name") or "") for plan in plans]
-    name_counts: dict[str, int] = {}
-    for name in names:
-        key = name.lower().strip()
-        name_counts[key] = name_counts.get(key, 0) + 1
-        if re.fullmatch(r"plan\s+\d+", key):
-            reasons.append("generic_plan_name")
-    if any(count > 1 and name not in {"free", "enterprise"} for name, count in name_counts.items()):
-        reasons.append("duplicate_plan_names")
-    if text_score < 18:
-        reasons.append("low_text_quality")
-
-    currencies = set()
-    for plan in plans:
-        for price in plan.get("prices", []):
-            if price.get("currency"):
-                currencies.add(str(price.get("currency")))
-            display_text = str(price.get("display_text") or "")
-            lower = display_text.lower()
-            if len(display_text) > 140:
-                reasons.append("long_price_context")
-            if re.search(r"\b(raise[sd]?|funding|students?|graduates?|academy|this month only|additional cost|traditional)\b", lower):
-                reasons.append("polluted_price_context")
-            if has_fixed_ai_allowance(display_text):
-                reasons.append("fixed_ai_allowance_present")
-            if "\u20b9" in display_text and price.get("currency") != "INR":
-                reasons.append("currency_mismatch")
-    if len(currencies) > 1:
-        reasons.append("mixed_currencies")
-    return bool(reasons), sorted(set(reasons))
-
-
-def validate_extracted_plan_consistency(plans: list[dict[str, Any]]) -> list[str]:
-    errors: list[str] = []
-    seen_names: dict[str, int] = {}
-    currencies = set()
-    for plan in plans:
-        name = str(plan.get("name") or "").strip().lower()
-        if name:
-            seen_names[name] = seen_names.get(name, 0) + 1
-        for price in plan.get("prices", []):
-            if price.get("currency"):
-                currencies.add(str(price.get("currency")))
-    duplicated_names = {name for name, count in seen_names.items() if count > 1 and name not in {"free", "enterprise", "custom"}}
-    if duplicated_names:
-        errors.append("Duplicate plan names in extracted pricing")
-    if len(currencies) > 1:
-        errors.append("Multiple currencies in extracted pricing")
-    return errors
-
-
-def normalize_pricing_plan(
-    name: str,
-    amount: str | None,
-    currency: str = "USD",
-    context: str = "",
-    index: int = 0,
-) -> dict[str, Any]:
-    kind = "one_time" if re.search(r"one[- ]?time|lifetime", context, re.I) else "recurring"
-    if amount is None:
-        kind = "custom_quote"
-    price = {
-        "kind": kind,
-        "amount": amount,
-        "currency": currency if amount is not None else None,
-        "billing_interval": infer_interval(context) if kind == "recurring" else None,
-        "commitment_interval": None,
-        "unit": infer_unit(context),
-        "custom_quote": amount is None,
-        "starting_at": bool(re.search(r"from|starting", context, re.I)),
-        "display_text": clean_snippet(context, 180),
-    }
-    clean_name = clean_snippet(name, 80) or ("Enterprise" if amount is None else f"Plan {index}")
-    return {
-        "source_plan_key": re.sub(r"[^a-z0-9]+", "_", clean_name.lower()).strip("_")[:80],
-        "name": clean_name,
-        "audience": None,
-        "description": None,
-        "is_enterprise": 1 if re.search(r"enterprise|contact", clean_name, re.I) else 0,
-        "prices": [price],
-        "features": [],
-        "display_order": index,
-    }
-
-
-def collect_jsonld_nodes(value: Any) -> list[dict[str, Any]]:
-    nodes: list[dict[str, Any]] = []
-    if isinstance(value, list):
-        for item in value:
-            nodes.extend(collect_jsonld_nodes(item))
-    elif isinstance(value, dict):
-        nodes.append(value)
-        if "@graph" in value:
-            nodes.extend(collect_jsonld_nodes(value["@graph"]))
-        if "offers" in value:
-            nodes.extend(collect_jsonld_nodes(value["offers"]))
-    return nodes
-
-
-def extract_jsonld_plans(scripts: list[str]) -> list[dict[str, Any]]:
-    plans: list[dict[str, Any]] = []
-    for script in scripts:
-        try:
-            data = json.loads(html.unescape(script))
-        except json.JSONDecodeError:
-            continue
-        for node in collect_jsonld_nodes(data):
-            raw_price = node.get("price") or node.get("lowPrice")
-            if raw_price is None and isinstance(node.get("priceSpecification"), dict):
-                raw_price = node["priceSpecification"].get("price")
-            amount = read_decimal(raw_price)
-            if amount is None:
-                continue
-            name = clean_snippet(str(node.get("name") or node.get("description") or ""), 80) or "Listed plan"
-            currency = normalize_currency(str(node.get("priceCurrency") or "USD"))
-            plans.append(normalize_pricing_plan(name, amount, currency, json.dumps(node, ensure_ascii=False), len(plans)))
-            if len(plans) >= 6:
-                return plans
-    return plans
-
-
-def has_free_plan_signal(text: str) -> bool:
-    lower = re.sub(r"\s+", " ", (text or "").lower())
-    if re.search(r"\bfree\s+(trial|demo|consultation|call|account|signup|sign up|start|download)\b", lower):
-        return False
-    return bool(
-        re.search(r"\bfree\s+(plan|tier|forever)\b|\b(plan|tier)\s+free\b", lower)
-        or re.search(r"\bfree\b.{0,80}\$(?:\s*)0(?:\b|/)", lower)
-        or re.search(r"\$(?:\s*)0(?:\b|/).{0,80}\bfree\b", lower)
-    )
-
-
-def extract_text_plans(text: str) -> list[dict[str, Any]]:
-    plans: list[dict[str, Any]] = []
-    seen: set[tuple[str, str | None, str | None]] = set()
-    price_matches = list(PRICE_RE.finditer(text))
-    for match_index, match in enumerate(price_matches):
-        amount = read_decimal(match.group("amount1") or match.group("amount2"))
-        if amount is None:
-            continue
-        start = max(0, match.start() - 260)
-        end = min(len(text), match.end() + 220)
-        context = text[start:end]
-        if is_polluted_context(context):
-            continue
-        currency = normalize_currency(match.group("currency1") or match.group("currency2"))
-        name = choose_plan_name(text[start:match.start()], len(plans) + 1)
-        plan = normalize_pricing_plan(name, amount, currency, context, len(plans))
-        next_price_start = (
-            price_matches[match_index + 1].start()
-            if match_index + 1 < len(price_matches)
-            else len(text)
-        )
-        allowance_context = text[match.end():min(next_price_start, match.end() + 360)]
-        plan["features"] = extract_fixed_allowance_quotes(allowance_context)
-        price = plan["prices"][0]
-        key = (plan["name"].lower(), price["amount"], price["billing_interval"])
-        if key in seen:
-            continue
-        seen.add(key)
-        plans.append(plan)
-        if len(plans) >= 6:
-            break
-
-    lower = text.lower()
-    if has_free_plan_signal(text) and not any(plan["name"].lower() == "free" for plan in plans):
-        plans.insert(0, normalize_pricing_plan("Free", "0", "USD", "Free", 0))
-    if re.search(r"contact sales|custom pricing|talk to sales", lower) and not any(plan["prices"][0]["custom_quote"] for plan in plans):
-        custom_plan = normalize_pricing_plan("Custom", None, "USD", "Contact sales", len(plans))
-        custom_plan["is_enterprise"] = 1
-        custom_plan["description"] = "No public prices; contact sales or book a demo."
-        custom_plan["prices"][0]["billing_interval"] = "custom"
-        plans.append(custom_plan)
-
-    normalized = sorted(plans[:6], key=price_sort_key)
-    for index, plan in enumerate(normalized):
-        plan["display_order"] = index
-    return normalized
-
-
-def extract_pricing_payload(
-    html_body: str,
-    source_url: str,
-    final_url: str,
-    http_status: int,
-    error: str,
-    page_status: str = "found",
-    discovery_method: str = "source_url",
-) -> tuple[dict[str, Any], str, int, list[str]]:
-    if page_status == "contact_sales":
-        plan = normalize_pricing_plan("Custom", None, "USD", "Book a demo / contact sales", 0)
-        plan["is_enterprise"] = 1
-        plan["description"] = "No public prices; contact sales or book a demo."
-        plan["prices"][0]["billing_interval"] = "custom"
-        plan["prices"][0]["display_text"] = "Book a demo / contact sales"
-        payload = {
-            "plans": [plan],
-            "plan_count": 1,
-            "quality": {
-                "ok": True,
-                "reason": None,
-                "text_score": pricing_text_quality(parse_pricing_html(html_body).text if html_body else ""),
-                "final_url": final_url,
-                "page_status": page_status,
-                "discovery_method": discovery_method,
-            },
-            "extraction_method": "python_rule",
-        }
-        return payload, "approved", 78, []
-
-    if page_status == "not_found":
-        payload = {
-            "plans": [],
-            "plan_count": 0,
-            "quality": {
-                "ok": False,
-                "reason": error or "no credible pricing page found",
-                "text_score": 0,
-                "final_url": final_url,
-                "page_status": page_status,
-                "discovery_method": discovery_method,
-            },
-            "extraction_method": "python_rule",
-        }
-        return payload, "manual_review", 10, [error or "No credible pricing page found"]
-
-    parser = parse_pricing_html(html_body)
-    text = parser.text
-    jsonld_plans = extract_jsonld_plans(parser.jsonld_scripts)
-    text_plans = extract_text_plans(text)
-    plans = jsonld_plans or text_plans
-    validation_errors: list[str] = []
-    if http_status < 200 or http_status >= 400:
-        validation_errors.append(error or f"HTTP {http_status}")
-    if http_status == 200 and not is_strict_pricing_url(final_url):
-        validation_errors.append(f"Final URL is not a strict pricing page: {final_url}")
-    if http_status == 200 and not final_url_matches_source_context(source_url, final_url):
-        validation_errors.append(f"Final URL lost source context: {final_url}")
-    if not plans:
-        validation_errors.append("No public pricing plans found")
-    validation_errors.extend(validate_plan_price_integrity(plans))
-    if jsonld_plans and text_plans:
-        validation_errors.extend(validate_jsonld_visible_price_conflicts(jsonld_plans, text_plans))
-
-    has_paid_or_quote = any(
-        price.get("custom_quote") or decimal_value(price.get("amount")) > 0
-        for plan in plans
-        for price in plan.get("prices", [])
-    )
-    if plans and not has_paid_or_quote and not any(plan["name"].lower() == "free" for plan in plans):
-        validation_errors.append("No paid, free, or custom-quote plan found")
-
-    approved = not validation_errors and bool(plans)
-    confidence = 82 if approved else 45 if plans else 25
-    payload = {
-        "plans": plans,
-        "plan_count": len(plans),
-        "quality": {
-            "ok": approved,
-            "reason": validation_errors[0] if validation_errors else None,
-            "text_score": pricing_text_quality(text),
-            "final_url": final_url,
-            "page_status": page_status,
-            "discovery_method": discovery_method,
-        },
-        "extraction_method": "python_rule",
-    }
-    return payload, "approved" if approved else "manual_review", confidence, validation_errors
-
-
-def derive_final_pipeline_stage(
-    payload: dict[str, Any],
-    review_status: str,
-    extractor_version: str,
-    model_name: str | None,
-    discovery_method: str,
-) -> str:
-    used_browser = "browser_run" in (discovery_method or "")
-    if review_status != "approved":
-        return "browser_run_manual_review" if used_browser else "manual_review"
-    if model_name or extractor_version == OPENAI_PRICING_EXTRACTOR_VERSION or payload.get("extraction_method") == "openai_structured":
-        return "browser_run_openai" if used_browser else "openai"
-    page_status = ((payload.get("quality") or {}).get("page_status") or "").strip()
-    if page_status == "contact_sales":
-        return "contact_sales"
-    return "browser_run_rule" if used_browser else "rule"
-
-
-def openai_pricing_schema() -> dict[str, Any]:
-    price_schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "kind": {"type": "string", "enum": ["recurring", "one_time", "usage", "custom_quote"]},
-            "amount": {"type": ["string", "null"]},
-            "currency": {"type": ["string", "null"]},
-            "billing_interval": {"type": ["string", "null"], "enum": ["monthly", "yearly", "one_time", "usage", "custom", None]},
-            "commitment_interval": {"type": ["string", "null"], "enum": ["monthly", "yearly", "none", None]},
-            "unit": {"type": ["string", "null"]},
-            "custom_quote": {"type": "boolean"},
-            "starting_at": {"type": "boolean"},
-            "display_text": {"type": "string"},
-        },
-        "required": [
-            "kind",
-            "amount",
-            "currency",
-            "billing_interval",
-            "commitment_interval",
-            "unit",
-            "custom_quote",
-            "starting_at",
-            "display_text",
-        ],
-    }
-    plan_schema = {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "source_plan_key": {"type": "string"},
-            "name": {"type": "string"},
-            "audience": {"type": ["string", "null"]},
-            "description": {"type": ["string", "null"]},
-            "is_enterprise": {"type": "boolean"},
-            "display_order": {"type": "integer"},
-            "prices": {"type": "array", "items": price_schema},
-            "features": {"type": "array", "items": {"type": "string"}},
-        },
-        "required": [
-            "source_plan_key",
-            "name",
-            "audience",
-            "description",
-            "is_enterprise",
-            "display_order",
-            "prices",
-            "features",
-        ],
-    }
-    return {
-        "type": "object",
-        "additionalProperties": False,
-        "properties": {
-            "plans": {"type": "array", "items": plan_schema},
-            "confidence": {"type": "integer"},
-            "notes": {"type": "string"},
-        },
-        "required": ["plans", "confidence", "notes"],
-    }
-
-
-def normalize_openai_plan(plan: Any, index: int) -> dict[str, Any] | None:
-    if not isinstance(plan, dict):
-        return None
-    raw_prices = plan.get("prices") if isinstance(plan.get("prices"), list) else []
-    raw_price = raw_prices[0] if raw_prices and isinstance(raw_prices[0], dict) else {}
-    raw_amount = raw_price.get("amount")
-    amount = read_decimal(raw_amount) if raw_amount not in (None, "") else None
-    custom_quote = bool(raw_price.get("custom_quote")) or amount is None or raw_price.get("kind") == "custom_quote"
-    kind = str(raw_price.get("kind") or ("custom_quote" if custom_quote else "recurring"))
-    if kind not in {"recurring", "one_time", "usage", "custom_quote"}:
-        kind = "custom_quote" if custom_quote else "recurring"
-
-    billing_interval = raw_price.get("billing_interval")
-    if billing_interval not in {"monthly", "yearly", "one_time", "usage", "custom", None}:
-        billing_interval = None
-    commitment_interval = raw_price.get("commitment_interval")
-    if commitment_interval not in {"monthly", "yearly", "none", None}:
-        commitment_interval = None
-
-    name = clean_snippet(str(plan.get("name") or ""), 80)
-    if not name:
-        name = "Enterprise" if custom_quote else f"Plan {index + 1}"
-    price = {
-        "kind": kind,
-        "amount": None if custom_quote else amount,
-        "currency": normalize_currency(str(raw_price.get("currency") or "USD")) if not custom_quote else None,
-        "billing_interval": billing_interval,
-        "commitment_interval": None if commitment_interval == "none" else commitment_interval,
-        "unit": clean_snippet(str(raw_price.get("unit") or ""), 40) or None,
-        "custom_quote": custom_quote,
-        "starting_at": bool(raw_price.get("starting_at")),
-        "display_text": clean_snippet(str(raw_price.get("display_text") or ""), 180),
-    }
-    features = [
-        clean_snippet(str(feature), 120)
-        for feature in (plan.get("features") if isinstance(plan.get("features"), list) else [])
-        if clean_snippet(str(feature), 120)
-    ][:12]
-    source_key = clean_snippet(str(plan.get("source_plan_key") or ""), 80)
-    if not source_key:
-        source_key = re.sub(r"[^a-z0-9]+", "_", name.lower()).strip("_")[:80]
-    return {
-        "source_plan_key": source_key,
-        "name": name,
-        "audience": clean_snippet(str(plan.get("audience") or ""), 80) or None,
-        "description": clean_snippet(str(plan.get("description") or ""), 220) or None,
-        "is_enterprise": 1 if bool(plan.get("is_enterprise")) or re.search(r"enterprise|contact", name, re.I) else 0,
-        "prices": [price],
-        "features": features,
-        "display_order": index,
-    }
-
-
-def validate_pricing_plans(
-    plans: list[dict[str, Any]],
-    source_url: str,
-    final_url: str,
-    http_status: int,
-    error: str,
-) -> list[str]:
-    validation_errors: list[str] = []
-    if http_status < 200 or http_status >= 400:
-        validation_errors.append(error or f"HTTP {http_status}")
-    if http_status == 200 and not is_strict_pricing_url(final_url):
-        validation_errors.append(f"Final URL is not a strict pricing page: {final_url}")
-    if http_status == 200 and not final_url_matches_source_context(source_url, final_url):
-        validation_errors.append(f"Final URL lost source context: {final_url}")
-    if not plans:
-        validation_errors.append("No public pricing plans found")
-    validation_errors.extend(validate_plan_price_integrity(plans))
-
-    has_paid_or_quote = any(
-        price.get("custom_quote") or decimal_value(price.get("amount")) > 0
-        for plan in plans
-        for price in plan.get("prices", [])
-    )
-    if plans and not has_paid_or_quote and not any(plan["name"].lower() == "free" for plan in plans):
-        validation_errors.append("No paid, free, or custom-quote plan found")
-    return validation_errors
-
-
-class OpenAIPricingExtractor:
-    def __init__(self, api_key: str, model: str, timeout_seconds: int, text_chars: int):
-        self.api_key = api_key
-        self.model = model
-        self.timeout_seconds = timeout_seconds
-        self.text_chars = text_chars
-
-    async def extract(
-        self,
-        html_body: str,
-        source_url: str,
-        final_url: str,
-        http_status: int,
-        error: str,
-    ) -> tuple[dict[str, Any], str, int, list[str]] | None:
-        if not self.api_key or http_status != 200 or not html_body:
-            return None
-        text = parse_pricing_html(html_body).text[: self.text_chars]
-        if not text.strip():
-            return None
-
-        request_payload = {
-            "model": self.model,
-            "messages": [
-                {
-                    "role": "system",
-                    "content": (
-                        "Extract public SaaS pricing plans from the provided pricing page text. "
-                        "Return only primary public package prices. Ignore discounts, trials, FAQ examples, add-ons, "
-                        "metered API rate tables, and unrelated comparison text unless they are the main package price. "
-                        "Fixed allowances such as included credits, tokens, generations, images, minutes, or API calls "
-                        "are normal plan features: copy their concise visible wording into features and do not classify "
-                        "the package price as usage pricing unless money is charged per usage unit. "
-                        "Use at most six plans. Each plan must keep at most one primary price."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "source_url": source_url,
-                            "final_url": final_url,
-                            "pricing_text": text,
-                        },
-                        ensure_ascii=False,
-                    ),
-                },
-            ],
-            "response_format": {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "pricing_extraction",
-                    "strict": True,
-                    "schema": openai_pricing_schema(),
-                },
-            },
-            "max_completion_tokens": 3000,
-        }
-
-        try:
-            async with httpx.AsyncClient(timeout=float(self.timeout_seconds)) as client:
-                response = await client.post(
-                    f"{OPENAI_API_BASE}/chat/completions",
-                    headers={
-                        "Authorization": f"Bearer {self.api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=request_payload,
-                )
-            response.raise_for_status()
-            data = response.json()
-            message = ((data.get("choices") or [{}])[0].get("message") or {})
-            content = message.get("content")
-            if not content:
-                log_info("pricing.openai.empty_response", model=self.model, final_url=final_url)
-                return None
-            parsed = json.loads(content)
-        except Exception as error_value:
-            log_info("pricing.openai.failed", model=self.model, final_url=final_url, error=str(error_value)[:300])
-            return None
-
-        raw_plans = parsed.get("plans") if isinstance(parsed, dict) else []
-        plans = [
-            normalized
-            for index, raw_plan in enumerate(raw_plans if isinstance(raw_plans, list) else [])
-            if (normalized := normalize_openai_plan(raw_plan, index)) is not None
-        ][:6]
-        feature_evidence = retain_evidenced_plan_features(plans, text)
-        validation_errors = validate_pricing_plans(plans, source_url, final_url, http_status, error)
-        validation_errors.extend(validate_extracted_plan_consistency(plans))
-        try:
-            model_confidence = int(parsed.get("confidence") or 70) if isinstance(parsed, dict) else 70
-        except (TypeError, ValueError):
-            model_confidence = 70
-        if model_confidence < OPENAI_PRICING_MIN_CONFIDENCE:
-            validation_errors.append(f"OpenAI confidence below {OPENAI_PRICING_MIN_CONFIDENCE}: {model_confidence}")
-        approved = not validation_errors and bool(plans)
-        confidence = min(90, max(0, model_confidence)) if approved else min(65, max(20, model_confidence))
-        payload = {
-            "plans": plans,
-            "plan_count": len(plans),
-            "quality": {
-                "ok": approved,
-                "reason": validation_errors[0] if validation_errors else None,
-                "text_score": pricing_text_quality(text),
-                "final_url": final_url,
-                "notes": clean_snippet(str(parsed.get("notes") or ""), 300) if isinstance(parsed, dict) else "",
-                "feature_evidence": feature_evidence,
-            },
-            "extraction_method": "openai_structured",
-        }
-        return payload, "approved" if approved else "manual_review", confidence, validation_errors
-
-
-class CloudflareBrowserRunRenderer:
-    def __init__(self, config: Config):
-        self.endpoint = (
-            f"{D1_API_BASE}/accounts/{config.cloudflare_account_id}"
-            "/browser-rendering/content"
-        )
-        self.headers = {
-            "Authorization": f"Bearer {config.browser_rendering_api_token}",
-            "Content-Type": "application/json",
-        }
-        self.timeout_seconds = config.browser_rendering_timeout_seconds
-
-    async def render(self, result: PricingFetchResult) -> PricingFetchResult | None:
-        target_url = result.final_url or result.url
-        request_payload = {
-            "url": target_url,
-            "userAgent": random_pricing_user_agent(),
-            "setExtraHTTPHeaders": {
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-            "rejectResourceTypes": ["image", "media", "font"],
-            "gotoOptions": {
-                "waitUntil": "networkidle0",
-            },
-        }
-        try:
-            async with httpx.AsyncClient(timeout=float(self.timeout_seconds)) as client:
-                response = await client.post(self.endpoint, headers=self.headers, json=request_payload)
-        except Exception as error:
-            log_info("pricing.browser_render.failed", url=target_url, error=str(error)[:300])
-            return None
-
-        if response.status_code < 200 or response.status_code >= 300:
-            log_info(
-                "pricing.browser_render.http_error",
-                url=target_url,
-                status=response.status_code,
-                body=response_body_sample(response, 300),
-            )
-            return None
-
-        rendered_html = ""
-        try:
-            data = response.json()
-        except ValueError:
-            data = None
-        if isinstance(data, dict):
-            if data.get("success") is False:
-                log_info("pricing.browser_render.api_error", url=target_url, response=str(data)[:300])
-                return None
-            rendered = data.get("result")
-            if isinstance(rendered, dict):
-                rendered = rendered.get("content") or rendered.get("html")
-            if isinstance(rendered, str):
-                rendered_html = rendered
-        if not rendered_html and "html" in response.headers.get("content-type", "").lower():
-            rendered_html = response.text
-        if not rendered_html.strip():
-            log_info("pricing.browser_render.empty", url=target_url)
-            return None
-
-        log_info(
-            "pricing.browser_render.done",
-            url=target_url,
-            text_score=pricing_text_quality(parse_pricing_html(rendered_html).text),
-        )
-        return PricingFetchResult(
-            url=result.url,
-            final_url=target_url,
-            status=200,
-            content_type="text/html; rendered=cloudflare-browser-run",
-            html=rendered_html,
-            error="",
-            page_status="found",
-            discovery_method=f"{result.discovery_method}+browser_run",
-        )
-
-
 class CloudflareBrowserRunAssetClient:
     def __init__(self, config: Config):
         self.endpoint_base = f"{D1_API_BASE}/accounts/{config.cloudflare_account_id}/browser-rendering"
@@ -3320,7 +2054,7 @@ class CloudflareBrowserRunAssetClient:
     def browser_payload(self, target_url: str, *, reject_heavy_resources: bool = False) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "url": target_url,
-            "userAgent": random_pricing_user_agent(),
+            "userAgent": random_browser_user_agent(),
             "setExtraHTTPHeaders": {
                 "Accept-Language": "en-US,en;q=0.9",
             },
@@ -3573,7 +2307,7 @@ class CloudflareBrowserRunAssetClient:
             async with httpx.AsyncClient(
                 timeout=float(self.timeout_seconds),
                 follow_redirects=False,
-                headers=pricing_request_headers(target_url),
+                headers=browser_request_headers(target_url),
             ) as client:
                 for redirect_count in range(HOMEPAGE_MAX_REDIRECTS + 1):
                     response = await client.get(current_url)
@@ -3902,44 +2636,6 @@ class CloudflareBrowserRunAssetClient:
             metadata_retryable=metadata_retryable,
         )
 
-    async def fetch_homepage_key_features(self, task: AssetTask) -> AssetFetchResult:
-        final_url, metadata = await self.fetch_structured_asset_data(
-            task,
-            stage="key features",
-            prompt=(
-                "Extract 1 to 6 concrete product capabilities from this product homepage. "
-                "Use short feature names and factual one-sentence descriptions."
-            ),
-            json_schema={
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "key_features": {
-                        "type": "array",
-                        "minItems": 1,
-                        "maxItems": 6,
-                        "items": {
-                            "type": "object",
-                            "additionalProperties": False,
-                            "properties": {
-                                "name": {"type": "string"},
-                                "description": {"type": "string"},
-                            },
-                            "required": ["name", "description"],
-                        },
-                    },
-                },
-                "required": ["key_features"],
-            },
-        )
-        key_features = clean_key_features(metadata.get("key_features"))
-        return AssetFetchResult(
-            final_url=final_url,
-            key_features=key_features,
-            metadata_error="" if key_features else "features_empty",
-            metadata_retryable=True,
-        )
-
     async def capture_homepage_screenshot(self, task: AssetTask) -> AssetFetchResult:
 
         errors: list[str] = []
@@ -4023,74 +2719,6 @@ class R2AssetUploader:
 
     async def check_access(self) -> None:
         await self.put_object("_runner-healthcheck.txt", b"ok\n", "text/plain")
-
-
-def amount_minor(value: str | None) -> int | None:
-    if value in {None, ""}:
-        return None
-    try:
-        return int((Decimal(str(value)) * 100).to_integral_value())
-    except InvalidOperation:
-        return None
-
-
-def derive_tool_pricing_summary(plans: list[dict[str, Any]]) -> dict[str, Any]:
-    prices = [price for plan in plans for price in plan.get("prices", [])]
-    has_free = any(
-        (price.get("amount") == "0") or plan.get("name", "").lower() == "free"
-        for plan in plans
-        for price in plan.get("prices", [])
-    )
-    custom_only = bool(prices) and all(price.get("custom_quote") for price in prices)
-    paid_prices = [
-        price
-        for price in prices
-        if not price.get("custom_quote") and decimal_value(price.get("amount")) > 0
-    ]
-    usage_only = bool(paid_prices) and all(price.get("kind") == "usage" for price in paid_prices)
-
-    if paid_prices and has_free:
-        pricing_model = "freemium"
-    elif paid_prices and usage_only:
-        pricing_model = "usage_based"
-    elif paid_prices:
-        pricing_model = "paid"
-    elif custom_only:
-        pricing_model = "contact"
-    elif has_free:
-        pricing_model = "free"
-    else:
-        pricing_model = "unknown"
-
-    def candidate_rank(price: dict[str, Any]) -> tuple[int, Decimal]:
-        interval = price.get("billing_interval")
-        amount = decimal_value(price.get("amount"))
-        if interval == "monthly":
-            return (0, amount)
-        if interval == "yearly":
-            return (1, amount)
-        return (2, amount)
-
-    chosen = sorted(paid_prices, key=candidate_rank)[0] if paid_prices else None
-    if chosen and chosen.get("billing_interval") in {"monthly", "yearly"}:
-        pricing_interval = chosen.get("billing_interval")
-    elif usage_only:
-        pricing_interval = "usage"
-    elif custom_only:
-        pricing_interval = "custom"
-    else:
-        pricing_interval = "none"
-
-    starting_minor = amount_minor(chosen.get("amount")) if chosen else None
-    currency = normalize_currency(chosen.get("currency") if chosen else None) if chosen else None
-    return {
-        "pricing_model": pricing_model,
-        "has_free_plan": 1 if has_free else 0,
-        "pricing_interval": pricing_interval,
-        "pricing_currency_code": None if currency == "USD" else currency,
-        "starting_price_minor": None if currency == "USD" else starting_minor,
-        "starting_price_usd_minor": starting_minor if currency == "USD" else None,
-    }
 
 
 def previous_traffic_month() -> str:
@@ -4372,6 +3000,13 @@ def estimate_visits_from_bps(visits: Any, traffic_share_bps: int) -> int | None:
     return (normalized_visits * traffic_share_bps + 5000) // 10000
 
 
+def parse_unit_ratio(value: Any) -> float | None:
+    ratio = to_number(value)
+    if ratio is None or not math.isfinite(ratio) or ratio < -1e-12 or ratio > 1 + 1e-12:
+        return None
+    return min(1.0, max(0.0, ratio))
+
+
 def parse_monthly_rows(payload: dict[str, Any], domain: str, requested_month: str) -> list[dict[str, Any]]:
     engagements = payload.get("Engagments") or {}
     estimated_visits = payload.get("EstimatedMonthlyVisits") or {}
@@ -4387,7 +3022,7 @@ def parse_monthly_rows(payload: dict[str, Any], domain: str, requested_month: st
         "engagement_visits": to_integer(engagements.get("Visits")),
         "global_rank": to_integer((payload.get("GlobalRank") or {}).get("Rank")),
         **parse_country_rank(payload),
-        "bounce_rate": to_number(engagements.get("BounceRate")),
+        "bounce_rate": parse_unit_ratio(engagements.get("BounceRate")),
         "pages_per_visit": to_number(engagements.get("PagePerVisit")),
         "avg_visit_duration_seconds": to_integer(engagements.get("TimeOnSite")),
         **parse_traffic_sources(payload),
@@ -4918,160 +3553,6 @@ class DomainStateClient:
             )
 
         return DomainStateResult(status="failed", domain_rating=None, domain_created_at=None, error=f"rdap_query_failed:{last_error}")
-
-
-class PricingClient:
-    def __init__(self, timeout_seconds: int):
-        self.timeout_seconds = timeout_seconds
-
-    async def fetch_url(self, url: str) -> PricingFetchResult:
-        try:
-            normalized = normalize_pricing_url(url)
-            headers = pricing_request_headers(normalized)
-        except ValueError as error:
-            return PricingFetchResult(url=url, final_url=url, status=0, content_type="", html="", error=str(error))
-
-        try:
-            started_at = time.perf_counter()
-            async with httpx.AsyncClient(
-                timeout=float(self.timeout_seconds),
-                follow_redirects=True,
-                headers=headers,
-            ) as client:
-                response = await client.get(normalized)
-            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-        except Exception as error:
-            log_info("pricing.fetch.request_error", url=normalized, error=str(error)[:300])
-            return PricingFetchResult(url=normalized, final_url=normalized, status=0, content_type="", html="", error=str(error)[:300])
-
-        content_type = response.headers.get("content-type", "")
-        html_body = ""
-        if any(kind in content_type.lower() for kind in ("html", "xml", "text")):
-            body = response.content[:MAX_PRICING_HTML_BYTES]
-            html_body = body.decode(response.encoding or "utf-8", errors="replace")
-        log_info(
-            "pricing.fetch.response",
-            url=normalized,
-            final_url=str(response.url),
-            status_code=response.status_code,
-            elapsed_ms=elapsed_ms,
-            content_type=content_type[:120],
-        )
-        return PricingFetchResult(
-            url=normalized,
-            final_url=str(response.url),
-            status=response.status_code,
-            content_type=content_type,
-            html=html_body,
-            error="" if response.is_success else f"HTTP {response.status_code}",
-        )
-
-    async def fetch_sitemap_body(self, origin_url: str) -> str:
-        try:
-            origin = pricing_url_origin(origin_url)
-        except ValueError:
-            return ""
-        root = await self.fetch_url(urljoin(origin, "/sitemap.xml"))
-        if root.status != 200 or not root.html:
-            return ""
-
-        bodies = [root.html]
-        nested_sitemaps = []
-        for loc in extract_sitemap_locs(root.html):
-            try:
-                parsed = urlsplit(loc)
-            except ValueError:
-                continue
-            if parsed.netloc == urlsplit(origin).netloc and parsed.path.lower().endswith(".xml"):
-                nested_sitemaps.append(loc)
-        for sitemap_url in nested_sitemaps[:4]:
-            nested = await self.fetch_url(sitemap_url)
-            if nested.status == 200 and nested.html:
-                bodies.append(nested.html)
-        return "\n".join(bodies)
-
-    async def choose_pricing_page(self, task: PricingTask) -> PricingFetchResult:
-        first = await self.fetch_url(task.source_url)
-        first_text = parse_pricing_html(first.html).text if first.html else ""
-        if first.status == 200 and is_strict_pricing_url(first.final_url) and pricing_text_quality(first_text) >= 12:
-            return PricingFetchResult(
-                first.url,
-                first.final_url,
-                first.status,
-                first.content_type,
-                first.html,
-                first.error,
-                "found",
-                "source_url",
-            )
-
-        try:
-            home_url = pricing_url_origin(task.official_url or task.source_url)
-        except ValueError:
-            home_url = task.source_url
-        home = await self.fetch_url(home_url)
-        sitemap_body = await self.fetch_sitemap_body(home.final_url or home_url)
-        candidates = discover_pricing_urls(home.final_url or home_url, home.html, sitemap_body) if home.html else []
-        best_result = first
-        best_score = (
-            pricing_url_score(first.final_url) + pricing_text_quality(first_text)
-            if first.status == 200
-            else -1000
-        )
-        for candidate in candidates:
-            if candidate.rstrip("/") == first.final_url.rstrip("/"):
-                continue
-            result = await self.fetch_url(candidate)
-            text = parse_pricing_html(result.html).text if result.html else ""
-            if result.status != 200 or not is_strict_pricing_url(result.final_url):
-                continue
-            score = pricing_url_score(result.final_url) + pricing_text_quality(text)
-            if score > best_score:
-                best_result = result
-                best_score = score
-        best_text = parse_pricing_html(best_result.html).text if best_result.html else ""
-        if (
-            best_result.status == 200
-            and is_strict_pricing_url(best_result.final_url)
-            and pricing_text_quality(best_text) > 0
-        ):
-            return PricingFetchResult(
-                best_result.url,
-                best_result.final_url,
-                best_result.status,
-                best_result.content_type,
-                best_result.html,
-                best_result.error,
-                "found",
-                "candidate_scored",
-            )
-
-        contact_candidates = discover_contact_sales_urls(home.final_url or home_url, home.html, sitemap_body) if home.html else []
-        for candidate in contact_candidates:
-            result = await self.fetch_url(candidate)
-            text = parse_pricing_html(result.html).text if result.html else ""
-            if result.status == 200 and len(text) >= 80:
-                return PricingFetchResult(
-                    result.url,
-                    result.final_url,
-                    result.status,
-                    result.content_type,
-                    result.html,
-                    result.error,
-                    "contact_sales",
-                    "contact_or_demo",
-                )
-
-        return PricingFetchResult(
-            best_result.url,
-            best_result.final_url,
-            best_result.status,
-            best_result.content_type,
-            best_result.html,
-            best_result.error or "No credible pricing page found",
-            "not_found",
-            "none",
-        )
 
 
 class D1Client:
@@ -5844,10 +4325,10 @@ async def resolve_market_snapshot_months(
          AND release.traffic_month = traffic.traffic_month
          AND release.status = 'available'
         WHERE traffic.source = ?
-          AND traffic.traffic_month < ?
+          AND traffic.traffic_month = ?
           AND traffic.visits IS NOT NULL
         """,
-        [TRAFFIC_SOURCE, selected_month],
+        [TRAFFIC_SOURCE, shift_month(selected_month[:7], -1) + '-01'],
     )
     baseline_month = (
         to_month_start(baseline_rows[0].get("traffic_month"))
@@ -5931,8 +4412,7 @@ async def build_market_snapshot_facet_rollups_from_d1(
     catalog_eligibility_revision: int,
     built_at: str,
 ) -> None:
-    await d1.batch(
-        [
+    statements = [
             (
                 "DELETE FROM taxonomy_market_snapshot_facet_rollups WHERE snapshot_id = ?",
                 [snapshot_id],
@@ -6001,6 +4481,7 @@ async def build_market_snapshot_facet_rollups_from_d1(
                   JOIN market_catalog_eligibility_revision revision
                     ON revision.id = 1 AND revision.revision = ?
                   WHERE country.snapshot_id = ?
+                    AND country.country_code = ?
                     AND {MARKET_SNAPSHOT_PUBLIC_TOOL_PREDICATE}
                   GROUP BY
                     country.snapshot_id,
@@ -6059,7 +4540,14 @@ async def build_market_snapshot_facet_rollups_from_d1(
                 ],
             ),
         ]
+    await d1.batch(statements[:3])
+    countries = await d1.query(
+        "SELECT DISTINCT country_code FROM tool_country_market_snapshots WHERE snapshot_id = ? ORDER BY country_code",
+        [snapshot_id],
     )
+    country_sql, country_params = statements[3]
+    for country in countries:
+        await d1.run(country_sql, [*country_params[:2], country['country_code'], *country_params[2:]])
 
 
 async def get_market_snapshot_coverage(d1: D1Client, snapshot_id: int) -> dict[str, int]:
@@ -6410,6 +4898,7 @@ async def activate_market_snapshot_from_d1(
                     WHERE candidate.id = ?
                       AND candidate.status = 'candidate'
                       AND candidate.catalog_eligibility_revision = revision.revision
+                      AND candidate.traffic_month >= market_snapshot_versions.traffic_month
                   )
                 """,
                 [
@@ -6425,6 +4914,12 @@ async def activate_market_snapshot_from_d1(
                 UPDATE market_snapshot_versions
                 SET status = 'active', activated_at = ?, retired_at = NULL, updated_at = ?
                 WHERE id = ? AND status = 'candidate'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM market_snapshot_versions newer
+                    WHERE newer.traffic_source = market_snapshot_versions.traffic_source
+                      AND newer.status = 'active'
+                      AND newer.traffic_month > market_snapshot_versions.traffic_month
+                  )
                   AND catalog_eligibility_revision = (
                     SELECT revision
                     FROM market_catalog_eligibility_revision
@@ -6447,6 +4942,11 @@ async def activate_market_snapshot_from_d1(
         "previous_snapshot_id": previous_snapshot_id,
         "coverage": coverage,
     }
+
+
+async def run_market_snapshot_pages(d1, sql, params, ranges, *, page_param_index=0):
+    for lower, upper in ranges:
+        await d1.run(sql, [*params[:page_param_index], lower, upper, *params[page_param_index:]])
 
 
 async def build_market_snapshot_from_d1(
@@ -6484,9 +4984,17 @@ async def build_market_snapshot_from_d1(
         raise RuntimeError("Market snapshot builder did not return a snapshot id")
 
     try:
-        await d1.run(
+        eligible_ids = await d1.query(f"WITH {MARKET_VISIBLE_TOOLS_CTES} SELECT id FROM visible_tools ORDER BY id")
+        ids = [row['id'] for row in eligible_ids]
+        # Bound index writes and restrict traffic/rating reads to the same page.
+        # Candidate rows remain private until all pages and coverage gates pass.
+        ranges = [(ids[start - 1] if start else 0, ids[min(start + 49, len(ids) - 1)]) for start in range(0, len(ids), 50)]
+        await run_market_snapshot_pages(
+            d1,
             f"""
-            WITH {MARKET_VISIBLE_TOOLS_CTES}, current_raw AS (
+            WITH {MARKET_VISIBLE_TOOLS_CTES}, selected_tools AS MATERIALIZED (
+              SELECT * FROM visible_tools WHERE id > ? AND id <= ?
+            ), current_raw AS (
               SELECT
                 traffic.normalized_domain,
                 traffic.visits,
@@ -6507,6 +5015,7 @@ async def build_market_snapshot_from_d1(
                 ) AS paid_search_share
               FROM domain_traffic_monthly traffic
               WHERE traffic.source = ? AND traffic.traffic_month = ?
+                AND traffic.normalized_domain IN (SELECT normalized_domain FROM selected_tools)
             ), current_computed AS (
               SELECT
                 current_raw.*,
@@ -6532,6 +5041,7 @@ async def build_market_snapshot_from_d1(
               SELECT normalized_domain, visits, ai_visits
               FROM domain_traffic_monthly
               WHERE source = ? AND traffic_month = ?
+                AND normalized_domain IN (SELECT normalized_domain FROM selected_tools)
             ), rating_latest_ranked AS (
               SELECT
                 normalized_domain,
@@ -6544,6 +5054,7 @@ async def build_market_snapshot_from_d1(
                 ) AS latest_row
               FROM domain_rating_history
               WHERE source = ?
+                AND normalized_domain IN (SELECT normalized_domain FROM selected_tools)
             ), rating_latest AS (
               SELECT
                 normalized_domain,
@@ -6637,7 +5148,7 @@ async def build_market_snapshot_from_d1(
               rating.previous_date,
               current.captured_at,
               ?
-            FROM visible_tools tool
+            FROM selected_tools tool
             LEFT JOIN current_traffic current
               ON current.normalized_domain = tool.normalized_domain
             LEFT JOIN baseline_traffic baseline
@@ -6654,8 +5165,10 @@ async def build_market_snapshot_from_d1(
                 snapshot_id,
                 now,
             ],
+            ranges,
         )
-        await d1.run(
+        await run_market_snapshot_pages(
+            d1,
             """
             WITH country_estimates AS (
               SELECT
@@ -6678,6 +5191,7 @@ async def build_market_snapshot_from_d1(
                AND country.source = ?
                AND country.traffic_month = ?
               WHERE snapshot.snapshot_id = ?
+                AND snapshot.tool_id > ? AND snapshot.tool_id <= ?
             )
             INSERT INTO tool_country_market_snapshots (
               snapshot_id, tool_id, normalized_domain, country_code,
@@ -6705,6 +5219,8 @@ async def build_market_snapshot_from_d1(
             FROM country_estimates estimate
             """,
             [TRAFFIC_SOURCE, selected_month, snapshot_id, now],
+            ranges,
+            page_param_index=3,
         )
         await build_market_snapshot_facet_rollups_from_d1(
             d1,
@@ -6797,7 +5313,6 @@ class RunnerTelemetry:
         "assets",
         "traffic",
         "domain_state",
-        "pricing",
         "enrichment",
         "catalog_publish",
     ]
@@ -6977,6 +5492,8 @@ def accepted_primary_taxonomy_predicate(tool_alias: str) -> str:
         WHERE assignment.tool_id = {tool_alias}.id
           AND assignment.is_primary = 1
           AND assignment.decision_status IN ('verified', 'auto_accepted')
+          AND (assignment.decision_status = 'verified'
+               OR coalesce(assignment.confidence, 0) >= {MIN_AUTO_PRIMARY_CONFIDENCE})
           AND NOT EXISTS (
             SELECT 1
             FROM taxonomy_terms active_child
@@ -7013,23 +5530,28 @@ def tool_live_ready_predicate(tool_alias: str) -> str:
               NOT IN ('needs_review', 'rejected')
           AND trim(coalesce(localization.short_description, '')) <> ''
       )
-      AND (
-        EXISTS (
-          SELECT 1 FROM tool_key_features feature
-          WHERE feature.tool_id = {tool_alias}.id
-        )
-        OR EXISTS (
-          SELECT 1 FROM tool_localizations localization
-          WHERE localization.tool_id = {tool_alias}.id
-            AND localization.translation_status = 'published'
-            AND localization.published_at IS NOT NULL
-            AND json_array_length(coalesce(localization.feature_highlights, '[]')) > 0
-        )
-      )
       AND {accepted_primary_taxonomy_predicate(tool_alias)}
       AND EXISTS (
         SELECT 1 FROM tool_sources source
         WHERE source.tool_id = {tool_alias}.id
+      )
+    """
+
+
+def tool_auto_publish_admission_predicate(tool_alias: str) -> str:
+    if tool_alias not in {"t", "tools"}:
+        raise ValueError("Unsupported tools table alias")
+    # Admission holds affect publication only: evidence/asset enrichment must continue.
+    # Keep legacy rows eligible; CASE prevents malformed legacy JSON from aborting a batch.
+    return f"""
+      NOT EXISTS (
+        SELECT 1 FROM tool_sources admission_source
+        WHERE admission_source.tool_id = {tool_alias}.id
+          AND admission_source.source_type = 'official_site'
+          AND CASE WHEN json_valid(admission_source.raw_payload)
+            THEN json_extract(admission_source.raw_payload,
+              '$.qualification.catalog_fit.decision.autoPublishAllowed') = 0
+            ELSE 0 END
       )
     """
 
@@ -7047,7 +5569,7 @@ class D1CatalogPublisher:
 
     async def publish_ready(self, limit: int) -> dict[str, int]:
         effective_limit = min(CATALOG_AUTO_PUBLISH_MAX_LIMIT, max(1, int(limit)))
-        predicate = tool_live_ready_predicate("t")
+        predicate = f"({tool_live_ready_predicate('t')}) AND ({tool_auto_publish_admission_predicate('t')})"
         rows = await self.d1.query(
             f"""
             SELECT t.id
@@ -7108,6 +5630,7 @@ class D1CatalogPublisher:
                       AND status = 'pending_review'
                       AND duplicate_of_tool_id IS NULL
                       AND ({tool_live_ready_predicate('tools')})
+                      AND ({tool_auto_publish_admission_predicate('tools')})
                     RETURNING id
                     """,
                     tool_ids,
@@ -7155,19 +5678,12 @@ class D1EnrichmentStore:
                 WHERE l.tool_id = t.id AND l.translation_status = 'published'
                   AND l.published_at IS NOT NULL AND trim(l.name) <> ''
                   AND coalesce(l.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
-                  AND length(trim(l.name)) <= 80
+                  AND (length(trim(l.name)) <= 80 OR (l.name_review_status = 'human_approved' AND length(trim(l.name)) <= 120))
                   AND instr(l.name, '<') = 0
                   AND instr(l.name, '>') = 0
                   AND instr(l.name, '`') = 0
                   AND instr(lower(l.name), 'json-ld') = 0
               ) THEN 1 ELSE 0 END AS has_name_quality,
-              CASE WHEN EXISTS (SELECT 1 FROM tool_key_features f WHERE f.tool_id = t.id)
-                     OR EXISTS (
-                       SELECT 1 FROM tool_localizations l
-                       WHERE l.tool_id = t.id AND l.translation_status = 'published'
-                         AND l.published_at IS NOT NULL
-                         AND json_array_length(coalesce(l.feature_highlights, '[]')) > 0
-                     ) THEN 1 ELSE 0 END AS has_features,
               CASE WHEN {accepted_primary_taxonomy_predicate('t')}
                    THEN 1 ELSE 0 END AS has_category,
               CASE WHEN NOT {accepted_primary_taxonomy_predicate('t')} AND EXISTS (
@@ -7192,11 +5708,7 @@ class D1EnrichmentStore:
                 SELECT 1 FROM domain_states ds
                 WHERE ds.normalized_domain = t.normalized_domain AND ds.source = ?
                   AND ds.last_crawled_at IS NOT NULL
-              ) THEN 1 ELSE 0 END AS has_domain_state,
-              CASE WHEN t.pricing_model <> 'unknown' OR EXISTS (
-                SELECT 1 FROM pricing_sources ps
-                WHERE ps.tool_id = t.id AND ps.is_active = 1 AND ps.last_success_at IS NOT NULL
-              ) THEN 1 ELSE 0 END AS has_pricing
+              ) THEN 1 ELSE 0 END AS has_domain_state
             FROM tools t
             LEFT JOIN tool_enrichment_states state ON state.tool_id = t.id
             WHERE t.id = ?
@@ -7226,19 +5738,12 @@ class D1EnrichmentStore:
                 WHERE l.tool_id = t.id AND l.translation_status = 'published'
                   AND l.published_at IS NOT NULL AND trim(l.name) <> ''
                   AND coalesce(l.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
-                  AND length(trim(l.name)) <= 80
+                  AND (length(trim(l.name)) <= 80 OR (l.name_review_status = 'human_approved' AND length(trim(l.name)) <= 120))
                   AND instr(l.name, '<') = 0
                   AND instr(l.name, '>') = 0
                   AND instr(l.name, '`') = 0
                   AND instr(lower(l.name), 'json-ld') = 0
               ) THEN 1 ELSE 0 END AS has_name_quality,
-              CASE WHEN EXISTS (SELECT 1 FROM tool_key_features f WHERE f.tool_id = t.id)
-                     OR EXISTS (
-                       SELECT 1 FROM tool_localizations l
-                       WHERE l.tool_id = t.id AND l.translation_status = 'published'
-                         AND l.published_at IS NOT NULL
-                         AND json_array_length(coalesce(l.feature_highlights, '[]')) > 0
-                     ) THEN 1 ELSE 0 END AS has_features,
               CASE WHEN {accepted_primary_taxonomy_predicate('t')}
                    THEN 1 ELSE 0 END AS has_category,
               0 AS category_needs_manual,
@@ -7254,11 +5759,7 @@ class D1EnrichmentStore:
                 SELECT 1 FROM domain_states ds
                 WHERE ds.normalized_domain = t.normalized_domain AND ds.source = ?
                   AND ds.last_crawled_at IS NOT NULL
-              ) THEN 1 ELSE 0 END AS has_domain_state,
-              CASE WHEN t.pricing_model <> 'unknown' OR EXISTS (
-                SELECT 1 FROM pricing_sources ps
-                WHERE ps.tool_id = t.id AND ps.is_active = 1 AND ps.last_success_at IS NOT NULL
-              ) THEN 1 ELSE 0 END AS has_pricing
+              ) THEN 1 ELSE 0 END AS has_domain_state
             FROM tools t
             LEFT JOIN tool_enrichment_states state ON state.tool_id = t.id
             WHERE t.id = ?
@@ -7284,7 +5785,6 @@ class D1EnrichmentStore:
                 ("screenshot", "has_screenshot"),
                 ("published_localization", "has_localization"),
                 ("name_quality", "has_name_quality"),
-                ("key_feature", "has_features"),
                 ("category", "has_category"),
                 ("source_evidence", "has_source"),
             )
@@ -7296,7 +5796,6 @@ class D1EnrichmentStore:
                 ("favicon", "has_favicon"),
                 ("traffic", "has_traffic"),
                 ("domain_state", "has_domain_state"),
-                ("pricing", "has_pricing"),
             )
             if not int(row.get(column) or 0)
         ]
@@ -7376,6 +5875,8 @@ class D1EnrichmentStore:
               AND (
                 state.evaluated_at IS NULL
                 OR t.updated_at > state.evaluated_at
+                OR instr(coalesce(state.blocking_json, ''), '"key_feature"') > 0
+                OR instr(coalesce(state.blocking_json, ''), '"key_features"') > 0
                 OR (
                   instr(coalesce(state.blocking_json, ''), '"category"') > 0
                   AND {accepted_primary_taxonomy_predicate('t')}
@@ -7420,7 +5921,7 @@ class D1AssetStore:
             WHERE task.source = ?
               AND task.status = 'failed'
               AND task.dead_letter_at IS NOT NULL
-              AND t.status = 'pending_enrich'
+              AND t.status IN ('pending_enrich', 'pending_review')
               AND coalesce(task.last_error, '') NOT LIKE 'content_safety_blocked:%'
               AND (
                 (task.generation <= 1 AND task.dead_letter_at <= ?)
@@ -7504,21 +6005,6 @@ class D1AssetStore:
                     AND tl.published_at IS NOT NULL
                     AND trim(coalesce(tl.short_description, '')) <> ''
                 )
-                OR (
-                  NOT EXISTS (
-                    SELECT 1
-                    FROM tool_key_features tkf
-                    WHERE tkf.tool_id = t.id
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM tool_localizations tl
-                    WHERE tl.tool_id = t.id
-                      AND tl.translation_status = 'published'
-                      AND tl.published_at IS NOT NULL
-                      AND json_array_length(coalesce(tl.feature_highlights, '[]')) > 0
-                  )
-                )
               )
               AND (
                 task.tool_id IS NULL
@@ -7583,33 +6069,10 @@ class D1AssetStore:
         lease_expires_at = iso_delta(hours=1)
         rows = await self.d1.query(
             """
-            SELECT
-              task.tool_id,
-              task.normalized_domain,
-              task.attempts,
-              task.max_attempts,
-              task.generation,
-              t.canonical_slug,
-              t.official_url
-            FROM asset_tasks task
-            JOIN tools t ON t.id = task.tool_id
-            WHERE task.source = ?
-              AND task.dead_letter_at IS NULL
-              AND task.attempts < task.max_attempts
-              AND (
-                (
-                  task.status IN ('queued', 'failed', 'sync_failed')
-                  AND (task.next_retry_at IS NULL OR task.next_retry_at <= ?)
-                )
-                OR (
-                  task.status = 'processing'
-                  AND task.lease_expires_at IS NOT NULL
-                  AND task.lease_expires_at <= ?
-                )
-              )
-            ORDER BY coalesce(task.next_retry_at, ''), task.updated_at
-            LIMIT ?
-            """,
+            WITH ready_tasks AS MATERIALIZED (SELECT task.tool_id, task.normalized_domain, task.attempts, task.max_attempts, task.generation, t.canonical_slug, t.official_url, coalesce(task.next_retry_at, '') AS __due_at, task.updated_at AS __updated_at FROM asset_tasks task JOIN tools t ON t.id = task.tool_id WHERE task.source = ?1 AND task.dead_letter_at IS NULL AND task.attempts < task.max_attempts AND (task.status IN ('queued', 'failed', 'sync_failed') AND (task.next_retry_at IS NULL OR task.next_retry_at <= ?2)) ORDER BY coalesce(task.next_retry_at, ''), task.updated_at LIMIT ?4), expired_tasks AS MATERIALIZED (SELECT task.tool_id, task.normalized_domain, task.attempts, task.max_attempts, task.generation, t.canonical_slug, t.official_url, coalesce(task.next_retry_at, '') AS __due_at, task.updated_at AS __updated_at FROM asset_tasks task JOIN tools t ON t.id = task.tool_id WHERE task.source = ?1 AND task.dead_letter_at IS NULL AND task.attempts < task.max_attempts AND (task.status = 'processing' AND task.lease_expires_at IS NOT NULL AND task.lease_expires_at <= ?3) ORDER BY coalesce(task.next_retry_at, ''), task.updated_at LIMIT ?4)
+             SELECT tool_id, normalized_domain, attempts, max_attempts, generation, canonical_slug, official_url FROM (SELECT * FROM ready_tasks UNION ALL SELECT * FROM expired_tasks)
+             ORDER BY __due_at, __updated_at LIMIT ?4
+        """,
             [ASSET_SOURCE, now, now, limit],
         )
 
@@ -7733,25 +6196,24 @@ class D1AssetStore:
         name_review_status = result.name_review_status
         invalid_reason = invalid_tool_name_reason(title)
         if invalid_reason:
-            title = canonical_slug_fallback_tool_name(task)
-            name_source = "verified_submission_fallback"
-            name_confidence = AUTO_APPROVE_TOOL_NAME_CONFIDENCE
-            name_evidence = f"pending_review fallback after {invalid_reason}"
-            name_review_status = "auto_approved"
+            title = domain_fallback_tool_name(task.normalized_domain)
+            name_source = "domain_fallback"
+            name_confidence = 45
+            name_evidence = f"Unverified domain candidate after {invalid_reason}"
+            name_review_status = "needs_review"
         elif name_confidence < AUTO_APPROVE_TOOL_NAME_CONFIDENCE:
-            original_source = name_source
-            title = canonical_slug_fallback_tool_name(task)
-            name_source = "verified_submission_fallback"
-            name_confidence = AUTO_APPROVE_TOOL_NAME_CONFIDENCE
-            name_evidence = (
-                f"Qualified Discovery candidate fallback after low-confidence {original_source}"
-            )[:500]
-            name_review_status = "auto_approved"
+            name_review_status = "needs_review"
+        name_evidence = json.dumps({
+            "ruleset": "tool-name-quality-2026-09-16.1",
+            "page_title": clean_asset_text(result.page_title, 200),
+            "source_url": result.final_url,
+            "evidence": name_evidence,
+        }, ensure_ascii=False, separators=(",", ":"))
         if not title and not description:
             return
         rows = await self.d1.query(
             """
-            SELECT locale_code
+            SELECT locale_code, name, name_review_status
             FROM tool_localizations
             WHERE tool_id = ?
             ORDER BY CASE WHEN locale_code = 'en' THEN 0 ELSE 1 END
@@ -7760,6 +6222,12 @@ class D1AssetStore:
             [task.tool_id],
         )
         locale = str(rows[0].get("locale_code") or "") if rows else ""
+        current = rows[0] if rows else {}
+        current_name = str(current.get("name") or "")
+        legacy_name_to_repair = (
+            current_name if current.get("name_review_status") == "legacy_unreviewed"
+            and invalid_tool_name_reason(current_name) else None
+        )
         if not locale:
             locale_rows = await self.d1.query(
                 """
@@ -7813,24 +6281,24 @@ class D1AssetStore:
             """
             UPDATE tool_localizations
             SET name = CASE
-                  WHEN ? <> '' AND (
+                  WHEN ? <> '' AND name_review_status <> 'human_approved' AND (
                     name IS NULL OR trim(name) = '' OR name = ?
-                    OR name_review_status IN ('needs_review', 'rejected')
+                    OR name_review_status IN ('needs_review', 'rejected') OR (name_review_status = 'legacy_unreviewed' AND name = ?)
                   )
                   THEN ?
                   ELSE name
                 END,
                 name_source = CASE
-                  WHEN ? <> '' AND (name IS NULL OR trim(name) = '' OR name = ? OR name_review_status IN ('needs_review', 'rejected'))
+                  WHEN ? <> '' AND name_review_status <> 'human_approved' AND (name IS NULL OR trim(name) = '' OR name = ? OR name_review_status IN ('needs_review', 'rejected') OR (name_review_status = 'legacy_unreviewed' AND name = ?))
                   THEN ? ELSE name_source END,
                 name_confidence = CASE
-                  WHEN ? <> '' AND (name IS NULL OR trim(name) = '' OR name = ? OR name_review_status IN ('needs_review', 'rejected'))
+                  WHEN ? <> '' AND name_review_status <> 'human_approved' AND (name IS NULL OR trim(name) = '' OR name = ? OR name_review_status IN ('needs_review', 'rejected') OR (name_review_status = 'legacy_unreviewed' AND name = ?))
                   THEN ? ELSE name_confidence END,
                 name_evidence = CASE
-                  WHEN ? <> '' AND (name IS NULL OR trim(name) = '' OR name = ? OR name_review_status IN ('needs_review', 'rejected'))
+                  WHEN ? <> '' AND name_review_status <> 'human_approved' AND (name IS NULL OR trim(name) = '' OR name = ? OR name_review_status IN ('needs_review', 'rejected') OR (name_review_status = 'legacy_unreviewed' AND name = ?))
                   THEN ? ELSE name_evidence END,
                 name_review_status = CASE
-                  WHEN ? <> '' AND (name IS NULL OR trim(name) = '' OR name = ? OR name_review_status IN ('needs_review', 'rejected'))
+                  WHEN ? <> '' AND name_review_status <> 'human_approved' AND (name IS NULL OR trim(name) = '' OR name = ? OR name_review_status IN ('needs_review', 'rejected') OR (name_review_status = 'legacy_unreviewed' AND name = ?))
                   THEN ? ELSE name_review_status END,
                 last_name_checked_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
                 tagline = CASE
@@ -7850,18 +6318,23 @@ class D1AssetStore:
             [
                 title,
                 task.canonical_slug,
+                legacy_name_to_repair,
                 title,
                 title,
                 task.canonical_slug,
+                legacy_name_to_repair,
                 name_source,
                 title,
                 task.canonical_slug,
+                legacy_name_to_repair,
                 name_confidence,
                 title,
                 task.canonical_slug,
+                legacy_name_to_repair,
                 name_evidence or None,
                 title,
                 task.canonical_slug,
+                legacy_name_to_repair,
                 name_review_status,
                 description,
                 description,
@@ -7871,82 +6344,6 @@ class D1AssetStore:
                 locale,
             ],
         )
-
-    async def save_tool_features(self, task: AssetTask, result: AssetFetchResult) -> None:
-        features = clean_key_features(result.key_features)
-        if not features:
-            return
-        await self.d1.run(
-            "DELETE FROM tool_key_features WHERE tool_id = ? AND source = ?",
-            [task.tool_id, ASSET_SOURCE],
-        )
-        for position, feature in enumerate(features):
-            await self.d1.run(
-                """
-                INSERT INTO tool_key_features (
-                  tool_id, feature_name, feature_description, position, source
-                )
-                VALUES (?, ?, ?, ?, ?)
-                """,
-                [task.tool_id, feature["name"], feature["description"] or None, position, ASSET_SOURCE],
-            )
-        feature_highlights = json.dumps(
-            [feature["name"] for feature in features],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
-        await self.d1.run(
-            """
-            UPDATE tool_localizations
-            SET feature_highlights = CASE
-                  WHEN json_array_length(coalesce(feature_highlights, '[]')) = 0
-                  THEN ?
-                  ELSE feature_highlights
-                END,
-                updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-            WHERE tool_id = ?
-            """,
-            [feature_highlights, task.tool_id],
-        )
-
-    async def fallback_tool_content(self, task: AssetTask) -> tuple[str, str]:
-        rows = await self.d1.query(
-            """
-            SELECT name, short_description
-            FROM tool_localizations
-            WHERE tool_id = ?
-              AND translation_status = 'published'
-              AND published_at IS NOT NULL
-            ORDER BY CASE WHEN locale_code = 'en' THEN 0 ELSE 1 END
-            LIMIT 1
-            """,
-            [task.tool_id],
-        )
-        row = rows[0] if rows else {}
-        name = clean_asset_text(row.get("name"), 120) or canonical_slug_fallback_tool_name(task)
-        description = clean_asset_text(row.get("short_description"), 500)
-        if not description:
-            description = deterministic_fallback_description(task, "", name)
-        return name, description
-
-    async def save_deterministic_tool_features(
-        self,
-        task: AssetTask,
-        html_body: str = "",
-    ) -> bool:
-        name, description = await self.fallback_tool_content(task)
-        features = deterministic_fallback_key_features(name, description, html_body)
-        if not features:
-            return False
-        await self.save_tool_features(
-            task,
-            AssetFetchResult(
-                final_url=asset_page_url(task),
-                key_features=features,
-                metadata_retryable=False,
-            ),
-        )
-        return True
 
     async def missing_tool_enrichment_requirements(self, tool_id: int) -> list[str]:
         rows = await self.d1.query(
@@ -7965,23 +6362,11 @@ class D1AssetStore:
                   AND trim(coalesce(tl.short_description, '')) <> ''
               ) THEN 1 ELSE 0 END AS has_description,
               CASE WHEN EXISTS (
-                SELECT 1
-                FROM tool_key_features tkf
-                WHERE tkf.tool_id = ?
-              ) OR EXISTS (
-                SELECT 1
-                FROM tool_localizations tl
-                WHERE tl.tool_id = ?
-                  AND tl.translation_status = 'published'
-                  AND tl.published_at IS NOT NULL
-                  AND json_array_length(coalesce(tl.feature_highlights, '[]')) > 0
-              ) THEN 1 ELSE 0 END AS has_features,
-              CASE WHEN EXISTS (
                 SELECT 1 FROM tools t
                 WHERE t.id = ? AND {accepted_primary_taxonomy_predicate('t')}
               ) THEN 1 ELSE 0 END AS has_category
             """,
-            [tool_id, tool_id, tool_id, tool_id, tool_id],
+            [tool_id, tool_id, tool_id],
         )
         row = rows[0] if rows else {}
         return [
@@ -7989,7 +6374,6 @@ class D1AssetStore:
             for name, column in (
                 ("content_safety", "has_content_safety"),
                 ("description", "has_description"),
-                ("key_features", "has_features"),
                 ("category", "has_category"),
             )
             if not int(row.get(column) or 0)
@@ -8025,26 +6409,12 @@ class D1AssetStore:
                   AND tl.translation_status = 'published'
                   AND tl.published_at IS NOT NULL
                   AND trim(coalesce(tl.short_description, '')) <> ''
-              ) THEN 1 ELSE 0 END AS has_description,
-              CASE WHEN EXISTS (
-                SELECT 1
-                FROM tool_key_features tkf
-                WHERE tkf.tool_id = ?
-              ) OR EXISTS (
-                SELECT 1
-                FROM tool_localizations tl
-                WHERE tl.tool_id = ?
-                  AND tl.translation_status = 'published'
-                  AND tl.published_at IS NOT NULL
-                  AND json_array_length(coalesce(tl.feature_highlights, '[]')) > 0
-              ) THEN 1 ELSE 0 END AS has_key_features
+              ) THEN 1 ELSE 0 END AS has_description
             """,
             [
                 tool_id,
                 tool_id,
                 ASSET_DB_STORAGE_BUCKET,
-                tool_id,
-                tool_id,
                 tool_id,
                 tool_id,
             ],
@@ -8055,7 +6425,6 @@ class D1AssetStore:
             "screenshot": "has_screenshot",
             "favicon": "has_favicon",
             "description": "has_description",
-            "key_features": "has_key_features",
         }
         missing = [
             requirement
@@ -8421,25 +6790,10 @@ class D1TaskStore:
         lease_expires_at = iso_delta(hours=1)
         rows = await self.d1.query(
             """
-            SELECT normalized_domain, source, traffic_month, attempts, max_attempts, generation
-            FROM traffic_tasks
-            WHERE source = ?
-              AND dead_letter_at IS NULL
-              AND attempts < max_attempts
-              AND (
-                (
-                  status IN ('queued', 'failed', 'sync_failed')
-                  AND (next_retry_at IS NULL OR next_retry_at <= ?)
-                )
-                OR (
-                  status = 'processing'
-                  AND lease_expires_at IS NOT NULL
-                  AND lease_expires_at <= ?
-                )
-              )
-            ORDER BY coalesce(next_retry_at, ''), updated_at
-            LIMIT ?
-            """,
+            WITH ready_tasks AS MATERIALIZED (SELECT normalized_domain, source, traffic_month, attempts, max_attempts, generation, coalesce(next_retry_at, '') AS __due_at, updated_at AS __updated_at FROM traffic_tasks WHERE source = ?1 AND dead_letter_at IS NULL AND attempts < max_attempts AND (status IN ('queued', 'failed', 'sync_failed') AND (next_retry_at IS NULL OR next_retry_at <= ?2)) ORDER BY coalesce(next_retry_at, ''), updated_at LIMIT ?4), expired_tasks AS MATERIALIZED (SELECT normalized_domain, source, traffic_month, attempts, max_attempts, generation, coalesce(next_retry_at, '') AS __due_at, updated_at AS __updated_at FROM traffic_tasks WHERE source = ?1 AND dead_letter_at IS NULL AND attempts < max_attempts AND (status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?3) ORDER BY coalesce(next_retry_at, ''), updated_at LIMIT ?4)
+             SELECT normalized_domain, source, traffic_month, attempts, max_attempts, generation FROM (SELECT * FROM ready_tasks UNION ALL SELECT * FROM expired_tasks)
+             ORDER BY __due_at, __updated_at LIMIT ?4
+        """,
             [TRAFFIC_SOURCE, now, now, limit],
         )
 
@@ -8739,39 +7093,10 @@ class D1DomainStateStore:
         lease_expires_at = iso_delta(minutes=15)
         rows = await self.d1.query(
             """
-            UPDATE domain_state_tasks
-            SET status = 'processing',
-                attempts = attempts + 1,
-                last_started_at = ?,
-                next_retry_at = NULL,
-                last_error = NULL,
-                lease_owner = ?,
-                lease_token = lower(hex(randomblob(16))),
-                lease_expires_at = ?,
-                updated_at = ?
-            WHERE rowid IN (
-              SELECT rowid
-              FROM domain_state_tasks
-              WHERE source = ?
-                AND dead_letter_at IS NULL
-                AND attempts < max_attempts
-                AND (
-                  (
-                    status IN ('queued', 'failed', 'sync_failed')
-                    AND (next_retry_at IS NULL OR next_retry_at <= ?)
-                  )
-                  OR (
-                    status = 'processing'
-                    AND lease_expires_at IS NOT NULL
-                    AND lease_expires_at <= ?
-                  )
-                )
-              ORDER BY coalesce(next_retry_at, ''), updated_at, normalized_domain
-              LIMIT ?
-            )
-            RETURNING normalized_domain, attempts, max_attempts, generation, lease_token,
-                      fetch_domain_rating, fetch_rdap
-            """,
+            UPDATE domain_state_tasks SET status = 'processing', attempts = attempts + 1, last_started_at = ?1, next_retry_at = NULL, last_error = NULL, lease_owner = ?2, lease_token = lower(hex(randomblob(16))), lease_expires_at = ?3, updated_at = ?4 WHERE rowid IN ( WITH ready_tasks AS MATERIALIZED (SELECT rowid AS __rid, coalesce(next_retry_at, '') AS __due_at, updated_at AS __updated_at, normalized_domain AS __domain FROM domain_state_tasks WHERE source = ?5 AND dead_letter_at IS NULL AND attempts < max_attempts AND (status IN ('queued', 'failed', 'sync_failed') AND (next_retry_at IS NULL OR next_retry_at <= ?6)) ORDER BY coalesce(next_retry_at, ''), updated_at, normalized_domain LIMIT ?8), expired_tasks AS MATERIALIZED (SELECT rowid AS __rid, coalesce(next_retry_at, '') AS __due_at, updated_at AS __updated_at, normalized_domain AS __domain FROM domain_state_tasks WHERE source = ?5 AND dead_letter_at IS NULL AND attempts < max_attempts AND (status = 'processing' AND lease_expires_at IS NOT NULL AND lease_expires_at <= ?7) ORDER BY coalesce(next_retry_at, ''), updated_at, normalized_domain LIMIT ?8)
+             SELECT __rid FROM (SELECT * FROM ready_tasks UNION ALL SELECT * FROM expired_tasks)
+             ORDER BY __due_at, __updated_at, __domain LIMIT ?8 ) RETURNING normalized_domain, attempts, max_attempts, generation, lease_token, fetch_domain_rating, fetch_rdap
+        """,
             [now, lease_owner, lease_expires_at, now, DOMAIN_STATE_SOURCE, now, now, limit],
         )
         return [
@@ -8951,1386 +7276,6 @@ class D1DomainStateStore:
         )
         task_meta = batch_results[-1].get("meta") if batch_results else {}
         return int((task_meta or {}).get("changes") or 0) > 0
-
-
-class D1PricingStore:
-    def __init__(self, d1: D1Client):
-        self.d1 = d1
-
-    async def missing_source_candidates(self, limit: int) -> list[PricingSourceCandidate]:
-        now = utc_now_iso()
-        rows = await self.d1.query(
-            """
-            SELECT
-              t.id AS tool_id,
-              t.canonical_slug,
-              t.official_url
-            FROM tools t
-            WHERE t.status IN ('published', 'pending_enrich', 'pending_review')
-              AND t.duplicate_of_tool_id IS NULL
-              AND t.official_url IS NOT NULL
-              AND trim(t.official_url) <> ''
-              AND NOT EXISTS (
-                SELECT 1 FROM pricing_sources active_source
-                WHERE active_source.tool_id = t.id AND active_source.is_active = 1
-              )
-              AND (
-                NOT EXISTS (SELECT 1 FROM pricing_sources any_source WHERE any_source.tool_id = t.id)
-                OR EXISTS (
-                  SELECT 1 FROM pricing_sources retry_source
-                  WHERE retry_source.tool_id = t.id
-                    AND retry_source.is_active = 0
-                    AND retry_source.discovery_status IN ('retryable', 'not_found')
-                    AND retry_source.discovery_attempts < retry_source.discovery_max_attempts
-                    AND retry_source.next_discovery_at IS NOT NULL
-                    AND retry_source.next_discovery_at <= ?
-                )
-              )
-            ORDER BY t.id
-            LIMIT ?
-            """,
-            [now, limit],
-        )
-        return [
-            PricingSourceCandidate(
-                tool_id=int(row["tool_id"]),
-                canonical_slug=str(row.get("canonical_slug") or ""),
-                official_url=str(row.get("official_url") or ""),
-            )
-            for row in rows
-        ]
-
-    async def insert_pricing_source(
-        self,
-        tool_id: int,
-        url: str,
-        discovery_method: str,
-        source_confidence: int,
-    ) -> None:
-        now = utc_now_iso()
-        await self.d1.run(
-            """
-            INSERT INTO pricing_sources (
-              tool_id,
-              url,
-              source_type,
-              scope,
-              locale,
-              region,
-              expected_currency,
-              fetch_mode,
-              discovery_method,
-              source_confidence,
-              is_active,
-              unchanged_runs,
-              next_run_at,
-              last_error,
-              discovery_status,
-              discovery_attempts,
-              last_discovery_at,
-              next_discovery_at,
-              created_at,
-              updated_at
-            )
-            VALUES (?, ?, 'marketing_pricing', 'individual', 'en-US', 'US', 'USD', 'static', ?, ?, 1, 0, NULL, NULL, 'found', 0, ?, NULL, ?, ?)
-            ON CONFLICT (tool_id, url, locale, region, scope) DO UPDATE SET
-              is_active = 1,
-              discovery_method = excluded.discovery_method,
-              source_confidence = excluded.source_confidence,
-              next_run_at = NULL,
-              last_error = NULL,
-              discovery_status = 'found',
-              discovery_attempts = 0,
-              last_discovery_at = excluded.last_discovery_at,
-              next_discovery_at = NULL,
-              updated_at = ?
-            """,
-            [tool_id, url, discovery_method, source_confidence, now, now, now, now],
-        )
-
-    async def mark_pricing_source_discovery_skipped(
-        self,
-        tool_id: int,
-        url: str,
-        error: str,
-        retryable: bool,
-    ) -> None:
-        clean_url = (url or "").strip()
-        if not clean_url:
-            return
-        now = utc_now_iso()
-        discovery_status = "retryable" if retryable else "not_found"
-        next_discovery_at = iso_delta(days=1 if retryable else 30)
-        await self.d1.run(
-            """
-            INSERT INTO pricing_sources (
-              tool_id,
-              url,
-              source_type,
-              scope,
-              locale,
-              region,
-              expected_currency,
-              fetch_mode,
-              discovery_method,
-              source_confidence,
-              is_active,
-              unchanged_runs,
-              next_run_at,
-              last_error,
-              discovery_status,
-              discovery_attempts,
-              last_discovery_at,
-              next_discovery_at,
-              created_at,
-              updated_at
-            )
-            VALUES (?, ?, 'marketing_pricing', 'individual', 'en-US', 'US', 'USD', 'static', 'homepage_link', 0, 0, 0, NULL, ?, ?, 1, ?, ?, ?, ?)
-            ON CONFLICT (tool_id, url, locale, region, scope) DO UPDATE SET
-              is_active = 0,
-              source_confidence = 0,
-              next_run_at = NULL,
-              last_error = excluded.last_error,
-              discovery_attempts = pricing_sources.discovery_attempts + 1,
-              discovery_status = CASE
-                WHEN pricing_sources.discovery_attempts + 1 >= pricing_sources.discovery_max_attempts
-                THEN 'exhausted'
-                ELSE excluded.discovery_status
-              END,
-              last_discovery_at = excluded.last_discovery_at,
-              next_discovery_at = CASE
-                WHEN pricing_sources.discovery_attempts + 1 >= pricing_sources.discovery_max_attempts
-                THEN NULL
-                ELSE excluded.next_discovery_at
-              END,
-              updated_at = ?
-            """,
-            [
-                tool_id,
-                clean_url,
-                error[:2000],
-                discovery_status,
-                now,
-                next_discovery_at,
-                now,
-                now,
-                now,
-            ],
-        )
-
-    async def queue_due_tasks(self, limit: int) -> int:
-        now = utc_now_iso()
-        rows = await self.d1.query(
-            """
-            WITH latest_task AS (
-              SELECT pricing_source_id, max(id) AS task_id
-              FROM pricing_tasks
-              GROUP BY pricing_source_id
-            )
-            SELECT
-              ps.id AS pricing_source_id,
-              ps.tool_id
-            FROM pricing_sources ps
-            JOIN tools t ON t.id = ps.tool_id
-            LEFT JOIN latest_task lt ON lt.pricing_source_id = ps.id
-            LEFT JOIN pricing_tasks task ON task.id = lt.task_id
-            WHERE ps.is_active = 1
-              AND t.status IN ('published', 'pending_enrich', 'pending_review')
-              AND t.duplicate_of_tool_id IS NULL
-              AND (ps.next_run_at IS NULL OR ps.next_run_at <= ?)
-              AND (
-                task.id IS NULL
-                OR task.status = 'succeeded'
-                OR (
-                  task.status = 'manual_review'
-                  AND ps.last_capture_at IS NOT NULL
-                  AND ps.next_run_at IS NOT NULL
-                )
-              )
-            ORDER BY coalesce(ps.next_run_at, ''), ps.id
-            LIMIT ?
-            """,
-            [now, limit],
-        )
-
-        queued = 0
-        for row in rows:
-            source_id = int(row.get("pricing_source_id") or 0)
-            tool_id = int(row.get("tool_id") or 0)
-            if source_id <= 0 or tool_id <= 0:
-                continue
-            await self.d1.run(
-                """
-                INSERT INTO pricing_tasks (
-                  pricing_source_id,
-                  tool_id,
-                  status,
-                  priority,
-                  run_after,
-                  attempts,
-                  max_attempts,
-                  last_error
-                )
-                VALUES (?, ?, 'queued', 0, ?, 0, 3, NULL)
-                """,
-                [source_id, tool_id, now],
-            )
-            queued += 1
-        return queued
-
-    async def claim_due_tasks(
-        self,
-        limit: int,
-        task_ids: list[int] | None = None,
-        claim: bool = True,
-        lease_owner: str = "tool-data-runner",
-        replay_manual_review: bool = False,
-    ) -> list[PricingTask]:
-        now = utc_now_iso()
-        lease_expires_at = iso_delta(hours=1)
-        task_ids = task_ids or []
-        params: list[Any]
-        if task_ids:
-            placeholders = ", ".join("?" for _ in task_ids)
-            where = f"task.id IN ({placeholders}) AND task.status IN ('queued', 'manual_review', 'failed')"
-            params = [*task_ids, limit]
-        elif replay_manual_review:
-            rows = await self.d1.query(
-                """
-                SELECT
-                  task.id AS task_id,
-                  task.pricing_source_id,
-                  task.tool_id,
-                  task.attempts,
-                  task.max_attempts,
-                  task.generation,
-                  task.status,
-                  task.last_error,
-                  t.canonical_slug,
-                  t.official_url,
-                  ps.url AS source_url
-                FROM pricing_tasks task
-                JOIN pricing_sources ps ON ps.id = task.pricing_source_id
-                JOIN tools t ON t.id = task.tool_id
-                WHERE task.status = 'manual_review'
-                  AND task.dead_letter_at IS NULL
-                  AND task.attempts < task.max_attempts
-                  AND ps.is_active = 1
-                  AND t.status IN ('published', 'pending_enrich', 'pending_review')
-                  AND t.duplicate_of_tool_id IS NULL
-                  AND coalesce(task.last_error, '') NOT LIKE ?
-                  AND NOT EXISTS (
-                    SELECT 1
-                    FROM pricing_tasks newer
-                    WHERE newer.pricing_source_id = task.pricing_source_id
-                      AND newer.id > task.id
-                  )
-                ORDER BY task.priority DESC, task.id ASC
-                LIMIT ?
-                """,
-                [f"{PRICING_CLAIMS_V2_REPLAY_MARKER}:%", limit],
-            )
-            params = []
-        else:
-            where = f"""
-              task.dead_letter_at IS NULL
-              AND task.attempts < task.max_attempts
-              AND (
-                (task.status IN ('queued', 'failed') AND task.run_after <= ?)
-                OR (
-                  task.status = 'running'
-                  AND task.lease_expires_at IS NOT NULL
-                  AND task.lease_expires_at <= ?
-                )
-              )
-            """
-            params = [now, now, limit]
-
-        if not (replay_manual_review and not task_ids):
-            rows = await self.d1.query(
-                f"""
-            SELECT
-              task.id AS task_id,
-              task.pricing_source_id,
-              task.tool_id,
-              task.attempts,
-              task.max_attempts,
-              task.generation,
-              task.status,
-              task.last_error,
-              t.canonical_slug,
-              t.official_url,
-              ps.url AS source_url
-            FROM pricing_tasks task
-            JOIN pricing_sources ps ON ps.id = task.pricing_source_id
-            JOIN tools t ON t.id = task.tool_id
-            WHERE {where}
-            ORDER BY
-              CASE WHEN task.status = 'manual_review' THEN 1 ELSE 0 END,
-              task.priority DESC,
-              task.id ASC
-            LIMIT ?
-            """,
-                params,
-            )
-
-        tasks: list[PricingTask] = []
-        for row in rows:
-            task = PricingTask(
-                task_id=int(row["task_id"]),
-                pricing_source_id=int(row["pricing_source_id"]),
-                tool_id=int(row["tool_id"]),
-                canonical_slug=str(row.get("canonical_slug") or ""),
-                source_url=str(row.get("source_url") or ""),
-                official_url=str(row.get("official_url") or ""),
-                attempts=int(row.get("attempts") or 0) + (1 if claim else 0),
-                max_attempts=int(row.get("max_attempts") or 3),
-                generation=int(row.get("generation") or 1),
-                lease_token="",
-                is_manual_review_replay=(
-                    (
-                        replay_manual_review
-                        and str(row.get("status") or "") == "manual_review"
-                    )
-                    or str(row.get("last_error") or "") == PRICING_CLAIMS_V2_REPLAY_RUNNING_MARKER
-                ),
-            )
-            if not claim:
-                tasks.append(task)
-                continue
-
-            claimed_rows = await self.d1.query(
-                """
-                UPDATE pricing_tasks
-                SET status = 'running',
-                    attempts = attempts + 1,
-                    started_at = ?,
-                    finished_at = NULL,
-                    last_error = CASE
-                      WHEN ? = 1 THEN ?
-                      WHEN last_error = ? THEN last_error
-                      ELSE NULL
-                    END,
-                    lease_owner = ?,
-                    lease_token = lower(hex(randomblob(16))),
-                    lease_expires_at = ?,
-                    updated_at = ?
-                WHERE id = ?
-                  AND dead_letter_at IS NULL
-                  AND attempts < max_attempts
-                  AND (
-                    (? = 1 AND status IN ('queued', 'manual_review', 'failed'))
-                    OR (status IN ('queued', 'failed') AND run_after <= ?)
-                    OR (
-                      status = 'running'
-                      AND lease_expires_at IS NOT NULL
-                      AND lease_expires_at <= ?
-                    )
-                    OR (
-                      ? = 1
-                      AND status = 'manual_review'
-                      AND coalesce(last_error, '') NOT LIKE ?
-                      AND id = (
-                        SELECT max(latest_task.id)
-                        FROM pricing_tasks latest_task
-                        WHERE latest_task.pricing_source_id = pricing_tasks.pricing_source_id
-                      )
-                      AND EXISTS (
-                        SELECT 1
-                        FROM pricing_sources replay_source
-                        JOIN tools replay_tool ON replay_tool.id = replay_source.tool_id
-                        WHERE replay_source.id = pricing_tasks.pricing_source_id
-                          AND replay_source.is_active = 1
-                          AND replay_tool.status IN ('published', 'pending_enrich', 'pending_review')
-                          AND replay_tool.duplicate_of_tool_id IS NULL
-                      )
-                    )
-                  )
-                RETURNING attempts, max_attempts, generation, lease_token
-                """,
-                [
-                    now,
-                    1 if replay_manual_review else 0,
-                    PRICING_CLAIMS_V2_REPLAY_RUNNING_MARKER,
-                    PRICING_CLAIMS_V2_REPLAY_RUNNING_MARKER,
-                    lease_owner,
-                    lease_expires_at,
-                    now,
-                    task.task_id,
-                    1 if task_ids else 0,
-                    now,
-                    now,
-                    1 if replay_manual_review else 0,
-                    f"{PRICING_CLAIMS_V2_REPLAY_MARKER}:%",
-                ],
-            )
-            if claimed_rows:
-                claimed_row = claimed_rows[0]
-                tasks.append(
-                    PricingTask(
-                        task_id=task.task_id,
-                        pricing_source_id=task.pricing_source_id,
-                        tool_id=task.tool_id,
-                        canonical_slug=task.canonical_slug,
-                        source_url=task.source_url,
-                        official_url=task.official_url,
-                        attempts=int(claimed_row.get("attempts") or 0),
-                        max_attempts=int(claimed_row.get("max_attempts") or task.max_attempts),
-                        generation=int(claimed_row.get("generation") or task.generation),
-                        lease_token=str(claimed_row.get("lease_token") or ""),
-                        is_manual_review_replay=task.is_manual_review_replay,
-                    )
-                )
-        return tasks
-
-    async def renew_lease(self, task: PricingTask) -> bool:
-        now = utc_now_iso()
-        meta = await self.d1.run(
-            """
-            UPDATE pricing_tasks
-            SET lease_expires_at = ?, updated_at = ?
-            WHERE id = ? AND status = 'running' AND generation = ? AND lease_token = ?
-            """,
-            [iso_delta(hours=1), now, task.task_id, task.generation, task.lease_token],
-        )
-        return int(meta.get("changes") or 0) > 0
-
-    async def prepare_pricing_claims_shadow(
-        self,
-        task: PricingTask,
-        bundle: PricingSnapshotBundle,
-        uploader: R2AssetUploader,
-    ) -> SnapshotCapturePlan:
-        previous_rows = await self.d1.query(
-            """
-            SELECT pricing_region_hash, snapshot_format_version
-            FROM pricing_snapshots snapshot
-            WHERE pricing_source_id = ?
-              AND pricing_region_hash IS NOT NULL
-              AND EXISTS (
-                SELECT 1
-                FROM pricing_snapshot_artifacts artifact
-                WHERE artifact.snapshot_id = snapshot.id
-              )
-            ORDER BY fetched_at DESC, id DESC
-            LIMIT 1
-            """,
-            [task.pricing_source_id],
-        )
-        previous_region_hash = (
-            str(previous_rows[0].get("pricing_region_hash") or "") if previous_rows else None
-        ) or None
-        previous_format_version = (
-            str(previous_rows[0].get("snapshot_format_version") or "") if previous_rows else None
-        ) or None
-        object_keys = [payload.artifact.object_key for payload in bundle.artifacts]
-        placeholders = ", ".join("?" for _ in object_keys)
-        existing_rows = await self.d1.query(
-            f"SELECT DISTINCT object_key FROM pricing_snapshot_artifacts WHERE object_key IN ({placeholders})",
-            object_keys,
-        ) if object_keys else []
-        existing_keys = {
-            str(row.get("object_key") or "")
-            for row in existing_rows
-            if row.get("object_key")
-        }
-        plan = plan_snapshot_capture(
-            [payload.artifact for payload in bundle.artifacts],
-            previous_region_hash=previous_region_hash,
-            current_region_hash=bundle.region.region_hash,
-            existing_artifact_keys=existing_keys,
-            pipeline_version_changed=bool(
-                previous_format_version and previous_format_version != bundle.format_version
-            ),
-        )
-        payload_by_key = {payload.artifact.object_key: payload for payload in bundle.artifacts}
-        for artifact in plan.upload_artifacts:
-            payload = payload_by_key[artifact.object_key]
-            await uploader.put_object(artifact.object_key, payload.body, artifact.content_type)
-        return plan
-
-    async def insert_snapshot(
-        self,
-        task: PricingTask,
-        result: PricingFetchResult,
-        claims_bundle: PricingSnapshotBundle | None = None,
-    ) -> int:
-        text = parse_pricing_html(result.html).text if result.html else ""
-        raw_hash = sha256_text(result.html or f"{result.status}:{result.final_url}")
-        text_hash = sha256_text(text)
-        if claims_bundle is not None:
-            artifact_keys = {
-                payload.artifact.artifact_type: payload.artifact.object_key
-                for payload in claims_bundle.artifacts
-            }
-            rendered = "browser_run" in result.discovery_method
-            meta = await self.d1.run(
-                """
-                INSERT INTO pricing_snapshots (
-                  pricing_source_id,
-                  pricing_task_id,
-                  final_url,
-                  http_status,
-                  content_type,
-                  html_object_key,
-                  text_object_key,
-                  rendered_html_object_key,
-                  structured_data_object_key,
-                  dom_map_object_key,
-                  pricing_region_hash,
-                  renderer_version,
-                  snapshot_format_version,
-                  requested_locale,
-                  requested_region,
-                  accept_language,
-                  geo_mode,
-                  observed_currency_context,
-                  raw_hash,
-                  semantic_hash,
-                  fetch_mode,
-                  error
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'en-US', 'US',
-                        'en-US,en;q=0.9', 'default_egress', ?, ?, ?, ?, ?)
-                """,
-                [
-                    task.pricing_source_id,
-                    task.task_id,
-                    result.final_url or result.url,
-                    result.status or None,
-                    result.content_type or None,
-                    artifact_keys.get("html"),
-                    artifact_keys.get("text"),
-                    artifact_keys.get("rendered_html"),
-                    artifact_keys.get("structured_data"),
-                    artifact_keys.get("dom_map"),
-                    claims_bundle.region.region_hash,
-                    "cloudflare-browser-run-v1" if rendered else None,
-                    claims_bundle.format_version,
-                    claims_bundle.observed_currency_context,
-                    raw_hash,
-                    text_hash,
-                    "browser_run" if rendered else "static",
-                    result.error or None,
-                ],
-            )
-            return int(meta.get("last_row_id") or 0)
-        meta = await self.d1.run(
-            """
-            INSERT INTO pricing_snapshots (
-              pricing_source_id,
-              pricing_task_id,
-              final_url,
-              http_status,
-              content_type,
-              raw_hash,
-              semantic_hash,
-              fetch_mode,
-              error
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'static', ?)
-            """,
-            [
-                task.pricing_source_id,
-                task.task_id,
-                result.final_url or result.url,
-                result.status or None,
-                result.content_type or None,
-                raw_hash,
-                text_hash,
-                result.error or None,
-            ],
-        )
-        return int(meta.get("last_row_id") or 0)
-
-    async def insert_pricing_claims_shadow(
-        self,
-        task: PricingTask,
-        snapshot_id: int,
-        bundle: PricingSnapshotBundle,
-        capture_plan: SnapshotCapturePlan | None = None,
-    ) -> dict[str, int]:
-        artifact_statements = [
-            (
-                """
-                INSERT OR IGNORE INTO pricing_snapshot_artifacts (
-                  snapshot_id, artifact_type, state_key, object_key, content_hash,
-                  byte_size, content_type, retention_class
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    snapshot_id,
-                    payload.artifact.artifact_type,
-                    payload.artifact.state_key,
-                    payload.artifact.object_key,
-                    payload.artifact.content_hash,
-                    payload.artifact.byte_size,
-                    payload.artifact.content_type,
-                    (
-                        payload.artifact.retention_class
-                        if capture_plan is None or capture_plan.region_changed
-                        else "diagnostic"
-                    ),
-                ],
-            )
-            for payload in bundle.artifacts
-        ]
-        await self.d1.batch(artifact_statements)
-
-        subject_rows = await self.d1.query(
-            """
-            INSERT INTO pricing_subjects (
-              tool_id, pricing_source_id, subject_type, subject_key, source_scope,
-              region_identity, current_name, first_seen_snapshot_id, last_seen_snapshot_id,
-              identity_metadata_json, last_match_score, last_match_reason, updated_at
-            ) VALUES (?, ?, 'product', 'product:root', 'default', 'pricing-main', ?, ?, ?, '{}',
-                      100, 'stable product root', ?)
-            ON CONFLICT (pricing_source_id, subject_key) DO UPDATE SET
-              last_seen_snapshot_id = excluded.last_seen_snapshot_id,
-              current_name = COALESCE(excluded.current_name, pricing_subjects.current_name),
-              last_match_score = 100,
-              last_match_reason = 'stable product root',
-              updated_at = excluded.updated_at
-            RETURNING id
-            """,
-            [
-                task.tool_id,
-                task.pricing_source_id,
-                task.canonical_slug,
-                snapshot_id,
-                snapshot_id,
-                utc_now_iso(),
-            ],
-        )
-        if not subject_rows:
-            subject_rows = await self.d1.query(
-                "SELECT id FROM pricing_subjects WHERE pricing_source_id = ? AND subject_key = 'product:root'",
-                [task.pricing_source_id],
-            )
-        if not subject_rows:
-            raise RuntimeError("Unable to create or resolve the pricing product subject")
-        subject_id = int(subject_rows[0]["id"])
-
-        inserted = 0
-        continued = 0
-        superseded = 0
-        evidence_rows = 0
-        auto_verified = 0
-        unresolved = 0
-        normalization_failed = 0
-        validation_conflicts = 0
-        semantic_validator_required = 0
-        for raw_claim in bundle.raw_claims:
-            normalization = normalize_raw_claim(raw_claim)
-            validation = validate_raw_claim(
-                raw_claim,
-                normalization,
-                bundle.dom_map,
-                bundle.region,
-            )
-            decision_status = (
-                "auto_verified"
-                if validation.status == "entailed"
-                and normalization.status in {"normalized", "not_applicable"}
-                else "unresolved"
-            )
-            auto_verified += int(decision_status == "auto_verified")
-            unresolved += int(decision_status == "unresolved")
-            normalization_failed += int(normalization.status == "failed")
-            validation_conflicts += int(validation.status == "conflict")
-            semantic_validator_required += int(validation.semantic_required)
-            assert_claim_invariants(
-                ClaimState(
-                    normalization.status,
-                    validation.status,
-                    decision_status,
-                    "active",
-                    "not_eligible",
-                ),
-                claim_type=raw_claim.claim_type,
-            )
-            normalized_value_json = (
-                json.dumps(
-                    normalization.normalized_value,
-                    ensure_ascii=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                )
-                if normalization.normalized_value is not None
-                else None
-            )
-            normalization_errors_json = json.dumps(
-                normalization.errors,
-                ensure_ascii=False,
-                separators=(",", ":"),
-            )
-            validation_result_json = json.dumps(
-                {
-                    "confidence": validation.confidence,
-                    "conflicts": validation.conflicts,
-                    "missing_fields": validation.missing_fields,
-                    "reason": validation.reason,
-                    "semantic_required": validation.semantic_required,
-                },
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-            )
-            exact_rows = await self.d1.query(
-                """
-                SELECT id
-                FROM pricing_claims
-                WHERE subject_id = ? AND claim_type = ? AND claim_fingerprint = ?
-                  AND lifecycle_status IN ('active', 'aging')
-                ORDER BY last_seen_at DESC, id DESC
-                LIMIT 1
-                """,
-                [subject_id, raw_claim.claim_type, raw_claim.claim_fingerprint],
-            )
-            if exact_rows:
-                claim_id = int(exact_rows[0]["id"])
-                await self.d1.run(
-                    """
-                    UPDATE pricing_claims
-                    SET last_seen_snapshot_id = ?, consecutive_seen_count = consecutive_seen_count + 1,
-                        miss_count = 0, last_seen_at = ?, lifecycle_status = 'active',
-                        normalized_value_json = ?, normalization_errors_json = ?,
-                        validation_result_json = ?, normalization_status = ?, validation_status = ?,
-                        decision_status = ?, normalization_confidence = ?, completeness_score = ?,
-                        normalizer_version = ?, validator_version = ?, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    [
-                        snapshot_id,
-                        utc_now_iso(),
-                        normalized_value_json,
-                        normalization_errors_json,
-                        validation_result_json,
-                        normalization.status,
-                        validation.status,
-                        decision_status,
-                        normalization.confidence,
-                        normalization.completeness_score,
-                        normalization.version,
-                        validation.version,
-                        utc_now_iso(),
-                        claim_id,
-                    ],
-                )
-                continued += 1
-            else:
-                changed_rows = await self.d1.query(
-                    """
-                    SELECT id
-                    FROM pricing_claims
-                    WHERE subject_id = ? AND claim_type = ?
-                      AND lifecycle_status IN ('active', 'aging')
-                    ORDER BY last_seen_at DESC, id DESC
-                    """,
-                    [subject_id, raw_claim.claim_type],
-                )
-                for changed in changed_rows:
-                    await self.d1.run(
-                        """
-                        UPDATE pricing_claims
-                        SET lifecycle_status = 'superseded',
-                            publication_status = CASE
-                              WHEN publication_status IN ('eligible', 'published') THEN 'withdrawn'
-                              ELSE publication_status
-                            END,
-                            updated_at = ?
-                        WHERE id = ?
-                        """,
-                        [utc_now_iso(), int(changed["id"])],
-                    )
-                    superseded += 1
-                    await self.d1.run(
-                        """
-                        INSERT INTO pricing_claim_events (
-                          claim_id, event_type, event_payload_json
-                        ) VALUES (?, 'change_detected', ?)
-                        """,
-                        [
-                            int(changed["id"]),
-                            json.dumps(
-                                {
-                                    "new_claim_fingerprint": raw_claim.claim_fingerprint,
-                                    "observed_snapshot_id": snapshot_id,
-                                },
-                                separators=(",", ":"),
-                                sort_keys=True,
-                            ),
-                        ],
-                    )
-                claim_rows = await self.d1.query(
-                    """
-                    INSERT INTO pricing_claims (
-                      tool_id, pricing_source_id, snapshot_id, subject_id, subject_key,
-                      claim_type, subject_type, locale_context, region_context,
-                      raw_value_json, normalized_value_json, claim_fingerprint,
-                      normalization_status, validation_status, decision_status,
-                      extraction_confidence, normalization_confidence, completeness_score,
-                      first_seen_snapshot_id, last_seen_snapshot_id, extractor_version,
-                      normalizer_version, validator_version, normalization_errors_json,
-                      validation_result_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 'en-US', 'US', ?, ?, ?, ?, ?, ?, 90,
-                              ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    RETURNING id
-                    """,
-                    [
-                        task.tool_id,
-                        task.pricing_source_id,
-                        snapshot_id,
-                        subject_id,
-                        raw_claim.subject_key,
-                        raw_claim.claim_type,
-                        raw_claim.subject_type,
-                        json.dumps(raw_claim.raw_value, ensure_ascii=False, separators=(",", ":"), sort_keys=True),
-                        normalized_value_json,
-                        raw_claim.claim_fingerprint,
-                        normalization.status,
-                        validation.status,
-                        decision_status,
-                        normalization.confidence,
-                        normalization.completeness_score,
-                        snapshot_id,
-                        snapshot_id,
-                        raw_claim.extractor_version,
-                        normalization.version,
-                        validation.version,
-                        normalization_errors_json,
-                        validation_result_json,
-                    ],
-                )
-                if not claim_rows:
-                    raise RuntimeError(f"Unable to insert raw pricing claim {raw_claim.claim_type}")
-                claim_id = int(claim_rows[0]["id"])
-                inserted += 1
-
-            for evidence in raw_claim.evidence:
-                snapshot_evidence_hash = hashlib.sha256(
-                    f"{snapshot_id}:{evidence.evidence_hash}".encode("utf-8")
-                ).hexdigest()
-                await self.d1.run(
-                    """
-                    INSERT OR IGNORE INTO pricing_claim_evidence (
-                      claim_id, snapshot_id, evidence_type, node_id, container_node_id,
-                      table_row, table_column, quote, selector_hint, evidence_hash, display_order
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                    """,
-                    [
-                        claim_id,
-                        snapshot_id,
-                        evidence.evidence_type,
-                        evidence.node_id,
-                        evidence.container_node_id,
-                        evidence.table_row,
-                        evidence.table_column,
-                        evidence.quote,
-                        evidence.selector_hint,
-                        snapshot_evidence_hash,
-                    ],
-                )
-                evidence_rows += 1
-        return {
-            "artifacts": len(bundle.artifacts),
-            "claims_inserted": inserted,
-            "claims_continued": continued,
-            "claims_superseded": superseded,
-            "evidence_rows": evidence_rows,
-            "claims_auto_verified": auto_verified,
-            "claims_unresolved": unresolved,
-            "normalization_failed": normalization_failed,
-            "validation_conflicts": validation_conflicts,
-            "semantic_validator_required": semantic_validator_required,
-        }
-
-    async def insert_extraction(
-        self,
-        snapshot_id: int,
-        payload: dict[str, Any],
-        review_status: str,
-        confidence: int,
-        validation_errors: list[str],
-        extractor_version: str = PRICING_EXTRACTOR_VERSION,
-        model_name: str | None = None,
-    ) -> int:
-        meta = await self.d1.run(
-            """
-            INSERT INTO pricing_extractions (
-              snapshot_id,
-              schema_version,
-              extractor_version,
-              model_name,
-              raw_extraction_json,
-              confidence_score,
-              validation_errors,
-              review_status
-            )
-            VALUES (?, 'v1', ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                snapshot_id,
-                extractor_version,
-                model_name,
-                json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                confidence,
-                json.dumps(validation_errors, ensure_ascii=False, separators=(",", ":")),
-                review_status,
-            ],
-        )
-        return int(meta.get("last_row_id") or 0)
-
-    async def save_catalog(self, task: PricingTask, result: PricingFetchResult, plans: list[dict[str, Any]]) -> int:
-        now = utc_now_iso()
-        context_hash = sha256_text(f"{task.pricing_source_id}:{result.final_url or result.url}")
-        version_hash = sha256_text(json.dumps(plans, ensure_ascii=False, sort_keys=True, separators=(",", ":")))
-        await self.d1.run(
-            """
-            INSERT INTO pricing_catalog_versions (
-              tool_id,
-              pricing_source_id,
-              context_hash,
-              version_hash,
-              first_observed_at,
-              last_observed_at,
-              status
-            )
-            VALUES (?, ?, ?, ?, ?, ?, 'active')
-            ON CONFLICT (pricing_source_id, context_hash, version_hash) DO UPDATE SET
-              last_observed_at = excluded.last_observed_at,
-              superseded_at = NULL,
-              status = 'active'
-            """,
-            [task.tool_id, task.pricing_source_id, context_hash, version_hash, now, now],
-        )
-        rows = await self.d1.query(
-            """
-            SELECT id
-            FROM pricing_catalog_versions
-            WHERE pricing_source_id = ?
-              AND context_hash = ?
-              AND version_hash = ?
-            LIMIT 1
-            """,
-            [task.pricing_source_id, context_hash, version_hash],
-        )
-        if not rows:
-            raise RuntimeError("Unable to resolve pricing catalog version.")
-        version_id = int(rows[0]["id"])
-
-        await self.d1.run(
-            """
-            UPDATE pricing_catalog_versions
-            SET status = 'superseded',
-                superseded_at = ?
-            WHERE pricing_source_id = ?
-              AND status = 'active'
-              AND id <> ?
-            """,
-            [now, task.pricing_source_id, version_id],
-        )
-        await self.d1.run(
-            """
-            DELETE FROM plan_features
-            WHERE pricing_plan_id IN (
-              SELECT id FROM pricing_plans WHERE pricing_version_id = ?
-            )
-            """,
-            [version_id],
-        )
-        await self.d1.run(
-            """
-            DELETE FROM plan_prices
-            WHERE pricing_plan_id IN (
-              SELECT id FROM pricing_plans WHERE pricing_version_id = ?
-            )
-            """,
-            [version_id],
-        )
-        await self.d1.run("DELETE FROM pricing_plans WHERE pricing_version_id = ?", [version_id])
-
-        for index, plan in enumerate(plans):
-            plan_meta = await self.d1.run(
-                """
-                INSERT INTO pricing_plans (
-                  pricing_version_id,
-                  source_plan_key,
-                  name,
-                  description,
-                  audience,
-                  is_enterprise,
-                  display_order
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    version_id,
-                    plan.get("source_plan_key"),
-                    plan.get("name"),
-                    plan.get("description"),
-                    plan.get("audience"),
-                    1 if plan.get("is_enterprise") else 0,
-                    index,
-                ],
-            )
-            plan_id = int(plan_meta.get("last_row_id") or 0)
-            for price in list(plan.get("prices") or [])[:1]:
-                await self.d1.run(
-                    """
-                    INSERT INTO plan_prices (
-                      pricing_plan_id,
-                      kind,
-                      amount,
-                      currency,
-                      billing_interval,
-                      commitment_interval,
-                      unit,
-                      starting_at,
-                      custom_quote,
-                      display_text,
-                      derived
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
-                    """,
-                    [
-                        plan_id,
-                        price.get("kind") or "recurring",
-                        price.get("amount"),
-                        price.get("currency"),
-                        price.get("billing_interval"),
-                        price.get("commitment_interval"),
-                        price.get("unit"),
-                        1 if price.get("starting_at") else 0,
-                        1 if price.get("custom_quote") else 0,
-                        price.get("display_text"),
-                    ],
-                )
-            for raw_feature in list(plan.get("features") or [])[:24]:
-                feature = normalize_plan_feature(raw_feature)
-                if feature is None:
-                    continue
-                await self.d1.run(
-                    """
-                    INSERT INTO plan_features (
-                      pricing_plan_id,
-                      feature_group,
-                      raw_name,
-                      normalized_key,
-                      state,
-                      value_type,
-                      value_number,
-                      value_text,
-                      unit,
-                      period,
-                      scope,
-                      evidence_quote
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    [
-                        plan_id,
-                        feature["feature_group"],
-                        feature["raw_name"],
-                        feature["normalized_key"],
-                        feature["state"],
-                        feature["value_type"],
-                        feature["value_number"],
-                        feature["value_text"],
-                        feature["unit"],
-                        feature["period"],
-                        feature["scope"],
-                        feature["evidence_quote"],
-                    ],
-                )
-        return version_id
-
-    async def update_summary(self, task: PricingTask, plans: list[dict[str, Any]]) -> None:
-        summary = derive_tool_pricing_summary(plans)
-        await self.d1.run(
-            """
-            UPDATE tools
-            SET pricing_model = ?,
-                has_free_plan = ?,
-                pricing_interval = ?,
-                pricing_currency_code = ?,
-                starting_price_minor = ?,
-                starting_price_usd_minor = ?,
-                updated_at = ?
-            WHERE id = ?
-            """,
-            [
-                summary["pricing_model"],
-                summary["has_free_plan"],
-                summary["pricing_interval"],
-                summary["pricing_currency_code"],
-                summary["starting_price_minor"],
-                summary["starting_price_usd_minor"],
-                utc_now_iso(),
-                task.tool_id,
-            ],
-        )
-
-    async def finish_task(
-        self,
-        task: PricingTask,
-        status: str,
-        error: str | None,
-        result: PricingFetchResult | None,
-    ) -> bool:
-        now = utc_now_iso()
-        exhausted = task.attempts >= task.max_attempts
-        meta = await self.d1.run(
-            """
-            UPDATE pricing_tasks
-            SET status = ?,
-                last_error = ?,
-                run_after = ?,
-                finished_at = ?,
-                dead_letter_at = ?,
-                last_completed_at = ?,
-                lease_owner = NULL,
-                lease_token = NULL,
-                lease_expires_at = NULL,
-                updated_at = ?
-            WHERE id = ?
-              AND status = 'running'
-              AND generation = ?
-              AND lease_token = ?
-            """,
-            [
-                status,
-                (error or "")[:2000] or None,
-                iso_delta(hours=6) if status == "failed" and not exhausted else now,
-                now,
-                now if status not in ("succeeded", "manual_review") and exhausted else None,
-                now,
-                now,
-                task.task_id,
-                task.generation,
-                task.lease_token,
-            ],
-        )
-        if int(meta.get("changes") or 0) == 0:
-            log_info("pricing_task.stale_completion_ignored", task_id=task.task_id)
-            return False
-        capture_succeeded = bool(
-            result
-            and 200 <= result.status < 400
-            and result.page_status in {"found", "contact_sales"}
-            and result.html
-        )
-        if status == "succeeded" or capture_succeeded:
-            capture_hash = sha256_text(result.html) if result else None
-            await self.d1.run(
-                """
-                UPDATE pricing_sources
-                SET last_capture_at = ?,
-                    last_capture_hash = ?,
-                    last_success_at = CASE WHEN ? = 1 THEN ? ELSE last_success_at END,
-                    last_content_hash = CASE WHEN ? = 1 THEN ? ELSE last_content_hash END,
-                    unchanged_runs = CASE
-                      WHEN last_capture_hash = ? THEN unchanged_runs + 1
-                      ELSE 0
-                    END,
-                    next_run_at = ?,
-                    last_error = ?,
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                [
-                    now,
-                    capture_hash,
-                    1 if status == "succeeded" else 0,
-                    now,
-                    1 if status == "succeeded" else 0,
-                    capture_hash,
-                    capture_hash,
-                    iso_delta(days=30),
-                    None if status == "succeeded" else pricing_claims_v2_replay_detail(error),
-                    now,
-                    task.pricing_source_id,
-                ],
-            )
-            return True
-
-        await self.d1.run(
-            """
-            UPDATE pricing_sources
-            SET last_error = ?, updated_at = ?
-            WHERE id = ?
-            """,
-            [pricing_claims_v2_replay_detail(error), now, task.pricing_source_id],
-        )
-        return True
-
-    async def claim_reviewed_extractions(self, limit: int = 20) -> list[ReviewedPricingExtraction]:
-        stale_before = iso_delta(hours=-1)
-        rows = await self.d1.query(
-            """
-            WITH latest_review AS (
-              SELECT extraction_id, max(id) AS review_id
-              FROM pricing_extraction_reviews
-              GROUP BY extraction_id
-            )
-            SELECT
-              extraction.id AS extraction_id,
-              snapshot.pricing_task_id,
-              snapshot.pricing_source_id,
-              task.tool_id,
-              tool.canonical_slug,
-              source.url AS source_url,
-              snapshot.final_url,
-              coalesce(snapshot.http_status, 0) AS http_status,
-              coalesce(snapshot.content_type, '') AS content_type,
-              extraction.raw_extraction_json
-            FROM latest_review latest
-            JOIN pricing_extraction_reviews review ON review.id = latest.review_id
-            JOIN pricing_extractions extraction ON extraction.id = latest.extraction_id
-            JOIN pricing_snapshots snapshot ON snapshot.id = extraction.snapshot_id
-            JOIN pricing_tasks task ON task.id = snapshot.pricing_task_id
-            JOIN pricing_sources source ON source.id = snapshot.pricing_source_id
-            JOIN tools tool ON tool.id = task.tool_id
-            LEFT JOIN pricing_extraction_materializations materialization
-              ON materialization.extraction_id = extraction.id
-            WHERE review.decision = 'approved'
-              AND extraction.review_status = 'approved'
-              AND snapshot.id = (
-                SELECT max(newer_snapshot.id)
-                FROM pricing_snapshots newer_snapshot
-                WHERE newer_snapshot.pricing_source_id = snapshot.pricing_source_id
-              )
-              AND (
-                materialization.extraction_id IS NULL
-                OR materialization.status = 'failed'
-                OR (materialization.status = 'running' AND materialization.started_at < ?)
-              )
-              AND coalesce(materialization.attempts, 0) < 5
-            ORDER BY review.id
-            LIMIT ?
-            """,
-            [stale_before, limit],
-        )
-        claimed: list[ReviewedPricingExtraction] = []
-        now = utc_now_iso()
-        for row in rows:
-            claimed_rows = await self.d1.query(
-                """
-                INSERT INTO pricing_extraction_materializations (
-                  extraction_id, status, attempts, started_at, finished_at, last_error, updated_at
-                )
-                VALUES (?, 'running', 1, ?, NULL, NULL, ?)
-                ON CONFLICT(extraction_id) DO UPDATE SET
-                  status = 'running',
-                  attempts = pricing_extraction_materializations.attempts + 1,
-                  started_at = excluded.started_at,
-                  finished_at = NULL,
-                  last_error = NULL,
-                  updated_at = excluded.updated_at
-                WHERE pricing_extraction_materializations.attempts < 5
-                  AND (
-                    pricing_extraction_materializations.status = 'failed'
-                    OR (
-                      pricing_extraction_materializations.status = 'running'
-                      AND pricing_extraction_materializations.started_at < ?
-                    )
-                  )
-                RETURNING extraction_id
-                """,
-                [int(row["extraction_id"]), now, now, stale_before],
-            )
-            if not claimed_rows:
-                continue
-            try:
-                payload = json.loads(str(row.get("raw_extraction_json") or "{}"))
-            except json.JSONDecodeError:
-                await self.fail_materialization(int(row["extraction_id"]), "Invalid extraction JSON")
-                continue
-            if not isinstance(payload, dict):
-                await self.fail_materialization(int(row["extraction_id"]), "Extraction JSON must be an object")
-                continue
-            claimed.append(
-                ReviewedPricingExtraction(
-                    extraction_id=int(row["extraction_id"]),
-                    pricing_task_id=int(row["pricing_task_id"]),
-                    pricing_source_id=int(row["pricing_source_id"]),
-                    tool_id=int(row["tool_id"]),
-                    canonical_slug=str(row.get("canonical_slug") or ""),
-                    source_url=str(row.get("source_url") or ""),
-                    final_url=str(row.get("final_url") or row.get("source_url") or ""),
-                    http_status=int(row.get("http_status") or 0),
-                    content_type=str(row.get("content_type") or ""),
-                    payload=payload,
-                )
-            )
-        return claimed
-
-    async def fail_materialization(self, extraction_id: int, error: str) -> None:
-        now = utc_now_iso()
-        await self.d1.run(
-            """
-            UPDATE pricing_extraction_materializations
-            SET status = 'failed', finished_at = ?, last_error = ?, updated_at = ?
-            WHERE extraction_id = ? AND status = 'running'
-            """,
-            [now, error[:2000], now, extraction_id],
-        )
-
-    async def materialize_reviewed_extraction(self, extraction: ReviewedPricingExtraction) -> int:
-        plans = list(extraction.payload.get("plans") or [])
-        if not plans:
-            raise RuntimeError("Approved extraction contains no pricing plans")
-        task = PricingTask(
-            task_id=extraction.pricing_task_id,
-            pricing_source_id=extraction.pricing_source_id,
-            tool_id=extraction.tool_id,
-            canonical_slug=extraction.canonical_slug,
-            source_url=extraction.source_url,
-            official_url=extraction.source_url,
-            attempts=0,
-            max_attempts=1,
-            generation=1,
-            lease_token="materializer",
-        )
-        result = PricingFetchResult(
-            url=extraction.source_url,
-            final_url=extraction.final_url,
-            status=extraction.http_status,
-            content_type=extraction.content_type,
-            html="",
-        )
-        version_id = await self.save_catalog(task, result, plans)
-        await self.update_summary(task, plans)
-        now = utc_now_iso()
-        await self.d1.batch(
-            [
-                (
-                    """
-                    UPDATE pricing_extraction_materializations
-                    SET status = 'succeeded', catalog_version_id = ?, finished_at = ?, last_error = NULL, updated_at = ?
-                    WHERE extraction_id = ? AND status = 'running'
-                    """,
-                    [version_id, now, now, extraction.extraction_id],
-                ),
-                (
-                    """
-                    UPDATE pricing_tasks
-                    SET status = 'succeeded', finished_at = ?, last_error = NULL, updated_at = ?
-                    WHERE id = ? AND status = 'manual_review'
-                    """,
-                    [now, now, extraction.pricing_task_id],
-                ),
-                (
-                    """
-                    UPDATE pricing_sources
-                    SET last_success_at = ?, next_run_at = ?, last_error = NULL, updated_at = ?
-                    WHERE id = ?
-                    """,
-                    [now, iso_delta(days=30), now, extraction.pricing_source_id],
-                ),
-            ]
-        )
-        return version_id
 
 
 async def process_task(
@@ -10551,7 +7496,7 @@ async def report_service_schedule(
         log_error("runner.telemetry.schedule_failed", error=str(error)[:300])
 
 
-async def _run_domain_state_once(config: Config, d1: D1Client, limit: int | None = None) -> dict[str, int]:
+async def _run_domain_state_once(config: Config, d1: D1Client, limit: int | None = None, *, discover_due: bool = True) -> dict[str, int]:
     effective_limit = limit or config.domain_state_limit
     concurrency = getattr(config, "domain_state_concurrency", config.concurrency)
     log_info("domain_state_runner.batch.start", limit=effective_limit, concurrency=concurrency)
@@ -10574,13 +7519,21 @@ async def _run_domain_state_once(config: Config, d1: D1Client, limit: int | None
         "domain_state_runner.requeue_missing_credential_tasks.done",
         requeued=credential_requeued,
     )
-    queued = await store.queue_due_tasks(effective_limit, config.domain_state_max_age_days)
-    log_info("domain_state_runner.queue_due_tasks.done", queued=queued)
+    # Claim known due/retry work first. Only discover across the catalog when
+    # this batch has room and the loop's idle discovery interval has elapsed.
     tasks = await store.claim_due_tasks(effective_limit, config.runner_instance_id)
+    queued = 0
+    discovery_ran = discover_due and len(tasks) < effective_limit
+    if discovery_ran:
+        queued = await store.queue_due_tasks(effective_limit - len(tasks), config.domain_state_max_age_days)
+        if queued:
+            tasks.extend(await store.claim_due_tasks(effective_limit - len(tasks), config.runner_instance_id))
+    log_info("domain_state_runner.queue_due_tasks.done", queued=queued, discovery_ran=discovery_ran)
     log_info("domain_state_runner.claim_due_tasks.done", claimed=len(tasks))
 
     semaphore = asyncio.Semaphore(concurrency)
     counts = {
+        "discovery_ran": int(discovery_ran),
         "credential_requeued": credential_requeued,
         "queued": queued,
         "claimed": len(tasks),
@@ -10628,13 +7581,13 @@ async def _run_domain_state_once(config: Config, d1: D1Client, limit: int | None
     return counts
 
 
-async def run_domain_state_once(config: Config, limit: int | None = None) -> dict[str, int]:
+async def run_domain_state_once(config: Config, limit: int | None = None, *, discover_due: bool = True) -> dict[str, int]:
     async with D1Client(config) as d1:
         return await run_with_telemetry(
             config,
             d1,
             "domain_state",
-            lambda: _run_domain_state_once(config, d1, limit),
+            lambda: _run_domain_state_once(config, d1, limit, discover_due=discover_due),
         )
 
 
@@ -10646,7 +7599,7 @@ async def fetch_favicon_asset(page_url: str, domain: str, html_body: str, favico
                 page_response = await client.get(
                     page_url,
                     headers={
-                        "User-Agent": random_pricing_user_agent(),
+                        "User-Agent": random_browser_user_agent(),
                         "Accept": "text/html,application/xhtml+xml",
                     },
                 )
@@ -10660,7 +7613,7 @@ async def fetch_favicon_asset(page_url: str, domain: str, html_body: str, favico
             response = await client.get(
                 favicon_url,
                 headers={
-                    "User-Agent": random_pricing_user_agent(),
+                    "User-Agent": random_browser_user_agent(),
                     "Accept": "image/avif,image/webp,image/png,image/svg+xml,image/*,*/*;q=0.8",
                     "Referer": page_url,
                 },
@@ -10783,47 +7736,6 @@ async def process_asset_task(
                     if isinstance(error, (PageQualityError, ContentSafetyError)):
                         raise
                     record_stage_error("description", error)
-
-            if "key_features" in missing_before:
-                try:
-                    feature_result = await browser_client.fetch_homepage_key_features(task)
-                    if not await store.renew_lease(task):
-                        return "stale"
-                    if feature_result.key_features and not feature_result.metadata_error:
-                        await store.save_tool_features(task, feature_result)
-                    elif await store.save_deterministic_tool_features(
-                        task,
-                        core_result.html if core_result else "",
-                    ):
-                        log_info(
-                            "assets.key_features.deterministic_fallback",
-                            tool_id=task.tool_id,
-                            slug=task.canonical_slug,
-                            model_error=feature_result.metadata_error[:200],
-                        )
-                    else:
-                        record_stage_error(
-                            "key_features",
-                            feature_result.metadata_error or "features_empty",
-                            retryable=feature_result.metadata_retryable,
-                        )
-                except Exception as error:
-                    try:
-                        fallback_saved = await store.save_deterministic_tool_features(
-                            task,
-                            core_result.html if core_result else "",
-                        )
-                    except Exception:
-                        fallback_saved = False
-                    if fallback_saved:
-                        log_info(
-                            "assets.key_features.deterministic_fallback",
-                            tool_id=task.tool_id,
-                            slug=task.canonical_slug,
-                            model_error=str(error)[:200],
-                        )
-                    else:
-                        record_stage_error("key_features", error)
 
             if "screenshot" in missing_before:
                 try:
@@ -11029,441 +7941,6 @@ def is_missing_market_country_schema_error(error: Exception) -> bool:
     return "domain_traffic_country_monthly" in message and (
         "no such table" in message or "table does not exist" in message
     )
-
-
-async def run_openai_pricing_extraction(
-    task: PricingTask,
-    result: PricingFetchResult,
-    payload: dict[str, Any],
-    review_status: str,
-    confidence: int,
-    validation_errors: list[str],
-    openai_extractors: list[OpenAIPricingExtractor],
-    needs_model_check: bool,
-    model_check_reasons: list[str],
-) -> tuple[dict[str, Any], str, int, list[str], str | None]:
-    if not ((review_status != "approved" or needs_model_check) and openai_extractors and result.page_status == "found"):
-        return payload, review_status, confidence, validation_errors, None
-
-    rule_payload = payload
-    rule_review_status = review_status
-    model_name = None
-    model_verified = False
-    for index, openai_extractor in enumerate(openai_extractors):
-        openai_extraction = await openai_extractor.extract(
-            result.html,
-            task.source_url,
-            result.final_url,
-            result.status,
-            result.error,
-        )
-        if openai_extraction is None:
-            if index + 1 < len(openai_extractors):
-                log_info(
-                    "pricing.openai.escalate",
-                    from_model=openai_extractor.model,
-                    to_model=openai_extractors[index + 1].model,
-                    reason="empty_response",
-                )
-            continue
-
-        payload, review_status, confidence, validation_errors = openai_extraction
-        model_name = openai_extractor.model
-        model_verified = True
-        rule_model_agreement = (
-            rule_review_status == "approved"
-            and review_status == "approved"
-            and pricing_payloads_agree(rule_payload, payload)
-        )
-        if rule_model_agreement:
-            merge_evidenced_rule_features(rule_payload, payload)
-        payload["verification"] = {
-            "rule_model_agreement": rule_model_agreement,
-            "model_check_reasons": model_check_reasons,
-        }
-        if (
-            needs_model_check
-            and rule_review_status == "approved"
-            and review_status == "approved"
-            and not rule_model_agreement
-        ):
-            review_status = "manual_review"
-            validation_errors = [
-                *validation_errors,
-                "Rule and model price facts disagree",
-            ]
-            confidence = min(confidence, 65)
-        if (review_status != "approved" or confidence < OPENAI_PRICING_MIN_CONFIDENCE) and index + 1 < len(openai_extractors):
-            log_info(
-                "pricing.openai.escalate",
-                from_model=openai_extractor.model,
-                to_model=openai_extractors[index + 1].model,
-                review_status=review_status,
-                confidence=confidence,
-                validation_errors=validation_errors[:3],
-            )
-            continue
-        break
-
-    if not model_verified and needs_model_check:
-        review_status = "manual_review"
-        validation_errors = [*validation_errors, f"Rule extraction requires model verification: {', '.join(model_check_reasons)}"]
-        confidence = min(confidence, 55)
-    return payload, review_status, confidence, validation_errors, model_name
-
-
-async def discover_missing_pricing_sources(
-    store: D1PricingStore,
-    client: PricingClient,
-    limit: int,
-) -> int:
-    if limit <= 0:
-        return 0
-
-    created = 0
-    for candidate in await store.missing_source_candidates(limit):
-        task = PricingTask(
-            task_id=0,
-            pricing_source_id=0,
-            tool_id=candidate.tool_id,
-            canonical_slug=candidate.canonical_slug,
-            source_url=candidate.official_url,
-            official_url=candidate.official_url,
-            attempts=0,
-            max_attempts=1,
-            generation=1,
-            lease_token="",
-        )
-        result = await client.choose_pricing_page(task)
-        text = parse_pricing_html(result.html).text if result.html else ""
-        text_score = pricing_text_quality(text)
-        if (
-            result.page_status == "found"
-            and result.status == 200
-            and is_strict_pricing_url(result.final_url)
-            and text_score > 0
-        ):
-            confidence = 70 if text_score >= 12 else 60
-            await store.insert_pricing_source(candidate.tool_id, result.final_url, "homepage_link", confidence)
-            created += 1
-            log_info(
-                "pricing_source.discovery.created",
-                tool_id=candidate.tool_id,
-                slug=candidate.canonical_slug,
-                url=result.final_url,
-                text_score=text_score,
-            )
-        else:
-            skip_error = result.error or f"{result.page_status}: HTTP {result.status}; text_score={text_score}"
-            await store.mark_pricing_source_discovery_skipped(
-                candidate.tool_id,
-                result.final_url or candidate.official_url,
-                skip_error,
-                retryable=(
-                    result.status == 0
-                    or result.status in (408, 425, 429)
-                    or result.status >= 500
-                ),
-            )
-            log_info(
-                "pricing_source.discovery.skipped",
-                tool_id=candidate.tool_id,
-                slug=candidate.canonical_slug,
-                final_url=result.final_url,
-                status=result.status,
-                page_status=result.page_status,
-                text_score=text_score,
-                error=(result.error or "")[:200],
-            )
-    return created
-
-
-def should_render_pricing_with_browser(
-    result: PricingFetchResult,
-    review_status: str,
-    text_score: int,
-    validation_errors: list[str],
-) -> bool:
-    if review_status == "approved":
-        return False
-    if result.status != 200 or not result.html:
-        return False
-    if result.page_status not in {"found", "not_found"}:
-        return False
-    if not is_strict_pricing_url(result.final_url):
-        return False
-    if text_score < BROWSER_RENDERING_TEXT_SCORE_THRESHOLD:
-        return True
-    return any("No public pricing plans found" in error for error in validation_errors)
-
-
-async def process_pricing_task(
-    task: PricingTask,
-    client: PricingClient,
-    openai_extractors: list[OpenAIPricingExtractor],
-    browser_renderer: CloudflareBrowserRunRenderer | None,
-    store: D1PricingStore,
-    max_retries: int,
-    approve_pricing: bool,
-    dry_run: bool,
-    claims_shadow_uploader: R2AssetUploader | None = None,
-    strict_auto_publish_enabled: bool = False,
-    strict_auto_publish_min_confidence: int = 82,
-) -> str:
-    result = PricingFetchResult(task.source_url, task.source_url, 0, "", "", "not_started")
-    for attempt in range(max_retries + 1):
-        log_debug(
-            "pricing_task.fetch_attempt.start",
-            task_id=task.task_id,
-            slug=task.canonical_slug,
-            attempt=attempt + 1,
-            max_attempts=max_retries + 1,
-        )
-        result = await client.choose_pricing_page(task)
-        pricing_fetch_log = log_debug if result.status and result.status < 500 else log_info
-        pricing_fetch_log(
-            "pricing_task.fetch_attempt.done",
-            task_id=task.task_id,
-            slug=task.canonical_slug,
-            attempt=attempt + 1,
-            status=result.status,
-            final_url=result.final_url,
-        )
-        if result.status and result.status < 500:
-            break
-        if attempt < max_retries:
-            await asyncio.sleep(random.uniform(1.0, 3.0))
-
-    original_fetch_result = result
-    payload, review_status, confidence, validation_errors = extract_pricing_payload(
-        result.html,
-        task.source_url,
-        result.final_url,
-        result.status,
-        result.error,
-        result.page_status,
-        result.discovery_method,
-    )
-    extractor_version = PRICING_EXTRACTOR_VERSION
-    model_name = None
-    text_score = pricing_text_quality(parse_pricing_html(result.html).text if result.html else "")
-    needs_model_check, model_check_reasons = should_verify_rule_pricing_with_openai(
-        payload,
-        text_score,
-        result.page_status,
-    )
-    payload, review_status, confidence, validation_errors, model_name = await run_openai_pricing_extraction(
-        task,
-        result,
-        payload,
-        review_status,
-        confidence,
-        validation_errors,
-        openai_extractors,
-        needs_model_check,
-        model_check_reasons,
-    )
-    if model_name:
-        extractor_version = OPENAI_PRICING_EXTRACTOR_VERSION
-
-    if browser_renderer is not None and should_render_pricing_with_browser(result, review_status, text_score, validation_errors):
-        rendered_result = await browser_renderer.render(result)
-        if rendered_result is not None:
-            result = rendered_result
-            payload, review_status, confidence, validation_errors = extract_pricing_payload(
-                result.html,
-                task.source_url,
-                result.final_url,
-                result.status,
-                result.error,
-                result.page_status,
-                result.discovery_method,
-            )
-            extractor_version = PRICING_EXTRACTOR_VERSION
-            model_name = None
-            text_score = pricing_text_quality(parse_pricing_html(result.html).text if result.html else "")
-            needs_model_check, model_check_reasons = should_verify_rule_pricing_with_openai(
-                payload,
-                text_score,
-                result.page_status,
-            )
-            payload, review_status, confidence, validation_errors, model_name = await run_openai_pricing_extraction(
-                task,
-                result,
-                payload,
-                review_status,
-                confidence,
-                validation_errors,
-                openai_extractors,
-                needs_model_check,
-                model_check_reasons,
-            )
-            if model_name:
-                extractor_version = OPENAI_PRICING_EXTRACTOR_VERSION
-
-    final_pipeline_stage = derive_final_pipeline_stage(
-        payload,
-        review_status,
-        extractor_version,
-        model_name,
-        result.discovery_method,
-    )
-    payload["final_pipeline_stage"] = final_pipeline_stage
-
-    verification = payload.get("verification") if isinstance(payload.get("verification"), dict) else {}
-    auto_approval = evaluate_strict_auto_approval(
-        payload,
-        review_status=review_status,
-        confidence=confidence,
-        validation_errors=validation_errors,
-        http_status=result.status,
-        page_status=result.page_status,
-        strict_source_context=(
-            is_strict_pricing_url(result.final_url)
-            and final_url_matches_source_context(task.source_url, result.final_url)
-        ),
-        model_used=bool(model_name),
-        rule_model_agreement=bool(verification.get("rule_model_agreement")),
-        min_confidence=strict_auto_publish_min_confidence,
-    )
-    payload["auto_approval"] = auto_approval.as_dict()
-    strict_auto_publish = strict_auto_publish_enabled and auto_approval.eligible
-
-    if strict_auto_publish:
-        log_info(
-            "pricing_task.strict_auto_publish.accepted",
-            task_id=task.task_id,
-            slug=task.canonical_slug,
-            policy_version=auto_approval.policy_version,
-            confidence=confidence,
-            final_pipeline_stage=final_pipeline_stage,
-            plans=len(payload.get("plans") or []),
-        )
-
-    if review_status == "approved" and not (approve_pricing or strict_auto_publish):
-        review_status = "manual_review"
-        validation_errors = (
-            [f"Strict auto-publish blocked: {', '.join(auto_approval.reasons)}"]
-            if strict_auto_publish_enabled
-            else ["Python extraction pending manual approval"]
-        )
-        confidence = min(confidence, 70)
-
-    if dry_run:
-        log_info(
-            "pricing_task.dry_run",
-            task_id=task.task_id,
-            slug=task.canonical_slug,
-            review_status=review_status,
-            final_pipeline_stage=final_pipeline_stage,
-            plans=len(payload.get("plans") or []),
-            final_url=result.final_url,
-            validation_errors=validation_errors,
-        )
-        return "dry_run"
-
-    if not await store.renew_lease(task):
-        return "stale"
-    claims_bundle: PricingSnapshotBundle | None = None
-    shadow_plan: SnapshotCapturePlan | None = None
-    shadow_persisted = False
-    shadow_claim_count = 0
-    if claims_shadow_uploader is not None and result.html:
-        try:
-            claims_bundle = build_pricing_snapshot_bundle(
-                result.html,
-                rendered="browser_run" in result.discovery_method,
-                original_html=(
-                    original_fetch_result.html
-                    if "browser_run" in result.discovery_method and original_fetch_result.html
-                    else None
-                ),
-            )
-            shadow_plan = await store.prepare_pricing_claims_shadow(
-                task,
-                claims_bundle,
-                claims_shadow_uploader,
-            )
-            log_info(
-                "pricing_claims_shadow.prepared",
-                task_id=task.task_id,
-                region_found=bool(claims_bundle.region.root_node_ids),
-                region_changed=shadow_plan.region_changed,
-                run_extraction=shadow_plan.run_extraction,
-                raw_claims=len(claims_bundle.raw_claims),
-                artifacts_uploaded=len(shadow_plan.upload_artifacts),
-            )
-        except Exception as error:
-            claims_bundle = None
-            shadow_plan = None
-            log_error(
-                "pricing_claims_shadow.prepare_failed",
-                task_id=task.task_id,
-                error=str(error)[:500],
-            )
-
-    try:
-        snapshot_id = await store.insert_snapshot(task, result, claims_bundle)
-    except Exception as error:
-        if claims_bundle is None:
-            raise
-        log_error(
-            "pricing_claims_shadow.snapshot_insert_fallback",
-            task_id=task.task_id,
-            error=str(error)[:500],
-        )
-        claims_bundle = None
-        shadow_plan = None
-        snapshot_id = await store.insert_snapshot(task, result)
-
-    if claims_bundle is not None:
-        try:
-            shadow_counts = await store.insert_pricing_claims_shadow(
-                task,
-                snapshot_id,
-                claims_bundle,
-                shadow_plan,
-            )
-            shadow_persisted = True
-            shadow_claim_count = len(claims_bundle.raw_claims)
-            log_info(
-                "pricing_claims_shadow.persisted",
-                task_id=task.task_id,
-                snapshot_id=snapshot_id,
-                region_changed=shadow_plan.region_changed if shadow_plan is not None else None,
-                **shadow_counts,
-            )
-        except Exception as error:
-            log_error(
-                "pricing_claims_shadow.persist_failed",
-                task_id=task.task_id,
-                snapshot_id=snapshot_id,
-                error=str(error)[:500],
-            )
-    await store.insert_extraction(
-        snapshot_id,
-        payload,
-        review_status,
-        confidence,
-        validation_errors,
-        extractor_version=extractor_version,
-        model_name=model_name,
-    )
-
-    if review_status == "approved":
-        if not await store.renew_lease(task):
-            return "stale"
-        plans = list(payload.get("plans") or [])
-        await store.save_catalog(task, result, plans)
-        await store.update_summary(task, plans)
-        completed = await store.finish_task(task, "succeeded", None, result)
-        return "succeeded" if completed else "stale"
-
-    error = "; ".join(validation_errors)[:900] or result.error or "manual review"
-    if task.is_manual_review_replay and shadow_persisted:
-        error = pricing_claims_v2_replay_error(error, shadow_claim_count)
-    completed = await store.finish_task(task, "manual_review", error, result)
-    return "manual_review" if completed else "stale"
 
 
 async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = None) -> dict[str, int]:
@@ -11702,240 +8179,49 @@ async def _run_once(config: Config, d1: D1Client, limit: int | None = None) -> d
 
 async def run_once(config: Config, limit: int | None = None) -> dict[str, int]:
     async with D1Client(config) as d1:
-        return await run_with_telemetry(
+        counts = await run_with_telemetry(
             config,
             d1,
             "traffic",
             lambda: _run_once(config, d1, limit),
         )
-
-
-async def _run_pricing_once(
-    config: Config,
-    d1: D1Client,
-    limit: int | None = None,
-    task_ids: list[int] | None = None,
-    approve_pricing: bool = False,
-    dry_run: bool = False,
-    timeout_seconds: int | None = None,
-) -> dict[str, int]:
-    effective_limit = limit or config.pricing_limit
-    concurrency = getattr(config, "pricing_concurrency", config.concurrency)
-    assert_safe_pricing_claim_flags(
-        shadow_enabled=config.pricing_claims_shadow,
-        publish_enabled=config.pricing_claims_publish,
-    )
-    log_info(
-        "pricing_runner.batch.start",
-        limit=effective_limit,
-        concurrency=concurrency,
-        dry_run=dry_run,
-        approve_pricing=approve_pricing,
-        pricing_claims_shadow=config.pricing_claims_shadow,
-        pricing_claims_publish=config.pricing_claims_publish,
-        pricing_strict_auto_publish_enabled=getattr(
-            config, "pricing_strict_auto_publish_enabled", False
-        ),
-        pricing_strict_auto_publish_min_confidence=getattr(
-            config, "pricing_strict_auto_publish_min_confidence", 82
-        ),
-    )
-    store = D1PricingStore(d1)
-    materialized = 0
-    materialization_failed = 0
-    if not dry_run:
-        reviewed_extractions = await store.claim_reviewed_extractions(effective_limit)
-        for extraction in reviewed_extractions:
-            try:
-                await store.materialize_reviewed_extraction(extraction)
-                materialized += 1
-            except Exception as error:
-                materialization_failed += 1
-                await store.fail_materialization(extraction.extraction_id, str(error))
-                log_error(
-                    "pricing_materialization.failed",
-                    extraction_id=extraction.extraction_id,
-                    error=str(error)[:300],
-                )
-    client = PricingClient(timeout_seconds or config.pricing_timeout_seconds)
-    openai_models: list[str] = []
-    if config.openai_api_key:
-        for model in (config.openai_pricing_model, config.openai_pricing_fallback_model):
-            clean_model = (model or "").strip()
-            if clean_model and clean_model not in openai_models:
-                openai_models.append(clean_model)
-    openai_extractors = [
-        OpenAIPricingExtractor(
-            config.openai_api_key,
-            model,
-            config.openai_pricing_timeout_seconds,
-            config.openai_pricing_text_chars,
-        )
-        for model in openai_models
-    ]
-    log_info(
-        "pricing_runner.openai_config",
-        enabled=bool(openai_extractors),
-        models=openai_models,
-    )
-    browser_renderer = CloudflareBrowserRunRenderer(config) if config.browser_rendering_enabled else None
-    log_info(
-        "pricing_runner.browser_rendering_config",
-        enabled=browser_renderer is not None,
-        timeout_seconds=config.browser_rendering_timeout_seconds if browser_renderer is not None else None,
-    )
-    claims_shadow_uploader = (
-        R2AssetUploader(config)
-        if config.pricing_claims_shadow and not dry_run
-        else None
-    )
-    log_info(
-        "pricing_runner.claims_shadow_storage_config",
-        enabled=claims_shadow_uploader is not None,
-        bucket=config.r2_bucket if claims_shadow_uploader is not None else None,
-    )
-    queued = 0
-    discovered_sources = 0
-    if not task_ids and not dry_run:
-        queued = await store.queue_due_tasks(effective_limit)
-        log_info("pricing_runner.queue_due_tasks.done", queued=queued)
-        if queued < effective_limit:
-            discovered_sources = await discover_missing_pricing_sources(store, client, effective_limit - queued)
-            log_info("pricing_runner.discover_missing_sources.done", discovered=discovered_sources)
-            if discovered_sources:
-                queued += await store.queue_due_tasks(effective_limit - queued)
-                log_info("pricing_runner.queue_discovered_tasks.done", queued=queued)
-    tasks = await store.claim_due_tasks(
-        effective_limit,
-        task_ids=task_ids,
-        claim=not dry_run,
-        lease_owner=config.runner_instance_id,
-        replay_manual_review=False,
-    )
-    if (
-        config.pricing_claims_shadow
-        and not dry_run
-        and not task_ids
-        and len(tasks) < effective_limit
-        and config.pricing_manual_review_replay_limit > 0
-    ):
-        replay_limit = min(
-            effective_limit - len(tasks),
-            config.pricing_manual_review_replay_limit,
-        )
-        tasks.extend(
-            await store.claim_due_tasks(
-                replay_limit,
-                claim=True,
-                lease_owner=config.runner_instance_id,
-                replay_manual_review=True,
+        # Publication is independent of report exports and also runs on idle batches.
+        try:
+            publication = await refresh_completed_market_snapshot(
+                d1, source=TRAFFIC_SOURCE, visible_tools_ctes=MARKET_VISIBLE_TOOLS_CTES,
+                build=build_market_snapshot_from_d1, activate=activate_market_snapshot_from_d1,
             )
-        )
-    manual_review_replayed = sum(1 for task in tasks if task.is_manual_review_replay)
-    log_info(
-        "pricing_runner.claim_due_tasks.done",
-        claimed=len(tasks),
-        manual_review_replayed=manual_review_replayed,
-        dry_run=dry_run,
-    )
-
-    semaphore = asyncio.Semaphore(concurrency)
-    counts = {
-        "queued": queued,
-        "discovered_sources": discovered_sources,
-        "materialized": materialized,
-        "materialization_failed": materialization_failed,
-        "claimed": len(tasks),
-        "manual_review_replayed": manual_review_replayed,
-        "succeeded": 0,
-        "manual_review": 0,
-        "failed": 0,
-        "dry_run": 0,
-        "stale": 0,
-    }
-
-    async def guarded(task: PricingTask) -> None:
-        async with semaphore:
-            try:
-                log_debug("pricing_task.start", task_id=task.task_id, slug=task.canonical_slug)
-                status = await process_pricing_task(
-                    task,
-                    client,
-                    openai_extractors,
-                    browser_renderer,
-                    store,
-                    config.max_retries,
-                    approve_pricing=approve_pricing,
-                    dry_run=dry_run,
-                    claims_shadow_uploader=claims_shadow_uploader,
-                    strict_auto_publish_enabled=getattr(
-                        config, "pricing_strict_auto_publish_enabled", False
-                    ),
-                    strict_auto_publish_min_confidence=getattr(
-                        config, "pricing_strict_auto_publish_min_confidence", 82
-                    ),
-                )
-            except Exception as error:
-                status = "failed" if dry_run else "manual_review"
-                log_error(
-                    "pricing_task.failed_with_exception",
-                    task_id=task.task_id,
-                    slug=task.canonical_slug,
-                    error=str(error)[:300],
-                )
-                if not dry_run:
-                    if not await store.finish_task(task, "manual_review", str(error)[:900], None):
-                        status = "stale"
-            counts[status] = counts.get(status, 0) + 1
-            log_task_result(
-                "pricing_task.done",
-                status,
-                task_id=task.task_id,
-                slug=task.canonical_slug,
-            )
-
-    if tasks:
-        await asyncio.gather(*(guarded(task) for task in tasks))
-
-    return counts
-
-
-async def run_pricing_once(
-    config: Config,
-    limit: int | None = None,
-    task_ids: list[int] | None = None,
-    approve_pricing: bool = False,
-    dry_run: bool = False,
-    timeout_seconds: int | None = None,
-) -> dict[str, int]:
-    if not getattr(config, "pricing_monitor_enabled", True):
-        log_info("pricing_runner.disabled", kill_switch="PRICING_MONITOR_ENABLED=0")
-        return {"disabled": 1}
-    async with D1Client(config) as d1:
-        if dry_run:
-            return await _run_pricing_once(
-                config,
-                d1,
-                limit,
-                task_ids=task_ids,
-                approve_pricing=False,
-                dry_run=True,
-                timeout_seconds=timeout_seconds,
-            )
-        return await run_with_telemetry(
-            config,
-            d1,
-            "pricing",
-            lambda: _run_pricing_once(
-                config,
-                d1,
-                limit,
-                task_ids=task_ids,
-                approve_pricing=approve_pricing,
-                dry_run=dry_run,
-                timeout_seconds=timeout_seconds,
-            ),
-        )
+            for status in ("active", "waiting", "blocked"):
+                counts["market_snapshot_" + status] = int(publication["status"] == status)
+            if publication["status"] not in ("disabled", "throttled", "locked"):
+                log_info("market_snapshot.auto_publish", **publication)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            counts["market_snapshot_blocked"] = 1
+            log_error("market_snapshot.auto_publish.failed", error_type=type(error).__name__)
+        # Catch up keyword projections even when the market month was published earlier.
+        try:
+            demand = await refresh_completed_search_demand(d1, source=TRAFFIC_SOURCE)
+            for status in ("active", "blocked"):
+                counts["search_demand_" + status] = int(demand["status"] == status)
+            if demand["status"] not in ("disabled", "throttled", "locked"):
+                log_info("search_demand.auto_publish", **demand)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            counts["search_demand_blocked"] = 1
+            log_error("search_demand.auto_publish.failed", error_type=type(error).__name__)
+        # Runs after collection, including idle batches. Rendering is independent;
+        # export failures never undo or misreport the traffic collection batch.
+        try:
+            counts.update(await export_ready_reports(d1, previous_traffic_month()))
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            counts["report_exports_blocked"] = 1
+            log_error("report_export.failed", error_type=type(error).__name__)
+        return counts
 
 
 def assets_next_delay_seconds(
@@ -12008,43 +8294,6 @@ async def run_loop(config: Config, limit: int | None, interval_seconds: int) -> 
         await asyncio.sleep(interval_seconds)
 
 
-async def run_pricing_loop(
-    config: Config,
-    limit: int | None,
-    interval_seconds: int,
-    task_ids: list[int] | None,
-    approve_pricing: bool,
-    dry_run: bool,
-    timeout_seconds: int | None,
-) -> None:
-    log_info("pricing_runner.loop.start", interval_seconds=interval_seconds)
-    if not getattr(config, "pricing_monitor_enabled", True):
-        log_info("pricing_runner.disabled", kill_switch="PRICING_MONITOR_ENABLED=0")
-        while True:
-            await asyncio.sleep(max(60, interval_seconds))
-    while True:
-        started_at = time.monotonic()
-        try:
-            counts = await run_pricing_once(
-                config,
-                limit,
-                task_ids=task_ids,
-                approve_pricing=approve_pricing,
-                dry_run=dry_run,
-                timeout_seconds=timeout_seconds,
-            )
-            log_info(
-                "pricing_runner.batch.summary",
-                duration_ms=round((time.monotonic() - started_at) * 1000),
-                **counts,
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception as error:
-            log_error("pricing_runner.batch.failed", error=str(error)[:500])
-        await asyncio.sleep(interval_seconds)
-
-
 def domain_state_next_delay_seconds(
     counts: dict[str, int],
     batch_limit: int,
@@ -12063,6 +8312,23 @@ def domain_state_next_delay_seconds(
     return max(configured_interval, 60)
 
 
+@dataclass
+class DomainDiscoveryBackoff:
+    next_discovery_at: float = 0.0
+    empty_scans: int = 0
+
+    def due(self, now: float) -> bool:
+        return now >= self.next_discovery_at
+
+    def observe(self, counts: dict[str, int], now: float) -> None:
+        if int(counts.get("queued") or 0) > 0 or int(counts.get("claimed") or 0) > 0:
+            self.empty_scans = 0
+            self.next_discovery_at = now
+        elif counts.get("discovery_ran"):
+            self.empty_scans = min(5, self.empty_scans + 1)
+            self.next_discovery_at = now + min(900, 60 * 2 ** (self.empty_scans - 1))
+
+
 async def run_domain_state_loop(config: Config, limit: int | None, interval_seconds: int) -> None:
     effective_limit = limit or config.domain_state_limit
     log_info(
@@ -12076,11 +8342,13 @@ async def run_domain_state_loop(config: Config, limit: int | None, interval_seco
             AHREFS_DEFAULT_REQUESTS_PER_MINUTE,
         ),
     )
+    discovery = DomainDiscoveryBackoff()
     while True:
         started_at = time.monotonic()
         next_delay = interval_seconds
         try:
-            counts = await run_domain_state_once(config, effective_limit)
+            counts = await run_domain_state_once(config, effective_limit, discover_due=discovery.due(started_at))
+            discovery.observe(counts, time.monotonic())
             log_info(
                 "domain_state_runner.batch.summary",
                 duration_ms=round((time.monotonic() - started_at) * 1000),
@@ -12091,6 +8359,8 @@ async def run_domain_state_loop(config: Config, limit: int | None, interval_seco
                 effective_limit,
                 interval_seconds,
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as error:
             log_error("domain_state_runner.batch.failed", error=str(error)[:500])
         await asyncio.sleep(next_delay)
@@ -12353,20 +8623,17 @@ async def run_all_loop(
     config: Config,
     limit: int | None,
     interval_seconds: int,
-    timeout_seconds: int | None,
     service_telemetry: RunnerTelemetry | None = None,
 ) -> None:
     shared_interval = interval_seconds or 300
     assets_interval = max(60, shared_interval // 2)
     traffic_interval = shared_interval
     domain_state_interval = getattr(config, "domain_state_poll_interval_seconds", 1)
-    pricing_interval = max(900, shared_interval * 3)
     log_info(
         "all_runner.loop.start",
         assets_interval_seconds=assets_interval,
         traffic_interval_seconds=traffic_interval,
         domain_state_interval_seconds=domain_state_interval,
-        pricing_interval_seconds=pricing_interval,
         taxonomy_enabled=config.taxonomy_auto_enabled,
         taxonomy_interval_seconds=config.taxonomy_interval_seconds,
     )
@@ -12375,18 +8642,6 @@ async def run_all_loop(
         run_loop(config, limit or config.limit, traffic_interval),
         run_domain_state_loop(config, config.domain_state_limit, domain_state_interval),
     ]
-    if getattr(config, "pricing_monitor_enabled", True):
-        loops.append(
-            run_pricing_loop(
-                config,
-                config.pricing_limit,
-                pricing_interval,
-                None,
-                False,
-                False,
-                timeout_seconds,
-            )
-        )
     if config.taxonomy_auto_enabled:
         loops.append(run_taxonomy_loop(config, service_telemetry))
     await asyncio.gather(*loops)
@@ -12397,8 +8652,6 @@ def runtime_profile_for_args(args: argparse.Namespace) -> tuple[str, tuple[str, 
         return "periodic-facts-worker", ("traffic", "domain_state")
     if args.assets:
         return "assets-worker", ("assets", "enrichment", "catalog_publish")
-    if args.pricing:
-        return "pricing-monitor-worker", ("pricing",)
     if args.taxonomy:
         return "taxonomy-worker", ("taxonomy",)
     if args.domain_state:
@@ -12408,7 +8661,6 @@ def runtime_profile_for_args(args: argparse.Namespace) -> tuple[str, tuple[str, 
             "assets",
             "traffic",
             "domain_state",
-            "pricing",
             "taxonomy",
             "enrichment",
             "catalog_publish",
@@ -12431,8 +8683,6 @@ def apply_runtime_profile(config: Config, args: argparse.Namespace) -> Config:
     default_service, workloads = runtime_profile_for_args(args)
     if args.all and not getattr(config, "taxonomy_auto_enabled", False):
         workloads = tuple(workload for workload in workloads if workload != "taxonomy")
-    if args.all and not getattr(config, "pricing_monitor_enabled", True):
-        workloads = tuple(workload for workload in workloads if workload != "pricing")
     service_name = (os.getenv("RUNNER_SERVICE_NAME") or default_service).strip()
     if not hasattr(config, "__dataclass_fields__"):
         setattr(config, "runner_service_name", service_name)
@@ -12448,11 +8698,10 @@ def apply_runtime_profile(config: Config, args: argparse.Namespace) -> Config:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Scheduled traffic, assets, and pricing runner")
+    parser = argparse.ArgumentParser(description="Scheduled traffic, assets, domain-state, and taxonomy runner")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--once", action="store_true", help="process one batch and exit")
     mode.add_argument("--loop", action="store_true", help="poll tasks forever")
-    parser.add_argument("--pricing", action="store_true", help="process pricing_tasks instead of traffic_tasks")
     parser.add_argument("--assets", action="store_true", help="process asset_tasks instead of traffic_tasks")
     parser.add_argument("--domain-state", action="store_true", help="process domain rating and whois creation date tasks")
     parser.add_argument(
@@ -12556,25 +8805,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="simulate auto_accepted when provisional confidence >= threshold (default 0.85)",
     )
     parser.add_argument("--all", action="store_true", help="legacy: run every automatic workload in one process")
-    parser.add_argument("--approve-pricing", action="store_true", help="write approved pricing extractions into active catalogs")
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="for pricing, market snapshot, or Shadow taxonomy: run without writes",
+        help="for market snapshot or Shadow taxonomy: run without writes",
     )
     parser.add_argument(
         "--task-id",
         type=int,
         action="append",
         default=[],
-        help="pricing task id, or published tool id with Shadow taxonomy/eval modes; can be repeated",
+        help="published tool id with Shadow taxonomy/eval modes; can be repeated",
     )
-    parser.add_argument("--timeout", type=int, default=None, help="pricing HTTP timeout in seconds")
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--interval-seconds", type=int, default=None)
     args = parser.parse_args(argv)
     selected = [
-        args.pricing,
         args.assets,
         args.domain_state,
         args.periodic_facts,
@@ -12588,7 +8834,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     ]
     if sum(1 for value in selected if value) > 1:
         parser.error(
-            "--pricing, --assets, --domain-state, --periodic-facts, --taxonomy, "
+            "--assets, --domain-state, --periodic-facts, --taxonomy, "
             "--backfill-traffic-monthly, "
             "--build-market-snapshot, --activate-market-snapshot-id, "
             "--shadow-taxonomy, "
@@ -12598,25 +8844,19 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--all requires --loop")
     if args.interval_seconds is not None and args.interval_seconds <= 0:
         parser.error("--interval-seconds must be positive")
-    if args.approve_pricing:
-        parser.error("--approve-pricing is retired; approve the stored extraction in ainav Admin")
-    if args.approve_pricing and not args.pricing:
-        parser.error("--approve-pricing requires --pricing")
     if args.task_id and not (
-        args.pricing
-        or args.shadow_taxonomy
+        args.shadow_taxonomy
         or args.eval_gold
     ):
         parser.error(
-            "--task-id requires --pricing, --shadow-taxonomy, or --eval-gold"
+            "--task-id requires --shadow-taxonomy, or --eval-gold"
         )
     if args.dry_run and not (
-        args.pricing
-        or args.build_market_snapshot
+        args.build_market_snapshot
         or args.shadow_taxonomy
     ):
         parser.error(
-            "--dry-run requires --pricing, --build-market-snapshot, or --shadow-taxonomy"
+            "--dry-run requires --build-market-snapshot, or --shadow-taxonomy"
         )
     if args.market_traffic_month and not args.build_market_snapshot:
         parser.error("--market-traffic-month requires --build-market-snapshot")
@@ -12669,8 +8909,7 @@ def main() -> None:
     args = parse_args()
     config = load_config(
         require_brightdata=not (
-            args.pricing
-            or args.assets
+            args.assets
             or args.domain_state
             or args.taxonomy
             or args.backfill_traffic_monthly
@@ -12797,7 +9036,7 @@ def main() -> None:
             run_with_service_heartbeat(
                 config,
                 lambda telemetry: run_all_loop(
-                    config, args.limit, interval_seconds, args.timeout, telemetry
+                    config, args.limit, interval_seconds, telemetry
                 ),
             )
         )
@@ -12835,36 +9074,6 @@ def main() -> None:
         log_info("domain_state_runner.batch.summary", **counts)
         return
 
-    if args.pricing:
-        if args.loop:
-            asyncio.run(
-                run_with_service_heartbeat(
-                    config,
-                    lambda telemetry: run_pricing_loop(
-                        config,
-                        args.limit,
-                        interval_seconds,
-                        args.task_id,
-                        args.approve_pricing,
-                        args.dry_run,
-                        args.timeout,
-                    ),
-                )
-            )
-            return
-
-        counts = asyncio.run(
-            run_pricing_once(
-                config,
-                args.limit,
-                task_ids=args.task_id,
-                approve_pricing=args.approve_pricing,
-                dry_run=args.dry_run,
-                timeout_seconds=args.timeout,
-            )
-        )
-        log_info("pricing_runner.batch.summary", **counts)
-        return
 
     if args.loop:
         asyncio.run(

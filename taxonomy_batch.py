@@ -15,6 +15,10 @@ from typing import Any
 
 import httpx
 
+from taxonomy_schema import strict_json_schema
+
+from taxonomy_precision import MIN_AUTO_PRIMARY_CONFIDENCE, PRIMARY_POLICY_VERSION, catalog_fingerprint, primary_acceptance
+
 from taxonomy_shadow import (
     PROVIDER_BLOCKED_RE,
     SHADOW_EXTRACTOR_VERSION,
@@ -50,7 +54,7 @@ from taxonomy_shadow import (
 )
 
 BATCH_PIPELINE_VERSION = "openai-batch-p2a-v1-2026-08-24"
-BATCH_PROMPT_VERSION = "openai-batch-markets-capabilities-v2-security-precision-2026-08-27"
+BATCH_PROMPT_VERSION = "openai-batch-markets-capabilities-v4-scoped-primary-evidence-2026-09-10"
 OPENAI_BATCH_ENDPOINT = "/v1/responses"
 FAILED_BATCH_STATUSES = {"failed", "expired", "cancelled"}
 OPENAI_FILE_READY_STATUS = "processed"
@@ -388,35 +392,6 @@ def response_usage(body: dict[str, Any]) -> dict[str, int]:
     }
 
 
-def strict_json_schema(schema: dict[str, Any]) -> dict[str, Any]:
-    """Normalize existing schemas to OpenAI strict Structured Outputs rules.
-
-    Strict mode requires every property of an object to be listed in
-    ``required``. Existing Browser Rendering schemas intentionally allowed a
-    few evidence metadata fields to be absent, so Batch asks the model to emit
-    empty strings for those fields instead.
-    """
-    cloned = json.loads(json.dumps(schema))
-
-    def visit(node: Any) -> None:
-        if not isinstance(node, dict):
-            return
-        if node.get("type") == "object" and isinstance(node.get("properties"), dict):
-            node["additionalProperties"] = False
-            node["required"] = list(node["properties"].keys())
-            for child in node["properties"].values():
-                visit(child)
-        items = node.get("items")
-        if isinstance(items, dict):
-            visit(items)
-        for keyword in ("anyOf", "oneOf", "allOf"):
-            for child in node.get(keyword) or []:
-                visit(child)
-
-    visit(cloned)
-    return cloned
-
-
 @dataclass(frozen=True)
 class ParsedBatchResult:
     custom_id: str
@@ -560,7 +535,7 @@ def should_escalate_leaf(
 ) -> bool:
     if not decision or not decision.get("evidence"):
         return True
-    if float(decision.get("confidence") or 0.0) < float(min_confidence):
+    if float(decision.get("confidence") or 0.0) < max(MIN_AUTO_PRIMARY_CONFIDENCE, float(min_confidence)):
         return True
     if len(l1_hits) >= 2:
         gap = float(l1_hits[0].get("confidence") or 0.0) - float(
@@ -778,6 +753,49 @@ def stage_policy(config: Any, stage: str) -> tuple[str, str, int]:
     return model, effort, max_tokens
 
 
+def capability_candidates_for_item(item: dict[str, Any], catalog: TaxonomyCatalog, limit: int = 96):
+    profile = _json_object(item.get("profile_json"))
+    leaf_raw = _json_object(item.get("leaf_json"))
+    l1_hits = parse_top2_l1(_json_object(item.get("l1_json")), catalog)
+    pool = build_leaf_candidate_pool(l1_hits, catalog)
+    metadata = _json_object(item.get("model_trace_json"))
+    markets = [
+        term
+        for term in (
+            catalog.get("primary_category", str(slug))
+            for slug in metadata.get("existing_market_slugs") or []
+        )
+        if term is not None
+    ]
+    if not markets:
+        primary = parse_leaf_decision(
+            leaf_raw,
+            pool,
+            catalog,
+            source_url=str(item.get("source_url") or ""),
+            source_text=profile_evidence_text(profile),
+        )
+        secondary = parse_secondary_leaf_decisions(
+            leaf_raw,
+            pool,
+            catalog,
+            primary_slug=primary["term"].slug if primary else "",
+            source_url=str(item.get("source_url") or ""),
+            source_text=profile_evidence_text(profile),
+        )
+        markets = [
+            decision["term"]
+            for decision in ([primary] if primary else []) + secondary
+        ]
+    candidates = recall_capability_candidates(
+        profile,
+        catalog,
+        markets=markets,
+        limit=int(limit),
+    )
+    return candidates
+
+
 def _stage_prompt_and_schema(
     item: dict[str, Any],
     catalog: TaxonomyCatalog,
@@ -820,41 +838,7 @@ def _stage_prompt_and_schema(
             )
         return prompt, leaf_adjudication_schema()
     if stage == "capability":
-        metadata = _json_object(item.get("model_trace_json"))
-        markets = [
-            term
-            for term in (
-                catalog.get("primary_category", str(slug))
-                for slug in metadata.get("existing_market_slugs") or []
-            )
-            if term is not None
-        ]
-        if not markets:
-            primary = parse_leaf_decision(
-                leaf_raw,
-                pool,
-                catalog,
-                source_url=str(item.get("source_url") or ""),
-                source_text=profile_evidence_text(profile),
-            )
-            secondary = parse_secondary_leaf_decisions(
-                leaf_raw,
-                pool,
-                catalog,
-                primary_slug=primary["term"].slug if primary else "",
-                source_url=str(item.get("source_url") or ""),
-                source_text=profile_evidence_text(profile),
-            )
-            markets = [
-                decision["term"]
-                for decision in ([primary] if primary else []) + secondary
-            ]
-        candidates = recall_capability_candidates(
-            profile,
-            catalog,
-            markets=markets,
-            limit=int(capability_candidate_limit),
-        )
+        candidates = capability_candidates_for_item(item, catalog, capability_candidate_limit)
         return capabilities_prompt(candidates, catalog, profile), capabilities_schema()
     raise ValueError(f"unsupported taxonomy batch stage: {stage}")
 
@@ -1761,15 +1745,21 @@ async def submit_queued_batches(
     catalog: TaxonomyCatalog,
     openai: OpenAIBatchClient,
 ) -> dict[str, int]:
+    from jev_taxonomy import enabled as jev_enabled, execute_queued_capabilities
+    jev_counts = await execute_queued_capabilities(d1, config, catalog)
     limit = max(1, int(getattr(config, "taxonomy_batch_request_limit", 500)))
     rows = await d1.query(
         """
-        SELECT * FROM taxonomy_batch_requests
-        WHERE status = 'queued' AND job_id IS NULL
-        ORDER BY stage, model, reasoning_effort, id
+        SELECT r.* FROM taxonomy_batch_requests r
+        WHERE r.status = 'queued' AND r.job_id IS NULL
+          AND (? = 0 OR r.stage <> 'capability' OR EXISTS (
+            SELECT 1 FROM taxonomy_batch_requests prior
+            WHERE prior.item_id = r.item_id AND prior.stage = 'capability' AND prior.model LIKE 'jev-%'
+          ))
+        ORDER BY r.stage, r.model, r.reasoning_effort, r.id
         LIMIT ?
         """,
-        [limit],
+        [int(jev_enabled(config)), limit],
     )
     grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for row in rows:
@@ -1788,6 +1778,7 @@ async def submit_queued_batches(
         "submission_persist_failed": 0,
         "provider_blocked": 0,
     }
+    counts.update(jev_counts)
     for (stage, model, effort), requests in grouped.items():
         now = utc_now_iso()
         meta = await d1.run(
@@ -1955,6 +1946,21 @@ async def _request_trace(d1: Any, item_id: int) -> list[dict[str, Any]]:
     return [dict(row) for row in rows]
 
 
+def provider_for_trace(trace: list[dict[str, Any]]) -> str:
+    models = [str(row.get("model") or "") for row in trace]
+    if not any(model.startswith("jev-") for model in models):
+        return "openai_batch_api"
+    return "hybrid_jev_openai" if any(not model.startswith("jev-") for model in models) else "typesafe_jev"
+
+
+def primary_model_for_trace(trace: list[dict[str, Any]]) -> str:
+    # Capability classification must not relabel the primary decision's model.
+    for row in reversed(trace):
+        if row.get("stage") in {"leaf", "leaf_escalation"}:
+            return str(row.get("model") or "")
+    return ""
+
+
 async def complete_without_leaf(
     d1: Any,
     item: dict[str, Any],
@@ -1968,7 +1974,7 @@ async def complete_without_leaf(
     trace = await _request_trace(d1, item_id)
     raw = {
         "pipeline": BATCH_PIPELINE_VERSION,
-        "prompt_version": BATCH_PROMPT_VERSION,
+        "prompt_version": item.get("prompt_version") or BATCH_PROMPT_VERSION,
         "taxonomy_version": catalog.taxonomy_version,
         "profile": _json_object(item.get("profile_json")),
         "l1_raw": _json_object(item.get("l1_json")),
@@ -1976,6 +1982,8 @@ async def complete_without_leaf(
         "model_trace": trace,
         "profile_reused": not any(row.get("stage") == "profile" for row in trace),
         "error": error,
+        "primary_policy_version": PRIMARY_POLICY_VERSION,
+        "taxonomy_catalog_hash": catalog_fingerprint(catalog),
     }
     run_id = int(item.get("classification_run_id") or 0)
     classification_status = "partial" if status == "needs_review" else status
@@ -1985,11 +1993,11 @@ async def complete_without_leaf(
             tool_id=tool_id,
             taxonomy_version=catalog.taxonomy_version,
             run_status=classification_status,
-            provider="openai_batch_api",
+            provider=provider_for_trace(trace),
             model_name=trace[-1]["model"] if trace else "",
             raw_output=raw,
             error=error,
-            prompt_version=BATCH_PROMPT_VERSION,
+            prompt_version=str(item.get("prompt_version") or BATCH_PROMPT_VERSION),
             extractor_version=SHADOW_EXTRACTOR_VERSION,
         )
     now = utc_now_iso()
@@ -2068,7 +2076,7 @@ async def finalize_capability_only(
     trace = await _request_trace(d1, item_id)
     raw = {
         "pipeline": BATCH_PIPELINE_VERSION,
-        "prompt_version": BATCH_PROMPT_VERSION,
+        "prompt_version": item.get("prompt_version") or BATCH_PROMPT_VERSION,
         "extractor_version": SHADOW_EXTRACTOR_VERSION,
         "taxonomy_version": catalog.taxonomy_version,
         "capability_backfill": 1,
@@ -2103,7 +2111,7 @@ async def finalize_capability_only(
             tool_id=int(item.get("tool_id") or 0),
             taxonomy_version=catalog.taxonomy_version,
             run_status="partial" if capabilities else run_status,
-            provider="openai_batch_api",
+            provider=provider_for_trace(trace),
             model_name=trace[-1]["model"] if trace else "",
             candidate_terms={
                 "existing_markets": market_slugs,
@@ -2111,7 +2119,7 @@ async def finalize_capability_only(
             },
             raw_output=raw,
             error=error or None,
-            prompt_version=BATCH_PROMPT_VERSION,
+            prompt_version=str(item.get("prompt_version") or BATCH_PROMPT_VERSION),
             extractor_version=SHADOW_EXTRACTOR_VERSION,
         )
         await d1.run(
@@ -2221,6 +2229,15 @@ async def finalize_classification(
             error="no_valid_primary_leaf_after_escalation",
         )
         return
+    acceptance = primary_acceptance(
+        primary, profile, l1_hits,
+        threshold=float(getattr(config, "taxonomy_auto_accept_confidence", MIN_AUTO_PRIMARY_CONFIDENCE)),
+        min_l1_gap=float(getattr(config, "taxonomy_batch_l1_min_gap", 0.08)),
+    )
+    if not acceptance["eligible"]:
+        await complete_without_leaf(d1, item, catalog, status="needs_review",
+                                    error="primary_quality:" + ",".join(acceptance["reasons"]))
+        return
     secondary = parse_secondary_leaf_decisions(
         leaf_raw,
         pool,
@@ -2246,7 +2263,7 @@ async def finalize_classification(
     trace = await _request_trace(d1, item_id)
     raw = {
         "pipeline": BATCH_PIPELINE_VERSION,
-        "prompt_version": BATCH_PROMPT_VERSION,
+        "prompt_version": item.get("prompt_version") or BATCH_PROMPT_VERSION,
         "extractor_version": SHADOW_EXTRACTOR_VERSION,
         "taxonomy_version": catalog.taxonomy_version,
         "profile": profile,
@@ -2260,6 +2277,8 @@ async def finalize_classification(
             for hit in l1_hits
         ],
         "leaf_raw": leaf_raw,
+        "primary_acceptance": acceptance,
+        "taxonomy_catalog_hash": catalog_fingerprint(catalog),
         "leaf_accepted": {
             "slug": primary["term"].slug,
             "confidence": primary["confidence"],
@@ -2300,15 +2319,15 @@ async def finalize_classification(
             tool_id=int(item.get("tool_id") or 0),
             taxonomy_version=catalog.taxonomy_version,
             run_status="partial",
-            provider="openai_batch_api",
-            model_name=trace[-1]["model"] if trace else "",
+            provider=provider_for_trace(trace),
+            model_name=primary_model_for_trace(trace),
             candidate_terms={
                 "l1": raw["l1_accepted"],
                 "leaf_pool": [term.slug for term in pool],
             },
             raw_output=raw,
             error=capability_error or None,
-            prompt_version=BATCH_PROMPT_VERSION,
+            prompt_version=str(item.get("prompt_version") or BATCH_PROMPT_VERSION),
             extractor_version=SHADOW_EXTRACTOR_VERSION,
         )
         await d1.run(
@@ -2336,6 +2355,8 @@ async def finalize_classification(
         decision_status=primary_status,
         evidence={
             "role": "primary_market",
+            "primary_acceptance": acceptance,
+            "taxonomy_catalog_hash": catalog_fingerprint(catalog),
             "reason": primary.get("reason"),
             "l1_candidates": raw["l1_accepted"],
             "evidence": primary.get("evidence") or [],
@@ -2464,6 +2485,10 @@ async def _handle_stage_failure(
     item = await load_batch_item(d1, item_id)
     if not item:
         return "missing_item"
+    if stage == "capability" and str(request.get("model") or "").startswith("jev-"):
+        # Persisted JEV failure makes the next durable attempt OpenAI-only, even after restart.
+        await enqueue_stage(d1, config, catalog, item_id=item_id, stage="capability")
+        return "jev_fallback_queued"
     retryable = is_retryable_stage_error(error)
     if retryable and await schedule_model_retry(d1, config, request, error):
         return "retry_scheduled"
@@ -2670,6 +2695,10 @@ async def apply_request_result(
             ),
             min_l1_gap=float(getattr(config, "taxonomy_batch_l1_min_gap", 0.08)),
         )
+        acceptance = primary_acceptance(decision, profile, hits,
+            threshold=float(getattr(config, "taxonomy_auto_accept_confidence", MIN_AUTO_PRIMARY_CONFIDENCE)),
+            min_l1_gap=float(getattr(config, "taxonomy_batch_l1_min_gap", 0.08)))
+        escalate = escalate or not acceptance["eligible"]
         if stage == "leaf" and escalate:
             await enqueue_stage(
                 d1, config, catalog, item_id=item_id, stage="leaf_escalation"
@@ -2682,6 +2711,9 @@ async def apply_request_result(
                 status="needs_review",
                 error="no_valid_primary_leaf_after_escalation",
             )
+        elif not acceptance["eligible"]:
+            await complete_without_leaf(d1, item, catalog, status="needs_review",
+                                        error="primary_quality:" + ",".join(acceptance["reasons"]))
         else:
             await _prepare_capability_or_finalize(d1, config, catalog, item_id)
         return True
@@ -2853,17 +2885,14 @@ async def poll_active_batches(
 ) -> dict[str, int]:
     rows = await d1.query(
         """
-        SELECT * FROM taxonomy_batch_jobs
-        WHERE openai_batch_id IS NOT NULL
-          AND (
-            status IN ('validating', 'in_progress', 'finalizing', 'cancelling')
-            OR EXISTS (
-              SELECT 1 FROM taxonomy_batch_requests request
-              WHERE request.job_id = taxonomy_batch_jobs.id
-                AND request.status IN ('queued', 'submitted')
-            )
-          )
-        ORDER BY id
+            SELECT * FROM taxonomy_batch_jobs
+             WHERE openai_batch_id IS NOT NULL AND id IN (
+               SELECT id FROM taxonomy_batch_jobs
+               WHERE status IN ('validating', 'in_progress', 'finalizing', 'cancelling')
+               UNION
+               SELECT job_id FROM taxonomy_batch_requests
+               WHERE status IN ('queued', 'submitted') AND job_id IS NOT NULL
+             ) ORDER BY id
         """
     )
     counts = {
@@ -3013,20 +3042,14 @@ async def reconcile_recorded_results(
     """Finish a stage whose result was recorded before a process interruption."""
     rows = await d1.query(
         """
-        SELECT r.*
-        FROM taxonomy_batch_requests r
-        JOIN taxonomy_batch_items i ON i.id = r.item_id
-        WHERE r.status IN ('succeeded', 'failed')
-          AND i.status = 'running'
-          AND i.current_stage = r.stage
-          AND NOT EXISTS (
-            SELECT 1 FROM taxonomy_batch_requests newer
-            WHERE newer.item_id = r.item_id
-              AND newer.stage = r.stage
-              AND newer.attempt > r.attempt
-          )
-        ORDER BY r.id
-        LIMIT 500
+            SELECT r.* FROM taxonomy_batch_items i
+             CROSS JOIN taxonomy_batch_requests r ON r.id = (
+               SELECT newest.id FROM taxonomy_batch_requests newest
+               WHERE newest.item_id = i.id AND newest.stage = i.current_stage
+               ORDER BY newest.attempt DESC LIMIT 1
+             )
+             WHERE i.status = 'running' AND r.status IN ('succeeded', 'failed')
+             ORDER BY r.id LIMIT 500
         """
     )
     reconciled = 0

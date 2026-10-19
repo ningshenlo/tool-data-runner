@@ -4,3 +4,5 @@ __pycache__/
 *.pyc
 wrangler.toml
 .sitemap-monitor/
+
+work/

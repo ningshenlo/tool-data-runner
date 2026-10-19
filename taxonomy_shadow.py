@@ -16,9 +16,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from anti_bot_signatures import detect_anti_bot_text
+from taxonomy_precision import (
+    DETECTION_BOUNDARY, DETECTION_MARKETS, MIN_AUTO_PRIMARY_CONFIDENCE,
+    catalog_fingerprint, primary_acceptance, valid_confidence,
+)
 
-SHADOW_PROMPT_VERSION = "shadow-markets-capabilities-v6-security-precision-2026-08-27"
-SHADOW_EXTRACTOR_VERSION = "cleaned-main-content-v2-evidence-grounded-2026-08-14"
+SHADOW_PROMPT_VERSION = "shadow-markets-capabilities-v8-scoped-primary-evidence-2026-09-10"
+SHADOW_EXTRACTOR_VERSION = "cleaned-main-content-v3-negative-evidence-2026-09-10"
 SHADOW_PIPELINE_VERSION = "p2a-markets-capabilities-v4-2026-08-24"
 DEFAULT_TAXONOMY_VERSION = 1
 PROFILE_VERSION = 1
@@ -29,7 +33,7 @@ DEFAULT_CAPABILITY_CANDIDATE_LIMIT = 96
 MAX_CAPABILITY_CATALOG_SIZE = 1000
 CAPABILITY_CHUNK_SIZE = 160
 MIN_LEAF_CONFIDENCE_PROVISIONAL = 0.35
-DEFAULT_AUTO_ACCEPT_PRIMARY_CONFIDENCE = 0.5
+DEFAULT_AUTO_ACCEPT_PRIMARY_CONFIDENCE = MIN_AUTO_PRIMARY_CONFIDENCE
 MIN_CAPABILITY_CONFIDENCE = 0.4
 MIN_ENTITY_CONFIDENCE_AUTO = 0.8
 ENTITY_KINDS = {
@@ -141,11 +145,11 @@ class TaxonomyCatalog:
             if term.parent_slug:
                 bits.append(f"parent={term.parent_slug}")
             if term.definition:
-                bits.append(f"def={_clip(term.definition, 200)}")
+                bits.append(f"def={term.definition}")
             if term.includes:
-                bits.append(f"includes={_clip(term.includes, 160)}")
+                bits.append(f"includes={term.includes}")
             if term.excludes:
-                bits.append(f"excludes={_clip(term.excludes, 160)}")
+                bits.append(f"excludes={term.excludes}")
             if term.examples:
                 bits.append(f"examples={_clip(term.examples, 120)}")
             lines.append(" | ".join(bits))
@@ -470,6 +474,8 @@ def build_product_profile(
         }
     return {
         "primary_job": primary_job,
+        "main_sold_workflow": normalize_evidenced_value(raw.get("main_sold_workflow"), source_url=source_url, source_text=source_text),
+        "negative_claims": normalize_evidenced_list(raw.get("negative_claims"), source_url=source_url, source_text=source_text, limit=6) or None,
         "primary_outputs": primary_outputs or None,
         "capabilities_raw": capabilities_raw or None,
         "entity_decision": entity_decision,
@@ -508,6 +514,11 @@ def profile_extract_prompt() -> str:
         "primary_job = the main job/outcome the product delivers for users; "
         "primary_outputs = main artifacts produced (e.g. video, image, code, document); "
         "capabilities_raw = concrete capabilities stated on the page (free text, not taxonomy slugs). "
+        "main_sold_workflow = the main outcome customers buy or activate this product for, "
+        "distinguishing paid core workflow from a supporting or free feature; "
+        "negative_claims = explicit statements about what the product cannot do or is not "
+        "(especially not an AI/authorship detector, not a correctness verdict, not a security product). "
+        "Do not drop negation or turn denials into positive capabilities. "
         "Each evidence item needs a short quote from the page."
     )
 
@@ -541,6 +552,8 @@ def profile_extract_schema() -> dict[str, Any]:
             "entity_reason": {"type": "string"},
             "entity_evidence": {"type": "array", "items": evidence_item},
             "primary_job": evidenced_value,
+            "main_sold_workflow": evidenced_value,
+            "negative_claims": {"type": "array", "items": evidenced_value},
             "primary_outputs": {"type": "array", "items": evidenced_value},
             "capabilities_raw": {"type": "array", "items": evidenced_value},
         },
@@ -550,6 +563,8 @@ def profile_extract_schema() -> dict[str, Any]:
             "entity_reason",
             "entity_evidence",
             "primary_job",
+            "main_sold_workflow",
+            "negative_claims",
             "primary_outputs",
             "capabilities_raw",
         ],
@@ -561,6 +576,8 @@ def profile_classification_context(profile: dict[str, Any]) -> str:
     compact: dict[str, Any] = {}
     for key, limit in (
         ("primary_job", 1),
+        ("main_sold_workflow", 1),
+        ("negative_claims", 6),
         ("primary_outputs", 6),
         ("capabilities_raw", MAX_CAPABILITIES),
     ):
@@ -584,14 +601,14 @@ def profile_classification_context(profile: dict[str, Any]) -> str:
             if len(rendered) >= limit:
                 break
         if rendered:
-            compact[key] = rendered[0] if key == "primary_job" else rendered
+            compact[key] = rendered[0] if key in {"primary_job", "main_sold_workflow"} else rendered
     return json.dumps(compact, ensure_ascii=False, separators=(",", ":"))
 
 
 def profile_evidence_text(
     profile: dict[str, Any],
     *,
-    keys: tuple[str, ...] = ("primary_job", "primary_outputs", "capabilities_raw"),
+    keys: tuple[str, ...] = ("primary_job", "main_sold_workflow", "negative_claims", "primary_outputs", "capabilities_raw"),
 ) -> str:
     """Return only previously grounded homepage quotes for downstream validation."""
     quotes: list[str] = []
@@ -694,6 +711,7 @@ def top2_l1_prompt(
         "such as safe, secure, private, trusted, responsible AI, guardrails, enterprise-grade, "
         "or compliant are supporting attributes and MUST NOT justify this market. "
         "Definitions and excludes are binding. Do not invent slugs.\n\n"
+        f"{DETECTION_BOUNDARY}\n\n"
         f"Product facts: {profile_classification_context(profile)}\n\n"
         f"L1 catalog:\n{catalog.render_terms(roots)}"
     )
@@ -730,6 +748,7 @@ def leaf_adjudication_prompt(
     catalog: TaxonomyCatalog,
     profile: dict[str, Any],
 ) -> str:
+    detection_boundary = DETECTION_BOUNDARY if any(term.slug in DETECTION_MARKETS for term in candidates) else ""
     return (
         "Ignore the neutral transport page. Classify only the evidence-backed product "
         "facts embedded below. "
@@ -744,7 +763,10 @@ def leaf_adjudication_prompt(
         "main sold workflow. Do not classify a product there from incidental security, "
         "privacy, safety, policy, or responsible-AI language. "
         "Definitions and excludes are binding. Empty leaf_slug only if none fit. "
-        "secondary_leaves must exclude leaf_slug and use exact candidate slugs.\n\n"
+        "secondary_leaves must exclude leaf_slug and use exact candidate slugs. "
+        "For each evidence.quote, copy verbatim from an evidence[].quote in Product facts. "
+        "The value fields are summaries, not source quotes; never cite or paraphrase them as evidence.\n\n"
+        f"{detection_boundary}\n\n"
         f"Product facts: {profile_classification_context(profile)}\n\n"
         f"Leaf candidates:\n{catalog.render_terms(candidates)}"
     )
@@ -977,7 +999,7 @@ def parse_entity_decision(
     candidate_kind = str(raw.get("entity_kind") or "").strip().lower().replace("-", "_")
     if candidate_kind not in ENTITY_KINDS:
         candidate_kind = "unresolved"
-    confidence = _as_confidence(raw.get("entity_confidence"), 0.0)
+    confidence = valid_confidence(raw.get("entity_confidence"))
     evidence_raw = raw.get("entity_evidence") or []
     evidence = normalize_evidence_items(
         evidence_raw,
@@ -1063,7 +1085,7 @@ def parse_top2_l1(raw: dict[str, Any], catalog: TaxonomyCatalog) -> list[dict[st
     if not isinstance(items, list):
         slug = clean_slug(raw.get("category_l1") or raw.get("l1") or raw.get("slug"))
         if slug in roots:
-            return [{"term": roots[slug], "confidence": 0.55, "reason": "flat_fallback"}]
+            return [{"term": roots[slug], "confidence": 0.0, "reason": "flat_fallback"}]
         return []
     out: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -1074,7 +1096,7 @@ def parse_top2_l1(raw: dict[str, Any], catalog: TaxonomyCatalog) -> list[dict[st
             reason = ""
         else:
             slug = clean_slug(item.get("slug") or item.get("category_l1"))
-            conf = _as_confidence(item.get("confidence"), 0.55)
+            conf = valid_confidence(item.get("confidence"))
             reason = _clip(item.get("reason"), 240)
         if not slug or slug in seen or slug not in roots:
             continue
@@ -1122,7 +1144,7 @@ def parse_leaf_decision(
     term = by_slug[slug]
     if not catalog.is_leaf(term):
         return None
-    conf = _as_confidence(raw.get("confidence"), 0.5)
+    conf = valid_confidence(raw.get("confidence"))
     evidence = []
     for item in raw.get("evidence") or []:
         norm = normalize_evidence_item(
@@ -1283,7 +1305,8 @@ def decide_primary_status(
     confidence: float,
     auto_accept_threshold: float = DEFAULT_AUTO_ACCEPT_PRIMARY_CONFIDENCE,
 ) -> str:
-    threshold = max(MIN_LEAF_CONFIDENCE_PROVISIONAL, min(float(auto_accept_threshold), 1.0))
+    confidence = valid_confidence(confidence)
+    threshold = max(MIN_AUTO_PRIMARY_CONFIDENCE, valid_confidence(auto_accept_threshold))
     if confidence >= threshold:
         return "auto_accepted"
     if confidence >= MIN_LEAF_CONFIDENCE_PROVISIONAL:
@@ -2470,6 +2493,24 @@ async def classify_tool_shadow(
             )
         result.raw = raw_bundle
         return result
+    acceptance = primary_acceptance(leaf_decision, profile, l1_hits, threshold=auto_accept_threshold)
+    raw_bundle["primary_acceptance"] = acceptance
+    raw_bundle["taxonomy_catalog_hash"] = catalog_fingerprint(catalog)
+    if not acceptance["eligible"]:
+        result.status = "partial"
+        result.error = "primary_quality:" + ",".join(acceptance["reasons"])
+        raw_bundle["error"] = result.error
+        result.raw = raw_bundle
+        if not dry_run:
+            await upsert_product_profile(d1, tool_id, profile)
+            result.run_id = await insert_classification_run(
+                d1, tool_id=tool_id, taxonomy_version=catalog.taxonomy_version,
+                run_status="partial", provider=provider,
+                model_name=(model_chain[0] if model_chain else ""),
+                candidate_terms={"l1": raw_bundle.get("l1_accepted"), "leaf_pool": raw_bundle.get("leaf_pool")},
+                raw_output=raw_bundle, error=result.error,
+            )
+        return result
     if leaf_decision:
         raw_bundle["leaf_accepted"] = {
             "slug": leaf_decision["term"].slug,
@@ -2605,6 +2646,8 @@ async def classify_tool_shadow(
         )
         evidence = {
             "role": "primary_market",
+            "primary_acceptance": acceptance,
+            "taxonomy_catalog_hash": catalog_fingerprint(catalog),
             "reason": leaf_decision.get("reason"),
             "l1_candidates": raw_bundle.get("l1_accepted"),
             "evidence": leaf_decision.get("evidence") or [],

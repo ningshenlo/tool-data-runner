@@ -1509,7 +1509,7 @@ class DeploymentBoundaryTests(unittest.TestCase):
     def test_formal_migration_builds_only_phase_one_metadata_tables(self) -> None:
         migration = (
             Path(__file__).parent.parent
-            / "ainav"
+            / "sigpik"
             / "d1"
             / "migrations"
             / "0060_sitemap_monitor_phase1.sql"
@@ -1530,7 +1530,7 @@ class DeploymentBoundaryTests(unittest.TestCase):
         self.assertNotIn("change_events", migration)
 
     def test_comparability_migration_adds_site_scan_without_signal_tables(self) -> None:
-        migrations = Path(__file__).parent.parent / "ainav" / "d1" / "migrations"
+        migrations = Path(__file__).parent.parent / "sigpik" / "d1" / "migrations"
         phase_one = (migrations / "0060_sitemap_monitor_phase1.sql").read_text(
             encoding="utf-8"
         )
