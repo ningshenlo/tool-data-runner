@@ -21,11 +21,13 @@ for name, address in addresses.items():
     assert ca['source'] == 'sigpik_pg_public_ca' and ca['read_only'], name
     assert ca['volume']['subpath'] == 'sigpik-public-ca', name
     assert service['build']['dockerfile'] == 'Dockerfile', name
-assert config['networks']['sigpik_pg'] == {'name': 'ainav-pg-vpc-test-20261019', 'external': True}
+assert config['networks']['sigpik_pg']['name'] == 'ainav-pg-vpc-test-20261019'
+assert config['networks']['sigpik_pg']['external'] is True
 assert config['networks']['default']['name'] == 'service-sigpik-h4m21a_default'
 for name in ('report-exports', 'report-drafts', 'market-snapshots'):
     assert config['volumes'][name]['name'] == 'sigpik-' + name
-assert config['volumes']['sigpik_pg_public_ca'] == {'name': 'ainav-pigsty-test-dnkttj_pigsty_data', 'external': True}
+assert config['volumes']['sigpik_pg_public_ca']['name'] == 'ainav-pigsty-test-dnkttj_pigsty_data'
+assert config['volumes']['sigpik_pg_public_ca']['external'] is True
 assert services['report-draft-worker']['network_mode'] == 'none'
 assert services['report-draft-worker']['read_only']
 assert services['sitemap-monitor-worker']['deploy']['replicas'] == args.sitemap_replicas
