@@ -156,6 +156,8 @@ services:
     environment:
       <<: *common-environment
       JEV_API_KEY: ${JEV_API_KEY:-${jev_api_key:-${TYPESAFE_API_KEY:-}}}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-perplexity/pplx-decider-v1.2}
       TAXONOMY_CAPABILITY_PROVIDER: ${TAXONOMY_CAPABILITY_PROVIDER:-openai}
       JEV_MIN_CONFIDENCE: ${JEV_MIN_CONFIDENCE:-0.85}
       JEV_TIMEOUT_SECONDS: ${JEV_TIMEOUT_SECONDS:-8}

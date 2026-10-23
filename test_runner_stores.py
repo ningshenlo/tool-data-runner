@@ -1704,9 +1704,9 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(status, "done")
-        self.assertEqual(browser_client.screenshot_calls, 1)
+        self.assertEqual(browser_client.screenshot_calls, 0)
         self.assertEqual(favicon_fetch.await_count, 2)
-        self.assertEqual(uploader.put_object.await_count, 2)
+        self.assertEqual(uploader.put_object.await_count, 1)
         self.assertEqual(await store.missing_asset_requirements(tool_id), [])
 
     async def test_missing_favicon_stays_in_bounded_failure_state(self) -> None:
@@ -3034,12 +3034,12 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         plans = self.connection.execute(
             "SELECT code FROM access_plans ORDER BY sort_order"
         ).fetchall()
-        self.assertEqual([row["code"] for row in plans], ["free", "pro", "enterprise"])
+        self.assertEqual([row["code"] for row in plans], ["free", "pro", "starter", "enterprise"])
         matrix = self.connection.execute(
             "SELECT plan_code, feature_key, is_enabled, limit_json "
             "FROM access_plan_features"
         ).fetchall()
-        self.assertEqual(len(matrix), 42)
+        self.assertEqual(len(matrix), 188)
         indexed = {(row["plan_code"], row["feature_key"]): row for row in matrix}
         self.assertEqual(indexed[("free", "filter.country")]["is_enabled"], 1)
         self.assertEqual(indexed[("free", "sort.search_share")]["is_enabled"], 0)

@@ -53,11 +53,11 @@ TRAFFIC_METRICS_SCHEMA_VERSION = 2
 ASSET_SOURCE = "site_scraper"
 ASSET_DB_STORAGE_BUCKET = "sitesimgs"
 DEFAULT_R2_BUCKET = "sitesimgs"
-ASSET_REQUIREMENT_ORDER = ("content_safety", "screenshot", "favicon", "description")
-AUTO_APPROVE_TOOL_NAME_CONFIDENCE = 85
+ASSET_REQUIREMENT_ORDER = ("content_safety", "favicon", "description")
+AUTO_APPROVE_TOOL_NAME_CONFIDENCE = 60
 CATALOG_AUTO_PUBLISH_POLICY_VERSION = "catalog-auto-publish-v2"
 CATALOG_AUTO_PUBLISH_MAX_LIMIT = 100
-REVIEW_TOOL_NAME_CONFIDENCE = 60
+REVIEW_TOOL_NAME_CONFIDENCE = 40
 ASSET_DEAD_LETTER_REVIVE_HOURS = 24
 # Primary taxonomy model via Browser Rendering custom_ai (AI Gateway provider form).
 DEFAULT_TAXONOMY_CLASSIFICATION_MODEL = "deepseek/deepseek-v4-flash"
@@ -170,6 +170,8 @@ class Config:
     runner_service_name: str
     runner_workloads: tuple[str, ...]
     jev_api_key: str = ""
+    openrouter_api_key: str = ""
+    openrouter_model: str = "perplexity/pplx-decider-v1.2"
     taxonomy_capability_provider: str = "openai"
     jev_min_confidence: float = 0.85
     jev_timeout_seconds: int = 8
@@ -615,7 +617,9 @@ def load_config(require_brightdata: bool = True) -> Config:
             1, read_int_env("RUNNER_DOMAIN_POLL_INTERVAL_SECONDS", 1)
         ),
         jev_api_key=(os.getenv("JEV_API_KEY") or os.getenv("jev_api_key") or os.getenv("TYPESAFE_API_KEY") or "").strip(),
-        taxonomy_capability_provider=os.getenv("TAXONOMY_CAPABILITY_PROVIDER", "openai").strip().lower(),
+        openrouter_api_key=(os.getenv("OPENROUTER_API_KEY") or os.getenv("openrouter_api_key") or "").strip(),
+        openrouter_model=(os.getenv("OPENROUTER_MODEL") or "perplexity/pplx-decider-v1.2").strip(),
+        taxonomy_capability_provider=os.getenv("TAXONOMY_CAPABILITY_PROVIDER", ("openrouter" if (os.getenv("OPENROUTER_API_KEY") or os.getenv("openrouter_api_key")) else "openai")).strip().lower(),
         jev_min_confidence=min(1.0, max(0.5, read_float_env("JEV_MIN_CONFIDENCE", 0.85))),
         jev_timeout_seconds=min(10, max(1, read_int_env("JEV_TIMEOUT_SECONDS", 8))),
         jev_capability_limit=min(10, max(1, read_int_env("JEV_CAPABILITY_LIMIT", 6))),
@@ -5505,13 +5509,6 @@ def accepted_primary_taxonomy_predicate(tool_alias: str) -> str:
           AND assignment.decision_status IN ('verified', 'auto_accepted')
           AND (assignment.decision_status = 'verified'
                OR coalesce(assignment.confidence, 0) >= {MIN_AUTO_PRIMARY_CONFIDENCE})
-          AND NOT EXISTS (
-            SELECT 1
-            FROM taxonomy_terms active_child
-            WHERE active_child.parent_id = term.id
-              AND active_child.dimension = 'primary_category'
-              AND active_child.status = 'active'
-          )
       )
     """
 
@@ -5526,19 +5523,10 @@ def tool_live_ready_predicate(tool_alias: str) -> str:
         WHERE state.tool_id = {tool_alias}.id AND state.readiness = 'ready'
       )
       AND EXISTS (
-        SELECT 1 FROM tool_assets asset
-        WHERE asset.tool_id = {tool_alias}.id
-          AND asset.asset_kind = 'screenshot'
-          AND asset.is_current = 1
-      )
-      AND EXISTS (
         SELECT 1 FROM tool_localizations localization
         WHERE localization.tool_id = {tool_alias}.id
-          AND localization.translation_status = 'published'
-          AND localization.published_at IS NOT NULL
           AND trim(localization.name) <> ''
-          AND coalesce(localization.name_review_status, 'legacy_unreviewed')
-              NOT IN ('needs_review', 'rejected')
+          AND coalesce(localization.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
           AND trim(coalesce(localization.short_description, '')) <> ''
       )
       AND {accepted_primary_taxonomy_predicate(tool_alias)}
@@ -5680,14 +5668,12 @@ class D1EnrichmentStore:
               ) THEN 1 ELSE 0 END AS has_favicon,
               CASE WHEN EXISTS (
                 SELECT 1 FROM tool_localizations l
-                WHERE l.tool_id = t.id AND l.translation_status = 'published'
-                  AND l.published_at IS NOT NULL AND trim(l.name) <> ''
+                WHERE l.tool_id = t.id AND trim(l.name) <> ''
                   AND trim(coalesce(l.short_description, '')) <> ''
               ) THEN 1 ELSE 0 END AS has_localization,
               CASE WHEN EXISTS (
                 SELECT 1 FROM tool_localizations l
-                WHERE l.tool_id = t.id AND l.translation_status = 'published'
-                  AND l.published_at IS NOT NULL AND trim(l.name) <> ''
+                WHERE l.tool_id = t.id AND trim(l.name) <> ''
                   AND coalesce(l.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
                   AND (length(trim(l.name)) <= 80 OR (l.name_review_status = 'human_approved' AND length(trim(l.name)) <= 120))
                   AND instr(l.name, '<') = 0
@@ -5740,14 +5726,12 @@ class D1EnrichmentStore:
               ) THEN 1 ELSE 0 END AS has_favicon,
               CASE WHEN EXISTS (
                 SELECT 1 FROM tool_localizations l
-                WHERE l.tool_id = t.id AND l.translation_status = 'published'
-                  AND l.published_at IS NOT NULL AND trim(l.name) <> ''
+                WHERE l.tool_id = t.id AND trim(l.name) <> ''
                   AND trim(coalesce(l.short_description, '')) <> ''
               ) THEN 1 ELSE 0 END AS has_localization,
               CASE WHEN EXISTS (
                 SELECT 1 FROM tool_localizations l
-                WHERE l.tool_id = t.id AND l.translation_status = 'published'
-                  AND l.published_at IS NOT NULL AND trim(l.name) <> ''
+                WHERE l.tool_id = t.id AND trim(l.name) <> ''
                   AND coalesce(l.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
                   AND (length(trim(l.name)) <= 80 OR (l.name_review_status = 'human_approved' AND length(trim(l.name)) <= 120))
                   AND instr(l.name, '<') = 0
@@ -5793,7 +5777,6 @@ class D1EnrichmentStore:
             name
             for name, column in (
                 ("content_safety", "has_content_safety"),
-                ("screenshot", "has_screenshot"),
                 ("published_localization", "has_localization"),
                 ("name_quality", "has_name_quality"),
                 ("category", "has_category"),
@@ -5804,6 +5787,7 @@ class D1EnrichmentStore:
         warnings = [
             name
             for name, column in (
+                ("screenshot", "has_screenshot"),
                 ("favicon", "has_favicon"),
                 ("traffic", "has_traffic"),
                 ("domain_state", "has_domain_state"),
@@ -5997,14 +5981,6 @@ class D1AssetStore:
                   SELECT 1
                   FROM tool_assets ta
                   WHERE ta.tool_id = t.id
-                    AND ta.asset_kind = 'screenshot'
-                    AND ta.storage_bucket = ?
-                    AND ta.is_current = 1
-                )
-                OR NOT EXISTS (
-                  SELECT 1
-                  FROM tool_assets ta
-                  WHERE ta.tool_id = t.id
                     AND ta.asset_kind = 'favicon'
                     AND ta.is_current = 1
                 )
@@ -6041,7 +6017,7 @@ class D1AssetStore:
             ORDER BY t.id ASC
             LIMIT ?
             """,
-            [ASSET_SOURCE, ASSET_DB_STORAGE_BUCKET, now, now, stale_done_before, limit],
+            [ASSET_SOURCE, now, now, stale_done_before, limit],
         )
         queued = 0
         for row in rows:

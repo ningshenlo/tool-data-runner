@@ -1,6 +1,7 @@
 """JEV execution inside the existing durable taxonomy request/job state machine."""
 import asyncio
 import json
+import os
 from typing import Any
 
 import httpx
@@ -11,7 +12,12 @@ from taxonomy_shadow import profile_evidence_text, utc_now_iso
 
 
 def enabled(config: Any) -> bool:
-    return str(getattr(config, "taxonomy_capability_provider", "openai")) == "jev" and bool(str(getattr(config, "jev_api_key", "") or "").strip())
+    provider = str(getattr(config, "taxonomy_capability_provider", "openai")).strip().lower()
+    has_jev_key = bool(str(getattr(config, "jev_api_key", "") or "").strip())
+    has_openrouter_key = bool(str(getattr(config, "openrouter_api_key", "") or os.getenv("OPENROUTER_API_KEY", "") or "").strip())
+    if provider in {"jev", "openrouter", "pplx", "perplexity"}:
+        return has_jev_key or has_openrouter_key
+    return has_openrouter_key
 
 
 def number(config: Any, name: str, default: float, low: float, high: float) -> float:
@@ -110,7 +116,8 @@ async def execute_queued_capabilities(d1, config, catalog) -> dict[str, int]:
                 await d1.run("UPDATE taxonomy_batch_requests SET request_json=?,updated_at=? WHERE id=? AND job_id=? AND status='submitted'", [batch._json(plan), utc_now_iso(), row["id"], job_id])
                 async with asyncio.timeout(120):
                     async with httpx.AsyncClient() as client:
-                        output = await evaluate_capability_plan(plan, client, str(config.jev_api_key),
+                        api_key = str(getattr(config, "openrouter_api_key", "") or os.getenv("OPENROUTER_API_KEY", "") or config.jev_api_key)
+                        output = await evaluate_capability_plan(plan, client, api_key,
                             threshold=number(config, "jev_min_confidence", 0.85, 0.5, 1),
                             timeout=number(config, "jev_timeout_seconds", 8, 1, 10), responses=responses, attempts=attempts)
             except JevError as exc:
