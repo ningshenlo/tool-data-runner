@@ -30,8 +30,8 @@ Never roll back to a D1-era deployment.
 The database is the existing production Pigsty PostgreSQL service under project
 `sigpik-postgresql-production`, environment `database-production`.
 Keep `SIGPIK_DATABASE_URL` in Dokploy Environment. It uses the existing jobs role,
-database `sigpik`, `sslmode=verify-full`, and `/run/pg-ca/pigsty-ca.crt`.
-The TLS identity is `ainav-test-1` (the server certificate SAN); `hostaddr=172.22.0.2`
+database `sigpik`, `sslmode=verify-full`, and `/run/pg-ca/origin-ca.pem`.
+The TLS identity is `ainav-pg-test.rugchecker.com`; `hostaddr=172.22.0.2`
 routes directly to the existing private PostgreSQL address. This keeps server
 identity verification enabled without requiring a public DNS change.
 Do not copy its value into source control, build arguments, CI or reports.
@@ -41,8 +41,8 @@ The following resource names intentionally retain `test`; they are production:
 * External network: `ainav-pg-vpc-test-20261019`.
 * CA source volume: `ainav-pigsty-test-dnkttj_pigsty_data`, only the
   `sigpik-public-ca` subdirectory mounted read-only at `/run/pg-ca`.
-  `pigsty-ca.crt` is the public CA copied from the database container's
-  `/pg/cert/ca.crt`. Never mount its private key or the entire database volume.
+  `origin-ca.pem` is the public Cloudflare Origin CA used by the database's
+  VPC certificate. Never mount its private key or the entire database volume.
 * Fixed IPs: assets `.21`, periodic facts `.22`, taxonomy `.24`, sitemap `.25`,
   review API `.20`, all on `172.22.0.0/24`.
 * Default network: `service-sigpik-h4m21a_default`.
@@ -61,8 +61,12 @@ deployment SHA, and worker logs/heartbeats. Process liveness alone does not prov
 successful database access. PostgreSQL schema migrations are separate from this
 pipeline; this deployment performs no migration or database restart.
 
-On 2026-10-23, the running database presented its native Pigsty certificate
-after its 2026-10-22 restart; the old Origin CA/hostname pair failed verification.
-The collector connection was aligned to the existing native certificate and
-verified with a read-only query as `sigpik_jobs` over TLS 1.3. Do not restore the
-obsolete Origin CA connection string when rolling back application code.
+On 2026-10-23, diagnosis of the homepage failure found that the database's
+2026-10-22 restart had reverted its TLS certificate to the native Pigsty one.
+Temporarily aligning only the collector to that certificate did not repair
+Hyperdrive: its VPC service requires the Origin CA certificate and matching
+hostname. Both consumers must use the same production certificate contract.
+Keep the production certificate paths in Patroni configuration and the
+persistent Pigsty inventory; a one-off ALTER SYSTEM override alone did not
+survive container bootstrap. Never disable TLS verification or switch only
+one consumer to the native Pigsty certificate as a permanent repair.
