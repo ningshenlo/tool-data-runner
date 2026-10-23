@@ -13,7 +13,6 @@ class DockerImageContractTests(unittest.TestCase):
             "market_snapshot_refresh.py",
             "search_demand_refresh.py",
             "search_demand_brand.py",
-            "d1_costguard.py",
             "taxonomy_shadow.py",
             "taxonomy_precision.py",
             "taxonomy_schema.py",

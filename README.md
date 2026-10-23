@@ -1,5 +1,12 @@
 # Tool Data Runner
 
+Production uses VPS PostgreSQL (database `sigpik`) since 2026-10-20.
+The historical D1 names below describe legacy interfaces; the production Compose
+forces `DATABASE_BACKEND=postgres` and maps Dokploy's `SIGPIK_DATABASE_URL` into
+the containers. Do not deploy the old D1 configuration. See
+[production deployment and CI](docs/production-deployment.md) for the maintained
+GitHub → tested deployment branch → Dokploy flow, TLS mounts and existing volumes.
+
 Python runner for scheduled SimilarWeb traffic backfill, homepage asset capture, domain facts, and taxonomy updates.
 
 The repository also contains the Phase 1 `sitemap_monitor` package. It discovers and

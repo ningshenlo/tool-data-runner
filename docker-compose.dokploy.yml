@@ -15,6 +15,8 @@ x-runner-base: &runner-base
     start_period: 20s
 
 x-common-environment: &common-environment
+  DATABASE_BACKEND: postgres
+  DATABASE_URL: ${SIGPIK_DATABASE_URL:?Formal jobs URL must be configured}
   CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID}
   CLOUDFLARE_D1_DATABASE_ID: ${CLOUDFLARE_D1_DATABASE_ID}
   CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
@@ -25,9 +27,21 @@ x-common-environment: &common-environment
   RUNNER_LOG_LEVEL: ${RUNNER_LOG_LEVEL:-info}
   RUNNER_MAX_RETRIES: ${RUNNER_MAX_RETRIES:-2}
 
+x-postgres-ca: &postgres-ca
+  type: volume
+  source: sigpik_pg_public_ca
+  target: /run/pg-ca
+  read_only: true
+  volume:
+    subpath: sigpik-public-ca
+
 services:
   periodic-facts-worker:
     <<: *runner-base
+    networks:
+      default: {}
+      sigpik_pg:
+        ipv4_address: 172.22.0.22
     command:
       - python
       - runner.py
@@ -67,11 +81,18 @@ services:
       BRIGHTDATA_PROXY_PASSWORD: ${BRIGHTDATA_PROXY_PASSWORD}
 
     volumes:
+      - *postgres-ca
       - report-exports:/report-exports
       - market-snapshots:/market-snapshots
 
   assets-worker:
     <<: *runner-base
+    networks:
+      default: {}
+      sigpik_pg:
+        ipv4_address: 172.22.0.21
+    volumes:
+      - *postgres-ca
     command:
       - python
       - runner.py
@@ -97,6 +118,12 @@ services:
 
   sitemap-monitor-worker:
     <<: *runner-base
+    networks:
+      default: {}
+      sigpik_pg:
+        ipv4_address: 172.22.0.25
+    volumes:
+      - *postgres-ca
     deploy:
       replicas: ${SITEMAP_MONITOR_REPLICAS:-0}
     command:
@@ -152,6 +179,12 @@ services:
 
   taxonomy-worker:
     <<: *runner-base
+    networks:
+      default: {}
+      sigpik_pg:
+        ipv4_address: 172.22.0.24
+    volumes:
+      - *postgres-ca
     command: ["python", "runner.py", "--taxonomy", "--loop"]
     environment:
       <<: *common-environment
@@ -221,10 +254,16 @@ services:
 
   report-review-api:
     <<: *runner-base
+    networks:
+      default: {}
+      sigpik_pg:
+        ipv4_address: 172.22.0.20
     command: ["python", "report_review_api.py"]
     read_only: true
     environment:
       REPORT_REVIEW_TOKEN: ${REPORT_REVIEW_TOKEN:?Set a random report review secret}
+      DATABASE_BACKEND: postgres
+      DATABASE_URL: ${SIGPIK_DATABASE_URL:?Formal jobs URL must be configured}
       REPORT_WORK_ROOT: /app/work
       REPORT_EXPORT_ROOT: /exports
     expose:
@@ -236,10 +275,21 @@ services:
       retries: 3
       start_period: 20s
     volumes:
+      - *postgres-ca
       - report-exports:/exports:ro
       - report-drafts:/app/work:ro
 
+networks:
+  default:
+    name: service-sigpik-h4m21a_default
+  sigpik_pg:
+    external: true
+    name: ainav-pg-vpc-test-20261019
+
 volumes:
+  sigpik_pg_public_ca:
+    external: true
+    name: ainav-pigsty-test-dnkttj_pigsty_data
   market-snapshots:
     name: sigpik-market-snapshots
   report-exports:
