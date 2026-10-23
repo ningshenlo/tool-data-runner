@@ -142,8 +142,16 @@ class PublicationTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ActivationSqlTests(unittest.IsolatedAsyncioTestCase):
-    setUp=stores.RunnerStoreLifecycleTests.setUp
-    tearDown=stores.RunnerStoreLifecycleTests.tearDown
+    def setUp(self):
+        from pathlib import Path
+        self.connection = sqlite3.connect(':memory:')
+        self.connection.row_factory = sqlite3.Row
+        fixture = Path(__file__).parent / 'tests/fixtures/market-activation-schema.sql'
+        self.connection.executescript(fixture.read_text(encoding='utf-8'))
+        self.d1 = stores.FakeD1(self.connection)
+
+    def tearDown(self):
+        self.connection.close()
 
     async def test_selects_only_released_closed_months_newer_than_active(self):
         self.connection.execute("INSERT INTO market_snapshot_versions(status,traffic_month) VALUES('active','2026-07-01')")
