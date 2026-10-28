@@ -149,6 +149,38 @@ class PrimaryPrecisionTests(unittest.TestCase):
 
 
 
+
+    def test_narrow_l1_gap_is_not_resolved_by_keyword_mentions(self):
+        video_root = TaxonomyTerm(1, 'primary_category', 'video-animation', 'Video and Animation')
+        video_leaf = TaxonomyTerm(2, 'primary_category', 'video-generation', 'Video Generation', parent_id=1)
+        image_root = TaxonomyTerm(3, 'primary_category', 'image-generation', 'Image Generation')
+
+        # Keyword presence alone cannot establish dominance between close markets.
+        profile_video = {
+            'entity_decision': {'accepted': True, 'kind': 'independent_product'},
+            'primary_job': {'value': 'All-in-one AI platform to generate videos and clips', 'evidence': [{'quote': 'generate videos and clips'}]},
+            'main_sold_workflow': {'value': 'generate videos and clips', 'evidence': [{'quote': 'generate videos and clips'}]},
+        }
+        l1_hits = [
+            {'term': video_root, 'confidence': 0.98},
+            {'term': image_root, 'confidence': 0.95},
+        ]
+        decision = {'term': video_leaf, 'confidence': 0.89, 'evidence': [{'quote': 'generate videos'}]}
+        result = primary_acceptance(decision, profile_video, l1_hits)
+        self.assertFalse(result['eligible'])
+        self.assertIn('unresolved_market_ambiguity', result['reasons'])
+
+        # Case B: primary_job mentions neither or cannot distinguish -> remains unresolved_market_ambiguity
+        profile_ambiguous = {
+            'entity_decision': {'accepted': True, 'kind': 'independent_product'},
+            'primary_job': {'value': 'AI creative engine', 'evidence': [{'quote': 'AI creative engine'}]},
+            'main_sold_workflow': {'value': 'AI creative engine', 'evidence': [{'quote': 'AI creative engine'}]},
+        }
+        result_ambiguous = primary_acceptance(decision, profile_ambiguous, l1_hits)
+        self.assertFalse(result_ambiguous['eligible'])
+        self.assertIn('unresolved_market_ambiguity', result_ambiguous['reasons'])
+
+
 class DirectPrimaryGateTests(unittest.IsolatedAsyncioTestCase):
     async def test_rejected_direct_results_do_not_write_or_supersede_assignments(self):
         from types import SimpleNamespace

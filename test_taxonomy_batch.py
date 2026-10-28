@@ -1244,6 +1244,73 @@ class TaxonomyBatchStateMachineTests(unittest.IsolatedAsyncioTestCase):
         ).fetchone()
         self.assertEqual(tuple(terminal), ("needs_review", "complete", 2))
 
+    async def test_exhausted_source_recovers_when_upstream_discovery_evidence_exists(self):
+        self.connection.executescript(
+            """
+            ALTER TABLE tools ADD COLUMN canonical_slug TEXT;
+            ALTER TABLE tools ADD COLUMN official_url TEXT;
+            ALTER TABLE tools ADD COLUMN normalized_domain TEXT;
+            CREATE TABLE IF NOT EXISTS tool_localizations (
+              tool_id INTEGER,
+              locale_code TEXT,
+              name TEXT,
+              short_description TEXT
+            );
+            CREATE TABLE IF NOT EXISTS tool_sources (
+              tool_id INTEGER,
+              source_type TEXT,
+              raw_payload TEXT
+            );
+            CREATE TABLE IF NOT EXISTS discovery_candidates (
+              id INTEGER PRIMARY KEY,
+              official_url TEXT,
+              normalized_domain TEXT,
+              submitted_name TEXT,
+              description_hint TEXT,
+              raw_payload TEXT
+            );
+            """
+        )
+        self.connection.execute(
+            "INSERT INTO tools (id, canonical_slug, official_url, normalized_domain, entity_kind) VALUES (88, 'agentxray', 'https://agentxray.ai/', 'agentxray.ai', 'independent_product')"
+        )
+        self.connection.execute(
+            "INSERT INTO tool_localizations VALUES (88, 'en', 'AgentXray', 'Amazon operations AI: profit analytics, listing work and PPC drafts.')"
+        )
+        self.connection.execute(
+            "INSERT INTO discovery_candidates VALUES (1, 'https://agentxray.ai/', 'agentxray.ai', 'AgentXray', 'Amazon operations AI', '{\"qualification\":{\"catalog_fit\":{\"decision\":{\"verifiedStrongEvidence\":[{\"quote\":\"Amazon operations AI and profit analytics\"}]}}}}')"
+        )
+        item_id = self.connection.execute(
+            """
+            INSERT INTO taxonomy_batch_items (
+              tool_id, pipeline_version, prompt_version, taxonomy_version,
+              source_url, existing_entity_kind, existing_entity_source, current_stage, status, retry_attempt
+            ) VALUES (
+              88, 'source-recover-test', 'source-recover-test', 2,
+              'https://agentxray.ai/', 'independent_product', 'auto', 'profile', 'running', 2
+            )
+            """
+        ).lastrowid
+        self.connection.commit()
+
+        error = RuntimeError("anti_bot_signature: cloudflare: cf_challenge_platform")
+        error.retryable = False
+        self.connection.execute("UPDATE discovery_candidates SET raw_payload = ? WHERE id = 1", [json.dumps({
+            "qualification": {"catalog_fit": {"decision": {"verifiedStrongEvidence": [{
+                "quote": "Amazon operations AI and profit analytics",
+                "pageUrl": "https://agentxray.ai/features",
+            }]}}}
+        })])
+        self.connection.commit()
+        recovered = await schedule_source_retry(
+            self.d1, self.config, self.catalog, item_id, error
+        )
+        self.assertTrue(recovered)
+        item = self.connection.execute("SELECT current_stage, status, error, profile_json FROM taxonomy_batch_items WHERE id = ?", (item_id,)).fetchone()
+        self.assertEqual(item[0], "l1")
+        self.assertEqual(item[1], "running")
+        self.assertIn("Amazon operations AI", item[3])
+
     async def test_batch_submission_failure_is_persisted_and_retried(self):
         item_id = self.connection.execute(
             """

@@ -990,6 +990,108 @@ async def _create_item(
     return int(rows[0].get("id") or 0) if rows else 0
 
 
+async def try_recover_source_with_upstream_evidence(
+    d1: Any,
+    item: dict[str, Any],
+    catalog: TaxonomyCatalog,
+    config: Any,
+    error_detail: str,
+) -> bool:
+    """Use traceable upstream claims for review-only classification candidates."""
+    tool_id = int(item.get("tool_id") or 0)
+    if not tool_id:
+        return False
+    try:
+        rows = await d1.query(
+            """
+            SELECT
+              t.id AS tool_id, t.official_url, t.canonical_slug, t.normalized_domain,
+              s.raw_payload AS source_payload,
+              c.submitted_name AS cand_name, c.description_hint AS cand_desc, c.raw_payload AS cand_payload
+            FROM tools t
+            LEFT JOIN tool_sources s ON s.tool_id = t.id AND s.source_type = 'official_site'
+            LEFT JOIN discovery_candidates c ON (c.official_url = t.official_url OR c.normalized_domain = t.normalized_domain)
+            WHERE t.id = ?
+            ORDER BY CASE WHEN c.official_url = t.official_url THEN 0 ELSE 1 END, c.id DESC LIMIT 1
+            """,
+            [tool_id],
+        )
+    except Exception:
+        return False
+    if not rows:
+        return False
+    row = rows[0]
+    official_url = str(row.get("official_url") or item.get("source_url") or "")
+    # Descriptions and localization text are not verified source quotations.
+    desc = ""
+    quotes: list[str] = []
+    quotes_evidence: list[dict[str, Any]] = []
+    for payload_key in ("cand_payload", "source_payload"):
+        raw_p = row.get(payload_key)
+        if raw_p and isinstance(raw_p, (str, dict)):
+            try:
+                p_data = json.loads(raw_p) if isinstance(raw_p, str) else raw_p
+                ev_list = (
+                    p_data.get("qualification", {})
+                    .get("catalog_fit", {})
+                    .get("decision", {})
+                    .get("verifiedStrongEvidence", [])
+                )
+                for ev in ev_list:
+                    if (isinstance(ev, dict) and isinstance(ev.get("quote"), str)
+                            and isinstance(ev.get("pageUrl"), str)
+                            and ev["pageUrl"].startswith(("https://", "http://"))):
+                        q_str = str(ev["quote"]).strip()
+                        if q_str and q_str not in quotes:
+                            quotes.append(q_str)
+                            quotes_evidence.append({"quote": q_str, "source_url": ev["pageUrl"],
+                                                    "source_field": payload_key,
+                                                    "evidence_type": ev.get("evidenceType")})
+            except Exception:
+                pass
+    if not desc and quotes:
+        desc = quotes[0]
+    if not desc and not quotes:
+        return False
+    profile = {
+        "primary_job": {
+            "value": desc[:500] or (quotes[0][:500] if quotes else "AI product offering"),
+            "evidence": quotes_evidence,
+        },
+        "main_sold_workflow": None,
+        "capabilities_raw": [
+            {"value": evidence["quote"][:200], "evidence": [evidence]}
+            for evidence in quotes_evidence[:6]
+        ] if quotes else None,
+        "entity_decision": {
+            "accepted": False,
+            "kind": "unresolved",
+            "reason": "upstream_metadata_requires_review",
+            "source": "upstream_discovery",
+            "evidence": quotes_evidence,
+        },
+        "profile_version": 1,
+        "extracted_at": utc_now_iso(),
+        "source_url": official_url,
+        "extractor_version": f"{SHADOW_EXTRACTOR_VERSION}-upstream-fallback-review-v2",
+        "evidence_tier": "upstream_metadata",
+    }
+    now = utc_now_iso()
+    await upsert_product_profile(d1, tool_id, profile)
+    await d1.run(
+        """
+        UPDATE taxonomy_batch_items
+        SET profile_json = ?, source_text = NULL,
+            current_stage = 'l1', status = 'pending',
+            error = ?, updated_at = ?
+        WHERE id = ?
+        """,
+        [_json(profile), f"{error_detail}:recovered_via_upstream_evidence", now, int(item["id"])],
+    )
+    await enqueue_stage(d1, config, catalog, item_id=int(item["id"]), stage="l1")
+    return True
+
+
 async def schedule_source_retry(
     d1: Any,
     config: Any,
@@ -1014,6 +1116,11 @@ async def schedule_source_retry(
     failed_attempt = int(item.get("retry_attempt") or 0) + 1
     safe_error = f"source_fetch_failed:{_safe_error(error)}"
     if not retryable or failed_attempt >= max_attempts:
+        recovered = await try_recover_source_with_upstream_evidence(
+            d1, item, catalog, config, safe_error
+        )
+        if recovered:
+            return True
         await d1.run(
             """
             UPDATE taxonomy_batch_items

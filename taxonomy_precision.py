@@ -11,7 +11,7 @@ import math
 import re
 from typing import Any
 
-PRIMARY_POLICY_VERSION = "primary-evidence-v3-preserve-half-confidence-2026-09-11"
+PRIMARY_POLICY_VERSION = "primary-evidence-v4-metadata-review-2026-10-28"
 MIN_AUTO_PRIMARY_CONFIDENCE = 0.50
 DETECTION_MARKETS = {"content-detection-authenticity", "content-authenticity-detection"}
 DETECTION_BOUNDARY = (
@@ -81,6 +81,9 @@ def primary_acceptance(
         reasons.append("low_primary_confidence")
     if not (decision or {}).get("evidence"):
         reasons.append("missing_grounded_leaf_evidence")
+    if (profile.get("evidence_tier") == "upstream_metadata"
+            or "upstream-fallback" in str(profile.get("extractor_version") or "")):
+        reasons.append("upstream_metadata_requires_review")
     entity = profile.get("entity_decision") or {}
     if not entity.get("accepted") or entity.get("kind") not in {"independent_product", "app_or_extension"}:
         reasons.append("entity_not_eligible")
