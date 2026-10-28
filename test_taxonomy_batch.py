@@ -268,10 +268,10 @@ class TaxonomyBatchPureTests(unittest.TestCase):
 
     def test_migration_contains_resumable_state_and_usage_columns(self):
         migration = (
-            Path(__file__).resolve().parent.parent
-            / "sigpik"
-            / "d1"
-            / "migrations"
+            Path(__file__).resolve().parent
+            / "tests"
+            / "fixtures"
+            / "taxonomy-migrations"
             / "0077_openai_taxonomy_batch.sql"
         ).read_text(encoding="utf-8")
         for table in (
@@ -283,10 +283,10 @@ class TaxonomyBatchPureTests(unittest.TestCase):
         self.assertIn("cached_input_tokens", migration)
         self.assertIn("reasoning_tokens", migration)
         retry_migration = (
-            Path(__file__).resolve().parent.parent
-            / "sigpik"
-            / "d1"
-            / "migrations"
+            Path(__file__).resolve().parent
+            / "tests"
+            / "fixtures"
+            / "taxonomy-migrations"
             / "0079_taxonomy_batch_retry.sql"
         ).read_text(encoding="utf-8")
         self.assertIn("retry_kind", retry_migration)
@@ -364,10 +364,10 @@ class TaxonomyBatchPureTests(unittest.TestCase):
             """
         )
         migration = (
-            Path(__file__).resolve().parent.parent
-            / "sigpik"
-            / "d1"
-            / "migrations"
+            Path(__file__).resolve().parent
+            / "tests"
+            / "fixtures"
+            / "taxonomy-migrations"
             / "0089_backfill_post_seed_legacy_taxonomy.sql"
         ).read_text(encoding="utf-8")
         connection.executescript(migration)
@@ -560,10 +560,10 @@ class TaxonomyBatchStateMachineTests(unittest.IsolatedAsyncioTestCase):
             """
         )
         migration_dir = (
-            Path(__file__).resolve().parent.parent
-            / "sigpik"
-            / "d1"
-            / "migrations"
+            Path(__file__).resolve().parent
+            / "tests"
+            / "fixtures"
+            / "taxonomy-migrations"
         )
         self.connection.executescript(
             (migration_dir / "0077_openai_taxonomy_batch.sql").read_text(
