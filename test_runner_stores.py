@@ -4368,7 +4368,7 @@ class FaviconFallbackTests(unittest.IsolatedAsyncioTestCase):
         empty_svg = runner.generate_letter_svg_icon("").decode("utf-8")
         self.assertIn(">A</text>", empty_svg)
 
-    async def test_fetch_favicon_asset_uses_direct_when_available(self) -> None:
+    async def test_fetch_favicon_asset_uses_cdn_first(self) -> None:
         mock_resp = AsyncMock()
         mock_resp.status_code = 200
         mock_resp.content = b"x" * 100 + b"png-image-content"
@@ -4385,6 +4385,35 @@ class FaviconFallbackTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(asset)
             self.assertEqual(asset.mime_type, "image/png")
             self.assertTrue(asset.key.endswith(".png"))
+            # 验证首个发出的请求是 Google CDN
+            first_called_url = mock_client.get.call_args_list[0][0][0]
+            self.assertIn("t1.gstatic.com/faviconV2", first_called_url)
+
+    async def test_fetch_favicon_asset_falls_back_to_origin_when_cdn_404(self) -> None:
+        # 模拟 Google CDN 和 DuckDuckGo 均 404（新域名未收录），原站 /favicon.ico 成功
+        def mock_get(url: str, **kwargs: Any) -> Any:
+            resp = AsyncMock()
+            if "gstatic.com" in url or "duckduckgo.com" in url:
+                resp.status_code = 404
+                resp.content = b""
+                resp.headers = {}
+            else:
+                resp.status_code = 200
+                resp.content = b"x" * 100 + b"origin-favicon-ico"
+                resp.headers = {"content-type": "image/x-icon"}
+            return resp
+
+        with patch("runner.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(side_effect=mock_get)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            asset = await runner.fetch_favicon_asset("https://newsite.ai", "newsite.ai", "")
+            self.assertIsNotNone(asset)
+            self.assertEqual(asset.mime_type, "image/x-icon")
+            self.assertTrue(asset.key.endswith(".ico"))
 
     async def test_fetch_favicon_asset_falls_back_to_svg_when_all_fail(self) -> None:
         mock_resp = AsyncMock()

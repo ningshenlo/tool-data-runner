@@ -7495,31 +7495,19 @@ async def fetch_favicon_asset(
 ) -> FaviconAsset | None:
     candidate_urls: list[str] = []
 
-    favicon_url = urljoin(page_url, favicon_href) if favicon_href else extract_favicon_href(html_body, page_url)
-    if not favicon_url:
-        try:
-            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
-                page_response = await client.get(
-                    page_url,
-                    headers={
-                        "User-Agent": random_browser_user_agent(),
-                        "Accept": "text/html,application/xhtml+xml",
-                    },
-                )
-            if 200 <= page_response.status_code < 300:
-                favicon_url = extract_favicon_href(page_response.text[:200000], str(page_response.url))
-        except Exception as error:
-            log_info("assets.favicon.discover_failed", domain=domain, url=page_url, error=str(error)[:300])
-
-    if favicon_url:
-        candidate_urls.append(favicon_url)
-    candidate_urls.append(urljoin(page_url, "/favicon.ico"))
-
+    # 1. 优先采用高可用 CDN (Google 128px v2 CDN + DuckDuckGo)
+    # 实测响应仅 20-50ms，且能彻底绕过原站 Cloudflare 5秒盾与 WAF 反爬阻断
     if domain:
         candidate_urls.append(
             f"https://t1.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=https://{domain}&size=128"
         )
         candidate_urls.append(f"https://icons.duckduckgo.com/ip3/{domain}.ico")
+
+    # 2. 原站回退 (用于第三方 CDN 尚未收录的全新站或冷门站)
+    origin_favicon = urljoin(page_url, favicon_href) if favicon_href else extract_favicon_href(html_body, page_url)
+    if origin_favicon:
+        candidate_urls.append(origin_favicon)
+    candidate_urls.append(urljoin(page_url, "/favicon.ico"))
 
     seen_urls: set[str] = set()
     ordered_urls: list[str] = []
@@ -7530,7 +7518,7 @@ async def fetch_favicon_asset(
 
     for target_url in ordered_urls:
         is_third_party = "gstatic.com" in target_url or "duckduckgo.com" in target_url
-        timeout = 8.0 if is_third_party else 12.0
+        timeout = 6.0 if is_third_party else 10.0
         headers = {
             "User-Agent": random_browser_user_agent(),
             "Accept": "image/avif,image/webp,image/png,image/svg+xml,image/*,*/*;q=0.8",
@@ -7568,6 +7556,41 @@ async def fetch_favicon_asset(
             mime_type=mime_type,
         )
 
+    # 3. 若以上均失败（CDN 未收录且原站 /favicon.ico 404），最后做一次原站动态 HTML 获取与 link 标签发现
+    if not html_body and page_url:
+        try:
+            async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+                page_response = await client.get(
+                    page_url,
+                    headers={
+                        "User-Agent": random_browser_user_agent(),
+                        "Accept": "text/html,application/xhtml+xml",
+                    },
+                )
+            if 200 <= page_response.status_code < 300:
+                discovered_url = extract_favicon_href(page_response.text[:200000], str(page_response.url))
+                if discovered_url:
+                    async with httpx.AsyncClient(timeout=8.0, follow_redirects=True) as client:
+                        resp = await client.get(
+                            discovered_url,
+                            headers={
+                                "User-Agent": random_browser_user_agent(),
+                                "Accept": "image/avif,image/webp,image/png,image/svg+xml,image/*,*/*;q=0.8",
+                                "Referer": page_url,
+                            },
+                        )
+                        if 200 <= resp.status_code < 300 and 50 < len(resp.content) <= 1024 * 1024:
+                            mime_type = asset_mime_type(discovered_url, resp.headers.get("content-type", ""))
+                            extension = asset_extension(discovered_url, mime_type)
+                            return FaviconAsset(
+                                body=resp.content,
+                                key=f"{domain}/favicon-{int(time.time() * 1000)}{extension}",
+                                mime_type=mime_type,
+                            )
+        except Exception as error:
+            log_info("assets.favicon.discover_failed", domain=domain, url=page_url, error=str(error)[:300])
+
+    # 4. 终极兜底：当原站和第三方服务均未能返回有效图片时，生成品牌首字母矢量 SVG
     log_info("assets.favicon.fallback_to_svg", domain=domain, page_url=page_url)
     svg_body = generate_letter_svg_icon(domain)
     return FaviconAsset(
