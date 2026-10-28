@@ -5870,6 +5870,8 @@ class D1EnrichmentStore:
               AND (
                 state.evaluated_at IS NULL
                 OR t.updated_at > state.evaluated_at
+                OR instr(coalesce(state.blocking_json, ''), '"screenshot"') > 0
+                OR instr(coalesce(state.blocking_json, ''), '"published_localization"') > 0
                 OR instr(coalesce(state.blocking_json, ''), '"key_feature"') > 0
                 OR instr(coalesce(state.blocking_json, ''), '"key_features"') > 0
                 OR (
@@ -5988,8 +5990,7 @@ class D1AssetStore:
                   SELECT 1
                   FROM tool_localizations tl
                   WHERE tl.tool_id = t.id
-                    AND tl.translation_status = 'published'
-                    AND tl.published_at IS NOT NULL
+                    AND trim(tl.name) <> ''
                     AND trim(coalesce(tl.short_description, '')) <> ''
                 )
               )
@@ -6344,8 +6345,7 @@ class D1AssetStore:
                 SELECT 1
                 FROM tool_localizations tl
                 WHERE tl.tool_id = ?
-                  AND tl.translation_status = 'published'
-                  AND tl.published_at IS NOT NULL
+                  AND trim(tl.name) <> ''
                   AND trim(coalesce(tl.short_description, '')) <> ''
               ) THEN 1 ELSE 0 END AS has_description,
               CASE WHEN EXISTS (
@@ -6393,8 +6393,7 @@ class D1AssetStore:
                 SELECT 1
                 FROM tool_localizations tl
                 WHERE tl.tool_id = ?
-                  AND tl.translation_status = 'published'
-                  AND tl.published_at IS NOT NULL
+                  AND trim(tl.name) <> ''
                   AND trim(coalesce(tl.short_description, '')) <> ''
               ) THEN 1 ELSE 0 END AS has_description
             """,
