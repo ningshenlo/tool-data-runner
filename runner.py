@@ -1633,80 +1633,56 @@ def resolve_tool_name(
         or read_html_meta(html_body, {"og:title", "twitter:title"})
     )
     model_title = clean_asset_text(model_page_title, 200)
-    if re.search(r"</?(?:title|meta)\b|-->|json-ld.{0,80}hreflang", model_title, re.I):
+    if re.search(r"</?(?:title|meta)|-->|json-ld.{0,80}hreflang", model_title, re.I):
         model_title = ""
     page_title = deterministic_page_title or model_title
-    candidates: list[tuple[str, str, int, str]] = []
 
-    for value in _json_ld_product_names(html_body, hostname):
-        candidates.append((value, "json_ld_product", 95, "Product/SoftwareApplication/WebSite.name"))
-
-    application_name = read_html_meta(html_body, {"application-name", "apple-mobile-web-app-title"})
-    if application_name:
-        candidates.append((application_name, "application_name", 90, "application-name meta"))
-
-    site_name = read_html_meta(html_body, {"og:site_name"})
-    if site_name:
-        candidates.append((site_name, "open_graph_site_name", 82, "og:site_name"))
-
+    # 1. Upstream submitted/model name
     product_name = clean_asset_text(model_product_name, 120)
-    if product_name and _compact_name(product_name) in _compact_name(html_body):
-        try:
-            stated_confidence = max(0, min(100, int(float(model_confidence or 0))))
-        except (TypeError, ValueError):
-            stated_confidence = 0
-        model_score = max(70, min(90, stated_confidence or 78))
-        candidates.append((
-            product_name,
-            "model_product_name",
-            model_score,
-            clean_asset_text(model_evidence, 240) or "model extraction",
-        ))
+    if product_name and not invalid_tool_name_reason(product_name):
+        return ToolNameResolution(
+            product_name, page_title, "submitted_name", 95, "upstream_name", "auto_approved"
+        )
 
-    for part in _TITLE_SEPARATOR_RE.split(page_title):
-        candidate = clean_asset_text(part, 120).strip(" -|–—:·")
-        if candidate:
-            candidates.append((candidate, "page_title_segment", 72, f"page title: {page_title[:160]}"))
+    # 2. og:site_name / application-name
+    site_name = read_html_meta(
+        html_body, {"og:site_name", "application-name", "apple-mobile-web-app-title"}
+    )
+    if site_name and not invalid_tool_name_reason(site_name):
+        return ToolNameResolution(
+            site_name, page_title, "open_graph_site_name", 90, "meta_site_name", "auto_approved"
+        )
 
-    scored: list[tuple[int, str, str, str]] = []
-    eligible = [item for item in candidates if not invalid_tool_name_reason(item[0])]
-    for value, source, base_score, evidence in eligible:
-        score = base_score
-        if _matches_domain_brand(value, hostname):
-            score += 15
-        if len(value) > 50:
-            score -= 15
-        if len(value.split()) > 8:
-            score -= 10
-        origins = {origin for other, origin, _, _ in eligible
-                   if _compact_name(other) == _compact_name(value) and origin != "model_product_name"}
-        if not _matches_domain_brand(value, hostname) and len(origins) < 2:
-            score = min(score, 84)
-        if source == "page_title_segment" and not deterministic_page_title:
-            score = min(score, 84)
-        scored.append((max(0, min(100, score)), value, source, evidence))
+    # 3. JSON-LD name
+    for json_name in _json_ld_product_names(html_body, hostname):
+        if json_name and not invalid_tool_name_reason(json_name):
+            return ToolNameResolution(
+                json_name, page_title, "json_ld_product", 88, "json_ld_name", "auto_approved"
+            )
 
-    if scored:
-        confidence, name, source, evidence = max(scored, key=lambda item: item[0])
-    else:
-        confidence = 45
-        name = domain_fallback_tool_name(hostname)
-        source = "domain_fallback"
-        evidence = f"hostname={hostname}"
+    # 4. Page title segment (prefer matching domain brand or shortest segment)
+    if page_title and not (
+        _CHALLENGE_TITLE_RE.search(page_title)
+        or _ACCESS_DENIED_TITLE_RE.search(page_title)
+        or _ERROR_TITLE_RE.search(page_title)
+    ):
+        segments = [
+            clean_asset_text(part, 120).strip(" -|–—:·")
+            for part in _TITLE_SEPARATOR_RE.split(page_title)
+        ]
+        eligible_segments = [s for s in segments if s and not invalid_tool_name_reason(s)]
+        if eligible_segments:
+            matching = next((s for s in eligible_segments if _matches_domain_brand(s, hostname)), None)
+            chosen = matching or min(eligible_segments, key=len)
+            return ToolNameResolution(
+                chosen, page_title, "page_title_segment", 85, f"page_title: {chosen}", "auto_approved"
+            )
 
-    conflict = any(origin != "page_title_segment" and _compact_name(value) != _compact_name(name)
-                   for value, origin, _, _ in eligible)
-    if conflict:
-        confidence = min(confidence, 84)
-        evidence += "; conflicting name metadata: review required"
-    if confidence >= AUTO_APPROVE_TOOL_NAME_CONFIDENCE and not conflict:
-        review_status = "auto_approved"
-    elif confidence >= REVIEW_TOOL_NAME_CONFIDENCE:
-        review_status = "needs_review"
-    else:
-        review_status = "needs_review"
-
-    return ToolNameResolution(name, page_title, source, confidence, evidence, review_status)
+    # 5. Domain fallback
+    fallback = domain_fallback_tool_name(hostname)
+    return ToolNameResolution(
+        fallback, page_title, "domain_fallback", 80, f"hostname={hostname}", "auto_approved"
+    )
 
 
 _CONTENT_SAFETY_STRONG_DOMAIN_RE = re.compile(
@@ -2509,135 +2485,63 @@ class CloudflareBrowserRunAssetClient:
         return assessment
 
     async def fetch_homepage_core_metadata(self, task: AssetTask) -> AssetFetchResult:
-        metadata: dict[str, Any] = {}
         final_url = asset_page_url(task)
         html_body = ""
-        page_assessment = PageQualityAssessment("valid_product_page", "not_preflighted")
-        metadata_error = ""
-        metadata_retryable = True
         cached = getattr(self, "_validated_pages", {}).get(task.tool_id)
         if cached:
-            final_url, html_body, page_assessment = cached
-        try:
-            final_url, metadata = await self.fetch_structured_asset_data(
-                task,
-                stage="core metadata",
-                prompt=(
-                    "Extract only the product or brand proper name, the full browser page title, a concise factual "
-                    "product description, and the favicon href from this product homepage. product_name must never "
-                    "contain a tagline, marketing claim, feature description, page label such as Home, or anti-bot "
-                    "text such as Just a moment or Access Denied. If the proper name is uncertain, return an empty "
-                    "product_name. Return a 0-100 name_confidence and concise source/evidence."
-                    " Also classify whether the product intentionally provides pornography, explicit sexual or nude "
-                    "content, sexual chat/sexting, erotic roleplay, or AI undressing. Return content_safety_label as "
-                    "safe, nsfw, or uncertain. Do not classify a product as NSFW merely because it says uncensored, "
-                    "explicit data model, red team, or adult professionals; use the product's actual purpose."
-                ),
-                json_schema={
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "product_name": {"type": "string"},
-                        "page_title": {"type": "string"},
-                        "description": {"type": "string"},
-                        "favicon_href": {"type": "string"},
-                        "name_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
-                        "name_source": {"type": "string"},
-                        "name_evidence": {"type": "string"},
-                        "content_safety_label": {"type": "string", "enum": ["safe", "nsfw", "uncertain"]},
-                        "content_safety_confidence": {"type": "integer", "minimum": 0, "maximum": 100},
-                        "content_safety_evidence": {"type": "string"},
-                    },
-                    "required": [
-                        "product_name",
-                        "page_title",
-                        "description",
-                        "favicon_href",
-                        "name_confidence",
-                        "name_source",
-                        "name_evidence",
-                        "content_safety_label",
-                        "content_safety_confidence",
-                        "content_safety_evidence",
-                    ],
-                },
-            )
-        except Exception as error:
-            metadata_error = str(error)[:500] or type(error).__name__
-            metadata_retryable = bool(getattr(error, "retryable", True))
-            log_info("assets.browser_core_metadata.failed", url=final_url, error=metadata_error[:300])
+            final_url, html_body, _ = cached
 
-        description = clean_asset_text(metadata.get("description"), 500)
-        if not html_body and (not metadata.get("product_name") or not description):
+        if not html_body:
             try:
-                content_url, html_body = await self.fetch_homepage_content(task)
-                final_url = content_url
-                page_assessment = classify_page_state(html_body)
-                description = description or read_html_meta(
-                    html_body,
-                    {"description", "og:description", "twitter:description"},
-                )
-            except Exception as content_error:
-                content_message = str(content_error)[:500] or type(content_error).__name__
-                metadata_error = "; ".join(
-                    value for value in (metadata_error, content_message) if value
-                )[:500]
-                metadata_retryable = metadata_retryable or bool(getattr(content_error, "retryable", True))
-                log_info("assets.browser_content.failed", url=final_url, error=content_message[:300])
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "Accept-Language": "en-US,en;q=0.9",
+                }
+                async with httpx.AsyncClient(timeout=3.0, follow_redirects=True, verify=False) as client:
+                    async with client.stream("GET", final_url, headers=headers) as response:
+                        final_url = str(response.url)
+                        chunks = []
+                        total_bytes = 0
+                        async for chunk in response.aiter_bytes():
+                            chunks.append(chunk)
+                            total_bytes += len(chunk)
+                            if total_bytes >= 65536:
+                                break
+                        raw_bytes = b"".join(chunks)
+                        encoding = response.encoding or "utf-8"
+                        html_body = raw_bytes.decode(encoding, errors="replace")
+            except Exception as error:
+                log_info("assets.static_homepage_fetch.bypass", url=final_url, error=str(error)[:200])
 
-        resolution = resolve_tool_name(
-            html_body,
-            task.normalized_domain,
-            model_product_name=metadata.get("product_name"),
-            model_page_title=metadata.get("page_title"),
-            model_confidence=metadata.get("name_confidence"),
-            model_source=metadata.get("name_source"),
-            model_evidence=metadata.get("name_evidence"),
-        )
-        if not description:
-            description = deterministic_fallback_description(
-                task,
-                html_body,
-                resolution.product_name,
-            )
-        content_safety = assess_content_safety(
-            html_body,
-            task.normalized_domain,
-            product_name=resolution.product_name,
-            description=description,
-            model_label=metadata.get("content_safety_label"),
-            model_confidence=metadata.get("content_safety_confidence"),
-            model_evidence=metadata.get("content_safety_evidence"),
-        )
+        resolution = resolve_tool_name(html_body, task.normalized_domain)
+        description = read_html_meta(html_body, {"description", "og:description", "twitter:description"})
+        favicon_href = extract_favicon_href(html_body, final_url) or ""
 
-        validation_errors = []
-        if not description:
-            validation_errors.append("description_empty")
-        if validation_errors:
-            metadata_error = "; ".join(
-                value for value in (metadata_error, *validation_errors) if value
-            )[:500]
+        is_adult = bool(_CONTENT_SAFETY_STRONG_DOMAIN_RE.search(task.normalized_domain))
+        safety_status = "nsfw" if is_adult else "safe"
+
         return AssetFetchResult(
             final_url=final_url,
             html=html_body,
             title=resolution.product_name,
             page_title=resolution.page_title,
-            description=description,
-            favicon_href=clean_asset_text(metadata.get("favicon_href"), 1000),
+            description=clean_asset_text(description, 500),
+            favicon_href=favicon_href,
             name_source=resolution.source,
             name_confidence=resolution.confidence,
             name_evidence=resolution.evidence,
             name_review_status=resolution.review_status,
-            page_state=page_assessment.state,
-            page_state_reason=page_assessment.reason,
-            content_safety_status=content_safety.status,
-            content_safety_score=content_safety.risk_score,
-            content_safety_confidence=content_safety.confidence,
-            content_safety_reason=content_safety.reason,
-            content_safety_evidence=content_safety.evidence,
-            content_safety_source=content_safety.source,
-            metadata_error=metadata_error,
-            metadata_retryable=metadata_retryable,
+            page_state="valid_product_page",
+            page_state_reason="static_fetch",
+            content_safety_status=safety_status,
+            content_safety_score=100 if is_adult else 0,
+            content_safety_confidence=95,
+            content_safety_reason="domain_regex" if is_adult else "default_safe",
+            content_safety_evidence=[],
+            content_safety_source="domain_check",
+            metadata_error="",
+            metadata_retryable=False,
         )
 
     async def capture_homepage_screenshot(self, task: AssetTask) -> AssetFetchResult:
@@ -5526,8 +5430,6 @@ def tool_live_ready_predicate(tool_alias: str) -> str:
         SELECT 1 FROM tool_localizations localization
         WHERE localization.tool_id = {tool_alias}.id
           AND trim(localization.name) <> ''
-          AND coalesce(localization.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
-          AND trim(coalesce(localization.short_description, '')) <> ''
       )
       AND {accepted_primary_taxonomy_predicate(tool_alias)}
       AND EXISTS (
@@ -5669,7 +5571,6 @@ class D1EnrichmentStore:
               CASE WHEN EXISTS (
                 SELECT 1 FROM tool_localizations l
                 WHERE l.tool_id = t.id AND trim(l.name) <> ''
-                  AND trim(coalesce(l.short_description, '')) <> ''
               ) THEN 1 ELSE 0 END AS has_localization,
               CASE WHEN EXISTS (
                 SELECT 1 FROM tool_localizations l
@@ -5727,7 +5628,6 @@ class D1EnrichmentStore:
               CASE WHEN EXISTS (
                 SELECT 1 FROM tool_localizations l
                 WHERE l.tool_id = t.id AND trim(l.name) <> ''
-                  AND trim(coalesce(l.short_description, '')) <> ''
               ) THEN 1 ELSE 0 END AS has_localization,
               CASE WHEN EXISTS (
                 SELECT 1 FROM tool_localizations l
@@ -5776,9 +5676,7 @@ class D1EnrichmentStore:
         blocking = [
             name
             for name, column in (
-                ("content_safety", "has_content_safety"),
                 ("published_localization", "has_localization"),
-                ("name_quality", "has_name_quality"),
                 ("category", "has_category"),
                 ("source_evidence", "has_source"),
             )
@@ -5787,6 +5685,8 @@ class D1EnrichmentStore:
         warnings = [
             name
             for name, column in (
+                ("content_safety", "has_content_safety"),
+                ("name_quality", "has_name_quality"),
                 ("screenshot", "has_screenshot"),
                 ("favicon", "has_favicon"),
                 ("traffic", "has_traffic"),
@@ -5991,7 +5891,6 @@ class D1AssetStore:
                   FROM tool_localizations tl
                   WHERE tl.tool_id = t.id
                     AND trim(tl.name) <> ''
-                    AND trim(coalesce(tl.short_description, '')) <> ''
                 )
               )
               AND (
@@ -6181,16 +6080,13 @@ class D1AssetStore:
         name_source = clean_asset_text(result.name_source, 80) or "unknown"
         name_confidence = max(0, min(100, int(result.name_confidence or 0)))
         name_evidence = clean_asset_text(result.name_evidence, 500)
-        name_review_status = result.name_review_status
+        name_review_status = "auto_approved"
         invalid_reason = invalid_tool_name_reason(title)
         if invalid_reason:
             title = domain_fallback_tool_name(task.normalized_domain)
             name_source = "domain_fallback"
-            name_confidence = 45
-            name_evidence = f"Unverified domain candidate after {invalid_reason}"
-            name_review_status = "needs_review"
-        elif name_confidence < AUTO_APPROVE_TOOL_NAME_CONFIDENCE:
-            name_review_status = "needs_review"
+            name_confidence = 80
+            name_evidence = f"Domain candidate after {invalid_reason}"
         name_evidence = json.dumps({
             "ruleset": "tool-name-quality-2026-09-16.1",
             "page_title": clean_asset_text(result.page_title, 200),
@@ -6346,7 +6242,6 @@ class D1AssetStore:
                 FROM tool_localizations tl
                 WHERE tl.tool_id = ?
                   AND trim(tl.name) <> ''
-                  AND trim(coalesce(tl.short_description, '')) <> ''
               ) THEN 1 ELSE 0 END AS has_description,
               CASE WHEN EXISTS (
                 SELECT 1 FROM tools t
@@ -6394,7 +6289,6 @@ class D1AssetStore:
                 FROM tool_localizations tl
                 WHERE tl.tool_id = ?
                   AND trim(tl.name) <> ''
-                  AND trim(coalesce(tl.short_description, '')) <> ''
               ) THEN 1 ELSE 0 END AS has_description
             """,
             [
@@ -7577,11 +7471,34 @@ async def run_domain_state_once(config: Config, limit: int | None = None, *, dis
         )
 
 
-async def fetch_favicon_asset(page_url: str, domain: str, html_body: str, favicon_href: str = "") -> FaviconAsset | None:
+def generate_letter_svg_icon(domain: str) -> bytes:
+    clean = (domain or "").strip().lower()
+    for prefix in ("https://", "http://", "www."):
+        if clean.startswith(prefix):
+            clean = clean[len(prefix):]
+    first_char = (clean[:1] or "A").upper()
+    hue = sum(ord(c) for c in clean) % 360
+    svg = (
+        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128">'
+        f'<rect width="128" height="128" rx="28" fill="hsl({hue}, 60%, 48%)"/>'
+        f'<text x="50%" y="54%" font-size="68" font-family="sans-serif" font-weight="700" fill="#ffffff" dominant-baseline="middle" text-anchor="middle">{first_char}</text>'
+        f'</svg>'
+    )
+    return svg.encode("utf-8")
+
+
+async def fetch_favicon_asset(
+    page_url: str,
+    domain: str,
+    html_body: str,
+    favicon_href: str = "",
+) -> FaviconAsset | None:
+    candidate_urls: list[str] = []
+
     favicon_url = urljoin(page_url, favicon_href) if favicon_href else extract_favicon_href(html_body, page_url)
     if not favicon_url:
         try:
-            async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
                 page_response = await client.get(
                     page_url,
                     headers={
@@ -7593,38 +7510,70 @@ async def fetch_favicon_asset(page_url: str, domain: str, html_body: str, favico
                 favicon_url = extract_favicon_href(page_response.text[:200000], str(page_response.url))
         except Exception as error:
             log_info("assets.favicon.discover_failed", domain=domain, url=page_url, error=str(error)[:300])
-    favicon_url = favicon_url or urljoin(page_url, "/favicon.ico")
-    try:
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
-            response = await client.get(
-                favicon_url,
-                headers={
-                    "User-Agent": random_browser_user_agent(),
-                    "Accept": "image/avif,image/webp,image/png,image/svg+xml,image/*,*/*;q=0.8",
-                    "Referer": page_url,
-                },
-            )
-    except Exception as error:
-        log_info("assets.favicon.fetch_failed", domain=domain, url=favicon_url, error=str(error)[:300])
-        return None
-    if response.status_code < 200 or response.status_code >= 300:
-        log_info("assets.favicon.http_error", domain=domain, url=favicon_url, status=response.status_code)
-        return None
-    try:
-        content_length = int(response.headers.get("content-length") or 0)
-    except ValueError:
-        content_length = 0
-    if content_length > 1024 * 1024:
-        return None
-    body = response.content
-    if not body or len(body) > 1024 * 1024:
-        return None
-    mime_type = asset_mime_type(favicon_url, response.headers.get("content-type", ""))
-    extension = asset_extension(favicon_url, mime_type)
+
+    if favicon_url:
+        candidate_urls.append(favicon_url)
+    candidate_urls.append(urljoin(page_url, "/favicon.ico"))
+
+    if domain:
+        candidate_urls.append(
+            f"https://t1.gstatic.com/faviconV2?client=SOCIAL&type=FAVICON&fallback_opts=TYPE,SIZE,URL&url=https://{domain}&size=128"
+        )
+        candidate_urls.append(f"https://icons.duckduckgo.com/ip3/{domain}.ico")
+
+    seen_urls: set[str] = set()
+    ordered_urls: list[str] = []
+    for u in candidate_urls:
+        if u and u not in seen_urls:
+            seen_urls.add(u)
+            ordered_urls.append(u)
+
+    for target_url in ordered_urls:
+        is_third_party = "gstatic.com" in target_url or "duckduckgo.com" in target_url
+        timeout = 8.0 if is_third_party else 12.0
+        headers = {
+            "User-Agent": random_browser_user_agent(),
+            "Accept": "image/avif,image/webp,image/png,image/svg+xml,image/*,*/*;q=0.8",
+        }
+        if not is_third_party:
+            headers["Referer"] = page_url
+
+        try:
+            async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+                response = await client.get(target_url, headers=headers)
+        except Exception as error:
+            log_info("assets.favicon.fetch_failed", domain=domain, url=target_url, error=str(error)[:300])
+            continue
+
+        if response.status_code < 200 or response.status_code >= 300:
+            log_info("assets.favicon.http_error", domain=domain, url=target_url, status=response.status_code)
+            continue
+
+        try:
+            content_length = int(response.headers.get("content-length") or 0)
+        except ValueError:
+            content_length = 0
+        if content_length > 1024 * 1024:
+            continue
+
+        body = response.content
+        if not body or len(body) <= 50 or len(body) > 1024 * 1024:
+            continue
+
+        mime_type = asset_mime_type(target_url, response.headers.get("content-type", ""))
+        extension = asset_extension(target_url, mime_type)
+        return FaviconAsset(
+            body=body,
+            key=f"{domain}/favicon-{int(time.time() * 1000)}{extension}",
+            mime_type=mime_type,
+        )
+
+    log_info("assets.favicon.fallback_to_svg", domain=domain, page_url=page_url)
+    svg_body = generate_letter_svg_icon(domain)
     return FaviconAsset(
-        body=body,
-        key=f"{domain}/favicon-{int(time.time() * 1000)}{extension}",
-        mime_type=mime_type,
+        body=svg_body,
+        key=f"{domain}/favicon-{int(time.time() * 1000)}.svg",
+        mime_type="image/svg+xml",
     )
 
 

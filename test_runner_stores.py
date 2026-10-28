@@ -4356,5 +4356,55 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("backoff_until", metadata)
 
 
+class FaviconFallbackTests(unittest.IsolatedAsyncioTestCase):
+    def test_generate_letter_svg_icon(self) -> None:
+        svg_bytes = runner.generate_letter_svg_icon("https://chatgpt.com")
+        svg_text = svg_bytes.decode("utf-8")
+        self.assertIn("<svg", svg_text)
+        self.assertIn(">C</text>", svg_text)
+        self.assertIn('fill="hsl(', svg_text)
+
+        # test empty domain fallback
+        empty_svg = runner.generate_letter_svg_icon("").decode("utf-8")
+        self.assertIn(">A</text>", empty_svg)
+
+    async def test_fetch_favicon_asset_uses_direct_when_available(self) -> None:
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 200
+        mock_resp.content = b"x" * 100 + b"png-image-content"
+        mock_resp.headers = {"content-type": "image/png"}
+
+        with patch("runner.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            asset = await runner.fetch_favicon_asset("https://example.com", "example.com", "")
+            self.assertIsNotNone(asset)
+            self.assertEqual(asset.mime_type, "image/png")
+            self.assertTrue(asset.key.endswith(".png"))
+
+    async def test_fetch_favicon_asset_falls_back_to_svg_when_all_fail(self) -> None:
+        mock_resp = AsyncMock()
+        mock_resp.status_code = 403
+        mock_resp.content = b"Forbidden"
+        mock_resp.headers = {"content-type": "text/html"}
+
+        with patch("runner.httpx.AsyncClient") as mock_client_cls:
+            mock_client = AsyncMock()
+            mock_client.get = AsyncMock(return_value=mock_resp)
+            mock_client.__aenter__ = AsyncMock(return_value=mock_client)
+            mock_client.__aexit__ = AsyncMock(return_value=None)
+            mock_client_cls.return_value = mock_client
+
+            asset = await runner.fetch_favicon_asset("https://blocked.example.com", "blocked.example.com", "")
+            self.assertIsNotNone(asset)
+            self.assertEqual(asset.mime_type, "image/svg+xml")
+            self.assertTrue(asset.key.endswith(".svg"))
+            self.assertIn(b">B</text>", asset.body)
+
+
 if __name__ == "__main__":
     unittest.main()
