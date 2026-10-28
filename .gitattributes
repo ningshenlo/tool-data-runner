@@ -1,0 +1,2 @@
+# Exact source bytes are part of the reviewed report generator fingerprint.
+report-runtime/** -text whitespace=cr-at-eol
