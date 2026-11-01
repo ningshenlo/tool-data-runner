@@ -37,6 +37,7 @@ from workloads.assets.constants import (
 )
 from taxonomy_schema import strict_json_schema
 from workloads.assets.content import *  # noqa: F403
+from workloads.assets.content import _CONTENT_SAFETY_STRONG_DOMAIN_RE
 from workloads.assets.types import (
     AssetFetchResult,
     AssetPipelineError,
