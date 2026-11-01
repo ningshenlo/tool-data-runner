@@ -1,8 +1,51 @@
+# Secrets / local env
 .env
+.env.*
+!.env.example
+
+# Python
 .venv/
 __pycache__/
-*.pyc
-wrangler.toml
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.tox/
+.nox/
+
+# Task / local working material (AGENTS: use work/YYYYMMDD-<task>/)
+work/
+logs/
+tmp/
+.tmp/
+*.log
+screenshots/
 .sitemap-monitor/
 
-work/
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+.agents/
+
+# Local Cloudflare / legacy tooling (use `cf` CLI; do not commit local wrangler state)
+wrangler.toml
+.wrangler/
+.dev.vars
+
+# Local DB dumps / ad-hoc exports
+*.sqlite
+*.sqlite3
+*.db
+*.dump
+*.sql.gz
+
+# Report task scratch (keep formal reports/YYYYMMDD-* committed when intentional)
+reports/**/tmp/
+reports/**/logs/
+reports/**/screenshots/

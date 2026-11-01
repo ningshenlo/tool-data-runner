@@ -1,0 +1,441 @@
+name: service-sigpik-h4m21a
+networks:
+  default:
+    name: service-sigpik-h4m21a_default
+  sigpik_pg:
+    external: true
+    name: ainav-pg-vpc-test-20261019
+services:
+  assets-worker:
+    command:
+      - python
+      - runner.py
+      - --assets
+      - --loop
+      - --interval-seconds
+      - ${RUNNER_ASSET_POLL_INTERVAL_SECONDS:-30}
+    environment:
+      - CATALOG_AUTO_PUBLISH_ENABLED=${CATALOG_AUTO_PUBLISH_ENABLED:-1}
+      - CATALOG_AUTO_PUBLISH_LIMIT=${CATALOG_AUTO_PUBLISH_LIMIT:-25}
+      - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - CLOUDFLARE_BROWSER_RENDERING_API_TOKEN=${CLOUDFLARE_BROWSER_RENDERING_API_TOKEN:-}
+      - CLOUDFLARE_D1_DATABASE_ID=${CLOUDFLARE_D1_DATABASE_ID}
+      - CLOUDFLARE_R2_ACCESS_KEY_ID=${CLOUDFLARE_R2_ACCESS_KEY_ID:-}
+      - CLOUDFLARE_R2_BUCKET=${CLOUDFLARE_R2_BUCKET:-sitesimgs}
+      - CLOUDFLARE_R2_SECRET_ACCESS_KEY=${CLOUDFLARE_R2_SECRET_ACCESS_KEY:-}
+      - DOKPLOY_COMMIT_SHA=${DOKPLOY_COMMIT_SHA:-}
+      - GIT_COMMIT_SHA=${GIT_COMMIT_SHA:-}
+      - R2_PUBLIC_BASE_URL=${R2_PUBLIC_BASE_URL:-https://img.sigpik.com}
+      - RUNNER_ASSET_CONCURRENCY=${RUNNER_ASSET_CONCURRENCY:-10}
+      - RUNNER_ASSET_LIMIT=${RUNNER_ASSET_LIMIT:-25}
+      - RUNNER_ENRICHMENT_RECONCILE_CONCURRENCY=${RUNNER_ENRICHMENT_RECONCILE_CONCURRENCY:-5}
+      - RUNNER_ENRICHMENT_RECONCILE_LIMIT=${RUNNER_ENRICHMENT_RECONCILE_LIMIT:-100}
+      - RUNNER_INSTANCE_ID=${ASSETS_RUNNER_INSTANCE_ID:-assets-worker}
+      - RUNNER_LOG_LEVEL=${RUNNER_LOG_LEVEL:-info}
+      - RUNNER_MAX_RETRIES=${RUNNER_MAX_RETRIES:-2}
+      - RUNNER_SERVICE_NAME=assets-worker
+      - RUNNER_VERSION=${RUNNER_VERSION:-}
+      - SOURCE_COMMIT=${SOURCE_COMMIT:-}
+      - DATABASE_BACKEND=postgres
+      - DATABASE_URL=${SIGPIK_DATABASE_URL:?Formal jobs URL must be configured}
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 20s
+      test:
+        - CMD-SHELL
+        - kill -0 1
+      timeout: 5s
+    image: sigpik-tool-data-runner:pg-6d04c5f-telemetry
+    init: true
+    networks:
+      default: {}
+      sigpik_pg:
+        ipv4_address: 172.22.0.21
+    pull_policy: never
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - read_only: true
+        source: sigpik_pg_public_ca
+        target: /run/pg-ca
+        type: volume
+        volume:
+          subpath: sigpik-public-ca
+  periodic-facts-worker:
+    command:
+      - python
+      - runner.py
+      - --periodic-facts
+      - --loop
+      - --interval-seconds
+      - ${RUNNER_FACTS_POLL_INTERVAL_SECONDS:-300}
+    environment:
+      - AHREF_API_KEY=${AHREF_API_KEY:-}
+      - BRIGHTDATA_PROXY_HOST=${BRIGHTDATA_PROXY_HOST:-brd.superproxy.io}
+      - BRIGHTDATA_PROXY_PASSWORD=${BRIGHTDATA_PROXY_PASSWORD}
+      - BRIGHTDATA_PROXY_PORT=${BRIGHTDATA_PROXY_PORT:-33335}
+      - BRIGHTDATA_PROXY_USER=${BRIGHTDATA_PROXY_USER}
+      - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - CLOUDFLARE_D1_DATABASE_ID=${CLOUDFLARE_D1_DATABASE_ID}
+      - DOKPLOY_COMMIT_SHA=${DOKPLOY_COMMIT_SHA:-}
+      - GIT_COMMIT_SHA=${GIT_COMMIT_SHA:-}
+      - MARKET_SNAPSHOT_AUTO_PUBLISH_ENABLED=${MARKET_SNAPSHOT_AUTO_PUBLISH_ENABLED:-1}
+      - MARKET_SNAPSHOT_CHECK_INTERVAL_SECONDS=${MARKET_SNAPSHOT_CHECK_INTERVAL_SECONDS:-3600}
+      - MARKET_SNAPSHOT_STATE_ROOT=/market-snapshots
+      - REPORT_EXPORT_ENABLED=${REPORT_EXPORT_ENABLED:-1}
+      - REPORT_EXPORT_INTERVAL_SECONDS=${REPORT_EXPORT_INTERVAL_SECONDS:-21600}
+      - REPORT_EXPORT_ROOT=/report-exports
+      - REPORT_MARKET_INVENTORY_ENABLED=1
+      - RUNNER_AHREFS_REQUESTS_PER_MINUTE=${RUNNER_AHREFS_REQUESTS_PER_MINUTE:-60}
+      - RUNNER_DOMAIN_CONCURRENCY=${RUNNER_DOMAIN_CONCURRENCY:-5}
+      - RUNNER_DOMAIN_POLL_INTERVAL_SECONDS=${RUNNER_DOMAIN_POLL_INTERVAL_SECONDS:-1}
+      - RUNNER_DOMAIN_STATE_LIMIT=${RUNNER_DOMAIN_STATE_LIMIT:-50}
+      - RUNNER_DOMAIN_STATE_MAX_AGE_DAYS=${RUNNER_DOMAIN_STATE_MAX_AGE_DAYS:-30}
+      - RUNNER_INSTANCE_ID=${PERIODIC_FACTS_RUNNER_INSTANCE_ID:-periodic-facts-worker}
+      - RUNNER_LIMIT=${RUNNER_LIMIT:-500}
+      - RUNNER_LOG_LEVEL=${RUNNER_LOG_LEVEL:-info}
+      - RUNNER_MAX_RETRIES=${RUNNER_MAX_RETRIES:-2}
+      - RUNNER_SERVICE_NAME=periodic-facts-worker
+      - RUNNER_TRAFFIC_CONCURRENCY=${RUNNER_TRAFFIC_CONCURRENCY:-5}
+      - RUNNER_VERSION=${RUNNER_VERSION:-}
+      - SEARCH_DEMAND_AUTO_PUBLISH_ENABLED=${SEARCH_DEMAND_AUTO_PUBLISH_ENABLED:-1}
+      - SEARCH_DEMAND_CHECK_INTERVAL_SECONDS=${SEARCH_DEMAND_CHECK_INTERVAL_SECONDS:-3600}
+      - SEARCH_DEMAND_STATE_ROOT=/market-snapshots/search-demand
+      - SOURCE_COMMIT=${SOURCE_COMMIT:-}
+      - TRAFFIC_RELEASE_PROBE_DOMAIN=${TRAFFIC_RELEASE_PROBE_DOMAIN:-chatgpt.com}
+      - TRAFFIC_RELEASE_PROBE_INTERVAL_SECONDS=${TRAFFIC_RELEASE_PROBE_INTERVAL_SECONDS:-21600}
+      - TRAFFIC_RELEASE_PROBE_START_DAY=${TRAFFIC_RELEASE_PROBE_START_DAY:-7}
+      - TRAFFIC_RELEASE_QUEUE_LIMIT=${TRAFFIC_RELEASE_QUEUE_LIMIT:-5000}
+      - DATABASE_BACKEND=postgres
+      - DATABASE_URL=${SIGPIK_DATABASE_URL:?Formal jobs URL must be configured}
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 20s
+      test:
+        - CMD-SHELL
+        - kill -0 1
+      timeout: 5s
+    image: sigpik-tool-data-runner:pg-6d04c5f-telemetry
+    init: true
+    networks:
+      default: {}
+      sigpik_pg:
+        ipv4_address: 172.22.0.22
+    pull_policy: never
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - source: report-exports
+        target: /report-exports
+        type: volume
+        volume: {}
+      - source: market-snapshots
+        target: /market-snapshots
+        type: volume
+        volume: {}
+      - read_only: true
+        source: sigpik_pg_public_ca
+        target: /run/pg-ca
+        type: volume
+        volume:
+          subpath: sigpik-public-ca
+  report-draft-worker:
+    environment:
+      REPORT_DRAFT_INTERVAL_SECONDS: ${REPORT_DRAFT_INTERVAL_SECONDS:-21600}
+    healthcheck:
+      interval: 60s
+      retries: 3
+      start_period: 120s
+      test:
+        - CMD
+        - python
+        - scripts/reports/healthcheck.py
+      timeout: 5s
+    hostname: sigpik-report-drafts
+    image: sigpik-report-drafts:pg-6d04c5f
+    init: true
+    network_mode: none
+    pull_policy: never
+    read_only: true
+    restart: unless-stopped
+    stop_grace_period: 40s
+    tmpfs:
+      - /tmp:size=256m
+    volumes:
+      - read_only: true
+        source: report-exports
+        target: /exports
+        type: volume
+        volume: {}
+      - source: report-drafts
+        target: /app/work
+        type: volume
+        volume: {}
+  report-review-api:
+    command:
+      - python
+      - report_review_api.py
+    environment:
+      - REPORT_EXPORT_ROOT=/exports
+      - REPORT_REVIEW_TOKEN=${REPORT_REVIEW_TOKEN:?Set a random report review secret}
+      - REPORT_WORK_ROOT=/app/work
+      - DATABASE_BACKEND=postgres
+      - DATABASE_URL=${SIGPIK_DATABASE_URL:?Formal jobs URL must be configured}
+    expose:
+      - "8091"
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 20s
+      test:
+        - CMD
+        - python
+        - -c
+        - import os,urllib.request; r=urllib.request.Request('http://127.0.0.1:8091/__sigpik_report_review/v1/health',headers={'Authorization':'Bearer
+          '+os.environ['REPORT_REVIEW_TOKEN']}); urllib.request.urlopen(r,timeout=3).close()
+      timeout: 5s
+    image: sigpik-tool-data-runner:pg-6d04c5f-telemetry
+    init: true
+    networks:
+      default: {}
+      sigpik_pg:
+        ipv4_address: 172.22.0.20
+    pull_policy: never
+    read_only: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - read_only: true
+        source: report-exports
+        target: /exports
+        type: volume
+        volume: {}
+      - read_only: true
+        source: report-drafts
+        target: /app/work
+        type: volume
+        volume: {}
+      - read_only: true
+        source: sigpik_pg_public_ca
+        target: /run/pg-ca
+        type: volume
+        volume:
+          subpath: sigpik-public-ca
+  sitemap-monitor-worker:
+    command:
+      - python
+      - -m
+      - sitemap_monitor
+      - --backend
+      - cloudflare
+      - --loop
+      - --require-enabled
+      - --interval-seconds
+      - ${SITEMAP_MONITOR_POLL_SECONDS:-30}
+      - --check-interval-seconds
+      - ${SITEMAP_MONITOR_CHECK_INTERVAL_SECONDS:-21600}
+      - --batch-size
+      - ${SITEMAP_MONITOR_BATCH_SIZE:-25}
+      - --execution-concurrency
+      - ${SITEMAP_MONITOR_EXECUTION_CONCURRENCY:-8}
+      - --catalog-sync
+      - --catalog-refresh-seconds
+      - ${SITEMAP_MONITOR_CATALOG_REFRESH_SECONDS:-3600}
+      - --catalog-page-size
+      - ${SITEMAP_MONITOR_CATALOG_PAGE_SIZE:-500}
+      - --max-attempts
+      - ${SITEMAP_MONITOR_MAX_ATTEMPTS:-5}
+      - --job-lease-seconds
+      - ${SITEMAP_MONITOR_JOB_LEASE_SECONDS:-900}
+      - --maintenance-interval-seconds
+      - ${SITEMAP_MONITOR_MAINTENANCE_INTERVAL_SECONDS:-21600}
+      - --run-detail-retention-days
+      - ${SITEMAP_MONITOR_RUN_DETAIL_RETENTION_DAYS:-7}
+      - --scan-detail-retention-days
+      - ${SITEMAP_MONITOR_SCAN_DETAIL_RETENTION_DAYS:-30}
+      - --job-retention-days
+      - ${SITEMAP_MONITOR_JOB_RETENTION_DAYS:-30}
+      - --maintenance-batch-size
+      - ${SITEMAP_MONITOR_MAINTENANCE_BATCH_SIZE:-500}
+    deploy:
+      replicas: ${SITEMAP_MONITOR_REPLICAS:-0}
+    environment:
+      - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - CLOUDFLARE_D1_DATABASE_ID=${CLOUDFLARE_D1_DATABASE_ID}
+      - CLOUDFLARE_R2_ACCESS_KEY_ID=${CLOUDFLARE_R2_ACCESS_KEY_ID:-}
+      - CLOUDFLARE_R2_BUCKET=${CLOUDFLARE_R2_BUCKET:-sitesimgs}
+      - CLOUDFLARE_R2_SECRET_ACCESS_KEY=${CLOUDFLARE_R2_SECRET_ACCESS_KEY:-}
+      - DOKPLOY_COMMIT_SHA=${DOKPLOY_COMMIT_SHA:-}
+      - FOR_ALL_APP_R2_ACCESS_KEY_ID=${FOR_ALL_APP_R2_ACCESS_KEY_ID}
+      - FOR_ALL_APP_R2_SECRET_ACCESS_KEY=${FOR_ALL_APP_R2_SECRET_ACCESS_KEY}
+      - GIT_COMMIT_SHA=${GIT_COMMIT_SHA:-}
+      - RUNNER_INSTANCE_ID=${SITEMAP_MONITOR_RUNNER_INSTANCE_ID:-sitemap-monitor-worker}
+      - RUNNER_LOG_LEVEL=${RUNNER_LOG_LEVEL:-info}
+      - RUNNER_MAX_RETRIES=${RUNNER_MAX_RETRIES:-2}
+      - RUNNER_SERVICE_NAME=sitemap-monitor-worker
+      - RUNNER_VERSION=${RUNNER_VERSION:-}
+      - SITEMAP_MONITOR_ENABLED=${SITEMAP_MONITOR_ENABLED:-0}
+      - SITEMAP_MONITOR_PAUSED_SITE_FILE=${SITEMAP_MONITOR_PAUSED_SITE_FILE:-}
+      - SITEMAP_MONITOR_R2_BUCKET=${SITEMAP_MONITOR_R2_BUCKET:-sitemap-monitor}
+      - SITEMAP_MONITOR_SITES=${SITEMAP_MONITOR_SITES:-}
+      - SITEMAP_MONITOR_SITE_FILE=${SITEMAP_MONITOR_SITE_FILE:-}
+      - SITEMAP_MONITOR_SYNTHETIC_DNS_DOH_FALLBACK=${SITEMAP_MONITOR_SYNTHETIC_DNS_DOH_FALLBACK:-0}
+      - SOURCE_COMMIT=${SOURCE_COMMIT:-}
+      - DATABASE_BACKEND=postgres
+      - DATABASE_URL=${SIGPIK_DATABASE_URL:?Formal jobs URL must be configured}
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 20s
+      test:
+        - CMD-SHELL
+        - kill -0 1
+      timeout: 5s
+    image: sigpik-tool-data-runner:pg-6d04c5f-telemetry
+    init: true
+    networks:
+      default: {}
+      sigpik_pg:
+        ipv4_address: 172.22.0.25
+    pull_policy: never
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - read_only: true
+        source: sigpik_pg_public_ca
+        target: /run/pg-ca
+        type: volume
+        volume:
+          subpath: sigpik-public-ca
+  taxonomy-worker:
+    command:
+      - python
+      - runner.py
+      - --taxonomy
+      - --loop
+    environment:
+      - CLOUDFLARE_ACCOUNT_ID=${CLOUDFLARE_ACCOUNT_ID}
+      - CLOUDFLARE_API_TOKEN=${CLOUDFLARE_API_TOKEN}
+      - CLOUDFLARE_BROWSER_RENDERING_API_TOKEN=${CLOUDFLARE_BROWSER_RENDERING_API_TOKEN:-}
+      - CLOUDFLARE_D1_DATABASE_ID=${CLOUDFLARE_D1_DATABASE_ID}
+      - DOKPLOY_COMMIT_SHA=${DOKPLOY_COMMIT_SHA:-}
+      - GIT_COMMIT_SHA=${GIT_COMMIT_SHA:-}
+      - JEV_API_KEY=${JEV_API_KEY:-${jev_api_key:-${TYPESAFE_API_KEY:-}}}
+      - JEV_CAPABILITY_LIMIT=${JEV_CAPABILITY_LIMIT:-6}
+      - JEV_MIN_CONFIDENCE=${JEV_MIN_CONFIDENCE:-0.85}
+      - JEV_TIMEOUT_SECONDS=${JEV_TIMEOUT_SECONDS:-8}
+      - OPENAI_API=${OPENAI_API:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_TAXONOMY_BATCH_REQUEST_LIMIT=${OPENAI_TAXONOMY_BATCH_REQUEST_LIMIT:-500}
+      - OPENAI_TAXONOMY_CAPABILITY_REASONING_EFFORT=${OPENAI_TAXONOMY_CAPABILITY_REASONING_EFFORT:-medium}
+      - OPENAI_TAXONOMY_ESCALATION_MODEL=${OPENAI_TAXONOMY_ESCALATION_MODEL:-gpt-5.6-terra}
+      - OPENAI_TAXONOMY_ESCALATION_REASONING_EFFORT=${OPENAI_TAXONOMY_ESCALATION_REASONING_EFFORT:-high}
+      - OPENAI_TAXONOMY_L1_MIN_GAP=${OPENAI_TAXONOMY_L1_MIN_GAP:-0.08}
+      - OPENAI_TAXONOMY_L1_REASONING_EFFORT=${OPENAI_TAXONOMY_L1_REASONING_EFFORT:-low}
+      - OPENAI_TAXONOMY_LEAF_MIN_CONFIDENCE=${OPENAI_TAXONOMY_LEAF_MIN_CONFIDENCE:-0.60}
+      - OPENAI_TAXONOMY_LEAF_REASONING_EFFORT=${OPENAI_TAXONOMY_LEAF_REASONING_EFFORT:-high}
+      - OPENAI_TAXONOMY_MAX_ATTEMPTS=${OPENAI_TAXONOMY_MAX_ATTEMPTS:-3}
+      - OPENAI_TAXONOMY_MAX_OUTPUT_TOKENS=${OPENAI_TAXONOMY_MAX_OUTPUT_TOKENS:-4096}
+      - OPENAI_TAXONOMY_MODEL=${OPENAI_TAXONOMY_MODEL:-gpt-5.6-luna}
+      - OPENAI_TAXONOMY_PROFILE_REASONING_EFFORT=${OPENAI_TAXONOMY_PROFILE_REASONING_EFFORT:-medium}
+      - OPENAI_TAXONOMY_RETRY_BASE_SECONDS=${OPENAI_TAXONOMY_RETRY_BASE_SECONDS:-300}
+      - OPENAI_TAXONOMY_TIMEOUT_SECONDS=${OPENAI_TAXONOMY_TIMEOUT_SECONDS:-90}
+      - RUNNER_INSTANCE_ID=${TAXONOMY_RUNNER_INSTANCE_ID:-taxonomy-worker}
+      - RUNNER_LOG_LEVEL=${RUNNER_LOG_LEVEL:-info}
+      - RUNNER_MAX_RETRIES=${RUNNER_MAX_RETRIES:-2}
+      - RUNNER_SERVICE_NAME=taxonomy-worker
+      - RUNNER_TAXONOMY_CONCURRENCY=${RUNNER_TAXONOMY_CONCURRENCY:-3}
+      - RUNNER_TAXONOMY_INTERVAL_SECONDS=${RUNNER_TAXONOMY_INTERVAL_SECONDS:-300}
+      - RUNNER_TAXONOMY_LIMIT=${RUNNER_TAXONOMY_LIMIT:-50}
+      - RUNNER_TAXONOMY_PROVIDER_BACKOFF_SECONDS=${RUNNER_TAXONOMY_PROVIDER_BACKOFF_SECONDS:-21600}
+      - RUNNER_VERSION=${RUNNER_VERSION:-}
+      - SOURCE_COMMIT=${SOURCE_COMMIT:-}
+      - TAXONOMY_AUTO_ACCEPT_CONFIDENCE=${TAXONOMY_AUTO_ACCEPT_CONFIDENCE:-0.50}
+      - TAXONOMY_AUTO_ENABLED=${TAXONOMY_AUTO_ENABLED:-1}
+      - TAXONOMY_BATCH_ENABLED=${TAXONOMY_BATCH_ENABLED:-1}
+      - TAXONOMY_CAPABILITIES_ENABLED=${TAXONOMY_CAPABILITIES_ENABLED:-1}
+      - TAXONOMY_CAPABILITY_BACKFILL_ENABLED=${TAXONOMY_CAPABILITY_BACKFILL_ENABLED:-1}
+      - TAXONOMY_CAPABILITY_CANDIDATE_LIMIT=${TAXONOMY_CAPABILITY_CANDIDATE_LIMIT:-96}
+      - TAXONOMY_CAPABILITY_PROVIDER=${TAXONOMY_CAPABILITY_PROVIDER:-openai}
+      - TAXONOMY_MAIN_CONTENT_MAX_CHARS=${TAXONOMY_MAIN_CONTENT_MAX_CHARS:-10000}
+      - DATABASE_BACKEND=postgres
+      - DATABASE_URL=${SIGPIK_DATABASE_URL:?Formal jobs URL must be configured}
+    healthcheck:
+      interval: 30s
+      retries: 3
+      start_period: 20s
+      test:
+        - CMD-SHELL
+        - kill -0 1
+      timeout: 5s
+    image: sigpik-tool-data-runner:pg-6d04c5f-catalog
+    init: true
+    networks:
+      default: {}
+      sigpik_pg:
+        ipv4_address: 172.22.0.24
+    pull_policy: never
+    restart: unless-stopped
+    stop_grace_period: 30s
+    volumes:
+      - read_only: true
+        source: sigpik_pg_public_ca
+        target: /run/pg-ca
+        type: volume
+        volume:
+          subpath: sigpik-public-ca
+volumes:
+  market-snapshots:
+    name: sigpik-market-snapshots
+  report-drafts:
+    name: sigpik-report-drafts
+  report-exports:
+    name: sigpik-report-exports
+  sigpik_pg_public_ca:
+    external: true
+    name: ainav-pigsty-test-dnkttj_pigsty_data
+x-common-environment:
+  CLOUDFLARE_ACCOUNT_ID: ${CLOUDFLARE_ACCOUNT_ID}
+  CLOUDFLARE_API_TOKEN: ${CLOUDFLARE_API_TOKEN}
+  CLOUDFLARE_D1_DATABASE_ID: ${CLOUDFLARE_D1_DATABASE_ID}
+  DOKPLOY_COMMIT_SHA: ${DOKPLOY_COMMIT_SHA:-}
+  GIT_COMMIT_SHA: ${GIT_COMMIT_SHA:-}
+  RUNNER_LOG_LEVEL: ${RUNNER_LOG_LEVEL:-info}
+  RUNNER_MAX_RETRIES: ${RUNNER_MAX_RETRIES:-2}
+  RUNNER_VERSION: ${RUNNER_VERSION:-}
+  SOURCE_COMMIT: ${SOURCE_COMMIT:-}
+x-postgres-runner:
+  environment:
+    DATABASE_BACKEND: postgres
+    DATABASE_URL: ${SIGPIK_DATABASE_URL:?Formal jobs URL must be configured}
+  image: sigpik-tool-data-runner:pg-6d04c5f-telemetry
+  pull_policy: never
+  volumes:
+    - read_only: true
+      source: sigpik_pg_public_ca
+      target: /run/pg-ca
+      type: volume
+      volume:
+        subpath: sigpik-public-ca
+x-runner-base:
+  build:
+    context: .
+    dockerfile: Dockerfile
+  healthcheck:
+    interval: 30s
+    retries: 3
+    start_period: 20s
+    test:
+      - CMD-SHELL
+      - kill -0 1
+    timeout: 5s
+  image: sigpik-tool-data-runner:${RUNNER_IMAGE_TAG:-latest}
+  init: true
+  pull_policy: build
+  restart: unless-stopped
+  stop_grace_period: 30s

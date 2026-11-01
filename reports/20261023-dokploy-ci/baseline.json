@@ -1,0 +1,30 @@
+{
+  "composeId": "c5v_jBd3UTUgsbGIsWVrX",
+  "appName": "service-sigpik-h4m21a",
+  "before": {
+    "source": "raw",
+    "autoDeploy": true,
+    "images": [
+      "sigpik-tool-data-runner:pg-6d04c5f-telemetry",
+      "sigpik-tool-data-runner:pg-6d04c5f-catalog",
+      "sigpik-report-drafts:pg-6d04c5f"
+    ]
+  },
+  "environmentUnchanged": true,
+  "serviceFlags": {
+    "CLOUDFLARE_BROWSER_RENDERING_ENABLED": "1",
+    "TAXONOMY_AUTO_ENABLED": "1",
+    "TAXONOMY_BATCH_ENABLED": "1",
+    "TAXONOMY_CAPABILITIES_ENABLED": "1",
+    "TAXONOMY_CAPABILITY_BACKFILL_ENABLED": "1",
+    "SITEMAP_MONITOR_ENABLED": "1",
+    "SITEMAP_MONITOR_REPLICAS": "1"
+  },
+  "postgres": {
+    "database": "sigpik",
+    "host": "ainav-pg-test.rugchecker.com",
+    "tls": "verify-full",
+    "ca": "/run/pg-ca/origin-ca.pem"
+  },
+  "domain": "https://back.rugchecker.com/__sigpik_report_review"
+}

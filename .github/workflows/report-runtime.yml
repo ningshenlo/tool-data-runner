@@ -1,7 +1,7 @@
 name: Report runtime
 on:
   push:
-    branches: [agent/reports-github-deploy-20260914, agent/fix-traffic-runner-observability]
+    branches: [main]
   pull_request:
   workflow_dispatch:
 permissions:
@@ -32,8 +32,8 @@ jobs:
           docker build -t report-test-renderer -f Dockerfile.reports .
       - name: Test collector entry point and scheduler contracts
         run: |
-          docker run --rm --network none report-test-collector python -c "import runner, report_review_api, postgres_client, postgres_legacy, taxonomy_batch, jev_taxonomy, sitemap_monitor.cloudflare"
-          docker run --rm --network none -v "$PWD:/repo:ro" -w /repo report-test-collector python -m unittest test_market_snapshot_refresh test_search_demand_refresh test_docker_image_contract test_d1_direct_clients tests.test_postgres_deployment tests.test_report_automation tests.test_report_review_api test_taxonomy_precision test_taxonomy_batch test_taxonomy_safety
+          docker run --rm --network none report-test-collector python -c "import runner, report_review_api, postgres_client, postgres_legacy, shared.readiness, workloads.assets, taxonomy_batch, jev_taxonomy, sitemap_monitor.cloudflare, config.constants, libs.domains"
+          docker run --rm --network none -v "$PWD:/repo:ro" -w /repo report-test-collector python -m unittest tests.test_market_snapshot_refresh tests.test_search_demand_refresh tests.test_docker_image_contract tests.test_d1_direct_clients tests.test_postgres_deployment tests.test_report_automation tests.test_report_review_api tests.test_taxonomy_precision tests.test_taxonomy_batch tests.test_taxonomy_safety
           docker run --rm --network none -v "$PWD:/repo:ro" -w /repo report-test-renderer node --test tests/report-runtime.test.mjs
       - name: Prepare synthetic completion events
         run: |
@@ -47,29 +47,3 @@ jobs:
         if: always()
         run: |
           docker volume rm report-test-exports report-test-drafts || true
-  promote-production:
-    needs: offline-report-smoke
-    if: github.ref == 'refs/heads/agent/fix-traffic-runner-observability' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    permissions:
-      contents: write
-    concurrency:
-      group: runner-production-promotion
-      cancel-in-progress: false
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Promote only the tested current commit
-        shell: bash
-        run: |
-          set -euo pipefail
-          current=$(git ls-remote origin "refs/heads/${GITHUB_REF_NAME}" | cut -f1)
-          if [ "$current" != "$GITHUB_SHA" ]; then
-            echo "A newer source commit exists; this run will not deploy."
-            exit 0
-          fi
-          # Dokploy watches only this branch. Never force-push or copy an untested HEAD.
-          git push origin "${GITHUB_SHA}:refs/heads/deploy/production"
-          echo "Promoted tested commit ${GITHUB_SHA} to Dokploy's deployment branch." >> "$GITHUB_STEP_SUMMARY"

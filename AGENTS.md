@@ -2,23 +2,24 @@
 
 适用于本项目及其子目录。先遵守工作区根 AGENTS.md，再阅读本项目 README.md。
 部署维护细节见 [docs/production-deployment.md](docs/production-deployment.md)。
+源码布局与 worker 边界见 [contracts/README.md](contracts/README.md)：`workloads/` 按 Dokploy 服务拆分，`config/` 放静态常量，`libs/` 放可复用工具函数，`shared/` 放 DB 与就绪门槛，`runner.py` 仍是 CLI 入口。
 
 ## 统一开发与发布分支
 
-- 后续修改统一提交并推送到 `agent/fix-traffic-runner-observability`。若在临时分支或工作树开发，先将改动整合到该分支再发布；不要覆盖他人的未提交改动。
-- `deploy/production` 是 CI 管理的发布分支，只由成功的 CI 推进到通过测试的准确提交。代理不得手动提交、合并、推送或强推该分支。
-- 不把 `main`、历史开发分支或临时分支当作生产发布入口；不得擅自更改 Dokploy 跟踪的分支。
+- 只使用 `main`：日常提交、推送、Dokploy 跟踪分支都是它。不要再往 `deploy/production` 或 `agent/fix-traffic-runner-observability` 发发布。
+- 历史分支可留作只读参考，不得再作为生产入口，也不得强推改写。
+- 不得擅自把 Dokploy 改到非 `main` 的分支。
 
 ## 唯一常规部署流程
 
-`推送 agent/fix-traffic-runner-observability → Report runtime CI 全部通过 → CI 推进 deploy/production → Dokploy 自动构建并部署`
+`推送 main → Report runtime CI 跑检查；Dokploy（Branch=main, On Push + Autodeploy）拉取同一推送并构建部署`
 
 - CI 定义在 `.github/workflows/report-runtime.yml`，包括 Compose 配置契约、两个镜像构建、镜像内导入检查、离线回归和报表生成检查。
-- CI 失败时修复问题并重新推送源分支，不得跳过检查或绕过 CI 发布。PR 检查通过本身不触发生产发布；过期源提交也不会被推进。
-- 正常代码和文档更新不需要手动操作 Dokploy。不得点击 Deploy、Rebuild、Stop、Fresh Volumes，也不得通过 API、Webhook、SSH 或生产 `docker compose up` 另行发布，以免重复部署或绕过测试门槛。
+- CI 与 Dokploy 会并行触发：CI 失败时立刻在源分支修并再推，必要时用 revert 回滚；不得点击 Deploy、Rebuild、Stop、Fresh Volumes，也不得通过 API、Webhook、SSH 或生产 `docker compose up` 另行发布。
+- PR 检查通过本身不触发生产发布；只有合并/推送到 `main` 才会让 Dokploy 部署。
 - 不再上传本地镜像、切回 Raw Compose 或在生产容器内直接修改源码。维护源是本项目的 `docker-compose.dokploy.yml` 和 Dockerfile。
-- 推送后检查该提交的 CI 结果；需要确认上线时，可只读查看 Dokploy 部署记录、提交 SHA、容器健康及任务日志。CI 成功不等于生产部署已经成功，未验证的状态必须明确说明。
-- 常规回滚也应在源分支提交 revert，再经过相同 CI 流程。遇到发布分支分叉时先排查原因，不得强推解决。
+- 推送后核对 CI 与 Dokploy 部署记录、提交 SHA、容器健康及任务日志。CI 成功不等于生产已完成，未验证状态必须说清楚。
+- 常规回滚在 `main` 上 revert 再推送。禁止对 `main` 强推来“修”发布分叉，除非用户在当前任务中明确授权。
 
 ## 生产配置与例外操作
 

@@ -1,9 +1,9 @@
 # Monthly report drafts in Dokploy
 
 `docker-compose.dokploy.yml` builds both the existing collector and the report
-renderer from this repository. The deployment branch is
-`agent/fix-traffic-runner-observability`. No separate image registry, Sigpik
-checkout, desktop package, new API key or external scheduler is required.
+renderer from this repository. The deployment branch is `main`. No separate
+image registry, Sigpik checkout, desktop package, new API key or external
+scheduler is required.
 
 ## What runs automatically
 

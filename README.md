@@ -5,9 +5,26 @@ The historical D1 names below describe legacy interfaces; the production Compose
 forces `DATABASE_BACKEND=postgres` and maps Dokploy's `SIGPIK_DATABASE_URL` into
 the containers. Do not deploy the old D1 configuration. See
 [production deployment and CI](docs/production-deployment.md) for the maintained
-GitHub → tested deployment branch → Dokploy flow, TLS mounts and existing volumes.
+GitHub `main` → Dokploy flow, TLS mounts and existing volumes.
 
 Python runner for scheduled SimilarWeb traffic backfill, homepage asset capture, domain facts, and taxonomy updates.
+
+## Layout
+
+Dokploy still runs one image as several services. Source is organized so each worker is reviewable without opening the whole monolith:
+
+| Path | Role |
+|---|---|
+| `runner.py` | CLI entry (`python runner.py …`) |
+| `config/` + `libs/` | static knobs + reusable helpers |
+| `workloads/` | per-worker packages (assets / traffic / domain_state / market / taxonomy) |
+| `shared/` | PostgreSQL transport + readiness predicates |
+| `ops/` | operator tools (gold eval, taxonomy incidents) — not loop hot path |
+| `scripts/` | CI checks + `once/` one-shot experiments |
+| `tests/` | all unit tests |
+| `contracts/` | worker map, readiness, SQL catalog rules |
+
+See [contracts/README.md](contracts/README.md) and [docs/ROOT-LAYOUT.md](docs/ROOT-LAYOUT.md). Root `postgres_client.py` / `postgres_legacy.py` are compatibility shims.
 
 The repository also contains the Phase 1 `sitemap_monitor` package. It discovers and
 recursively checks sitemap resources, uses HTTP validators, filters serialization-only

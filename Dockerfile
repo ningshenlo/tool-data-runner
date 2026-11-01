@@ -9,7 +9,13 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY requirements-postgres.txt .
 RUN pip install --no-cache-dir -r requirements-postgres.txt
-COPY postgres_client.py postgres_legacy.py postgres-query-catalog.json ./
+COPY shared ./shared
+COPY workloads ./workloads
+COPY contracts ./contracts
+COPY config ./config
+COPY libs ./libs
+COPY ops ./ops
+COPY postgres_client.py postgres_legacy.py ./
 
 COPY runner.py .
 COPY report_exports.py .

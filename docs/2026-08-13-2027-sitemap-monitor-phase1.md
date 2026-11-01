@@ -5,7 +5,7 @@
 
 ## 目标与边界
 
-依据《Sitemap Change Intelligence Engine 实现方案》先完成 Phase 1，确保 URL
+依据 [Sitemap Change Intelligence Engine 实现方案](design/sitemap-change-intelligence-engine.md) 先完成 Phase 1，确保 URL
 新增/移除检测准确。当前不接 ChangeEvent 产品层、URL 聚类、页面抽样、LLM、
 Adaptive Polling 或 Queue；这些仍属于后续阶段。
 

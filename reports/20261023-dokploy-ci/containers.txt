@@ -1,0 +1,92 @@
+
+  - button "Toggle Sidebar":
+    - generic: Toggle Sidebar
+  - button "监控类应用":
+    - generic: 监控类应用
+  - paragraph: production
+  - button "sigpik数据采集":
+    - generic: sigpik数据采集
+  - button:
+  - button:
+  - button
+  - text: sigpik数据采集
+  - generic: 拆分运行的服务
+  - generic: service-sigpik-h4m21a
+  - generic: Dokploy Server
+  - button:
+  - button:
+  - tablist:
+    - tab "General"
+    - tab "Environment"
+    - tab "Domains"
+    - tab "Deployments"
+    - tab "Containers" [active] [selected]
+    - tab "Backups"
+    - tab "Schedules"
+    - tab "Volume Backups"
+    - tab "Logs"
+    - tab "Patches"
+    - tab "Monitoring"
+    - tab "Advanced"
+  - tabpanel "Containers":
+    - generic: Containers
+    - generic: Inspect each container in this compose and run basic lifecycle actions.
+    - button:
+    - table:
+      - rowgroup:
+        - row "Name State Status Container ID":
+          - columnheader "Name"
+          - columnheader "State"
+          - columnheader "Status"
+          - columnheader "Container ID"
+          - columnheader
+      - rowgroup:
+        - row "service-sigpik-h4m21a-periodic-facts-worker-1 running Up About a minute (healthy) 5f83d9a73e40":
+          - cell "service-sigpik-h4m21a-periodic-facts-worker-1"
+          - cell "running":
+            - generic: running
+          - cell "Up About a minute (healthy)"
+          - cell "5f83d9a73e40"
+          - cell:
+            - button:
+        - row "service-sigpik-h4m21a-report-review-api-1 running Up About a minute (healthy) 57558ea2b868":
+          - cell "service-sigpik-h4m21a-report-review-api-1"
+          - cell "running":
+            - generic: running
+          - cell "Up About a minute (healthy)"
+          - cell "57558ea2b868"
+          - cell:
+            - button:
+        - row "service-sigpik-h4m21a-sitemap-monitor-worker-1 running Up About a minute (healthy) a581be84ad26":
+          - cell "service-sigpik-h4m21a-sitemap-monitor-worker-1"
+          - cell "running":
+            - generic: running
+          - cell "Up About a minute (healthy)"
+          - cell "a581be84ad26"
+          - cell:
+            - button:
+        - row "service-sigpik-h4m21a-taxonomy-worker-1 running Up About a minute (healthy) f534cfff2e6a":
+          - cell "service-sigpik-h4m21a-taxonomy-worker-1"
+          - cell "running":
+            - generic: running
+          - cell "Up About a minute (healthy)"
+          - cell "f534cfff2e6a"
+          - cell:
+            - button:
+        - row "service-sigpik-h4m21a-assets-worker-1 running Up About a minute (healthy) 1cffe88ecb36":
+          - cell "service-sigpik-h4m21a-assets-worker-1"
+          - cell "running":
+            - generic: running
+          - cell "Up About a minute (healthy)"
+          - cell "1cffe88ecb36"
+          - cell:
+            - button:
+        - row "service-sigpik-h4m21a-report-draft-worker-1 running Up 8 minutes (healthy) 2f836176da54":
+          - cell "service-sigpik-h4m21a-report-draft-worker-1"
+          - cell "running":
+            - generic: running
+          - cell "Up 8 minutes (healthy)"
+          - cell "2f836176da54"
+          - cell:
+            - button:
+- alert: "Compose: sigpik数据采集 - 监控类应用 | Dokploy"

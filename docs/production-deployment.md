@@ -3,27 +3,32 @@
 The existing Dokploy Compose service is `sigpik数据采集`, app name
 `service-sigpik-h4m21a`, compose ID `c5v_jBd3UTUgsbGIsWVrX`.
 Its GitHub source is `ningshenlo/tool-data-runner`, Compose path
-`./docker-compose.dokploy.yml`, deployment branch `deploy/production`.
+`./docker-compose.dokploy.yml`, deployment branch `main`.
 
 ## Test gate
 
-Develop on `agent/fix-traffic-runner-observability`. The `Report runtime` workflow
-validates the rendered Compose, builds both images, checks imports inside the
-actual collector image, runs offline regression tests, and renders synthetic
-reports with read-only input volumes and no network. Only a successful run on
-that source branch can advance `deploy/production` to its exact tested SHA.
-PR runs and the historical reports branch cannot promote production.
+Develop and release only on `main`. The `Report runtime` workflow validates the
+rendered Compose, builds both images, checks imports inside the actual collector
+image, runs offline regression tests, and renders synthetic reports with
+read-only input volumes and no network. PR runs do not deploy.
 
-Dokploy's GitHub provider watches only `deploy/production`, with On Push and
-Autodeploy enabled. Do not point it back at the source branch or manually push
-untested commits to the deployment branch. No Dokploy administrator API key or
-database password is stored in GitHub Actions. The promotion job uses the
-repository-scoped GitHub Actions token with contents write permission.
+Dokploy's GitHub provider watches only `main`, with On Push and Autodeploy
+enabled. A push to `main` starts CI and Dokploy in parallel — there is no
+separate `deploy/production` promotion branch. Do not retarget Dokploy to
+legacy branches (`deploy/production`, `agent/fix-traffic-runner-observability`,
+etc.). Revert on `main` and push again to roll back application code. Never
+roll back to a D1-era deployment. Never force-push `main` unless the current
+task explicitly authorizes it.
 
-The promotion step rejects stale source runs and uses a normal fast-forward
-push. A divergent release branch fails closed; do not solve that with a force
-push. Revert through the source branch and run CI to roll back application code.
-Never roll back to a D1-era deployment.
+### One-time cutover from the old dual-branch setup
+
+1. Fast-forward remote `main` to the commit that is live on
+   `deploy/production` (do this **before** changing Dokploy, or the next
+   Autodeploy would roll production backward).
+2. In Dokploy → General: set Branch to `main`, keep Compose path
+   `./docker-compose.dokploy.yml`, Trigger `On Push`, Autodeploy on. Save.
+   Do not click Deploy / Rebuild / Fresh Volumes just to flip the branch.
+3. Later pushes go only to `main`. Leave old branches untouched.
 
 ## PostgreSQL and preserved resources
 

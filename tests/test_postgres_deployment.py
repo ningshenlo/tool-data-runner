@@ -26,7 +26,7 @@ class PostgresDeploymentTests(unittest.TestCase):
 
     def test_postgres_backend_selects_pg_transport(self):
         url = 'postgresql://ci:ci@postgres.invalid/sigpik?sslmode=verify-full'
-        with patch.dict(os.environ, {'DATABASE_BACKEND': 'postgres', 'DATABASE_URL': url}), patch('postgres_legacy.LegacyPostgresClient') as client:
+        with patch.dict(os.environ, {'DATABASE_BACKEND': 'postgres', 'DATABASE_URL': url}), patch('shared.db.legacy.LegacyPostgresClient') as client:
             self.assertIs(transport_for(AINAV_DATABASE_ID), client.return_value)
             client.assert_called_once_with(url)
 
