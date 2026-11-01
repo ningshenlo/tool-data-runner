@@ -3507,11 +3507,21 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             runner.assets_next_delay_seconds(
-                {"claimed": 0, "enrichment_has_more": 1},
+                {"claimed": 0, "enrichment_has_more": 1, "enrichment_ready": 3},
                 batch_limit=25,
                 idle_interval_seconds=30,
             ),
             0,
+        )
+
+    def test_assets_batches_wait_when_reconcile_only_reconfirms_blocked_rows(self) -> None:
+        self.assertEqual(
+            runner.assets_next_delay_seconds(
+                {"claimed": 0, "enrichment_has_more": 1, "enrichment_ready": 0},
+                batch_limit=25,
+                idle_interval_seconds=30,
+            ),
+            30,
         )
 
     def test_assets_batches_back_off_only_after_backlog_drains(self) -> None:

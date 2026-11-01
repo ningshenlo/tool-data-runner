@@ -17,8 +17,13 @@ def assets_next_delay_seconds(
     queued = max(0, int(counts.get("asset_queued") or 0))
     revived = max(0, int(counts.get("asset_revived") or 0))
     effective_limit = max(1, int(batch_limit))
+    # Reconcile keeps re-selecting rows that stay blocked (missing name/category),
+    # so has_more alone would spin; only skip the wait while rows are promoted.
+    enrichment_progress = int(counts.get("enrichment_has_more") or 0) and int(
+        counts.get("enrichment_ready") or 0
+    ) > 0
 
-    if claimed >= effective_limit or int(counts.get("enrichment_has_more") or 0):
+    if claimed >= effective_limit or enrichment_progress:
         return 0
     if claimed > 0 or queued > 0 or revived > 0:
         return min(max(1, int(idle_interval_seconds)), 5)
