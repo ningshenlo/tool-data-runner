@@ -76,6 +76,34 @@ class PostgresDeploymentTests(unittest.TestCase):
         self.assertIn('>= 0.5', entry['postgres'])
         self.assertIn('<= $1', entry['postgres'])
 
+    def test_auto_publish_statements_use_postgres_safe_catalog_entries(self):
+        from shared.db.legacy import catalog_entry, query_key
+
+        captured = []
+
+        class RecordingClient:
+            async def query(self, sql, params=None, **kwargs):
+                captured.append((sql, params))
+                return [{'id': 1}, {'id': 2}]
+
+            async def batch(self, statements, **kwargs):
+                captured.extend(statements)
+                return []
+
+        asyncio.run(runner.D1CatalogPublisher(RecordingClient(), 'test').publish_ready(5))
+        client = LegacyPostgresClient('postgresql://ci:ci@postgres.invalid/sigpik')
+        self.assertEqual(len(captured), 3)
+        for sql, params in captured:
+            entry = catalog_entry(client.catalog, query_key(sql))
+            self.assertIsNotNone(entry)
+            # PostgreSQL has neither SQLite json_extract nor strftime.
+            self.assertNotIn('json_extract (', entry['postgres'])
+            self.assertNotIn(' strftime (', entry['postgres'])
+            self.assertIn('ainav_json_extract_text', entry['postgres'])
+            # RETURNING id rows are the published count; identity capture would drop them.
+            self.assertIsNone(entry['generatedReturning'])
+            client.prepare(sql, params)
+
     def test_pipeline_queries_covered_by_postgres_catalog(self):
         client = LegacyPostgresClient('postgresql://ci:ci@postgres.invalid/sigpik')
         predicate = f"({tool_live_ready_predicate('t')}) AND ({tool_auto_publish_admission_predicate('t')})"
