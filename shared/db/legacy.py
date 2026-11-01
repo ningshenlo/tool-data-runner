@@ -11,13 +11,18 @@ from pathlib import Path
 from shared.db.client import PostgresClient
 
 AINAV_DATABASE_ID='3025073a-9e43-4000-b5c9-9e975ed27b7b'
-# Compound operators must stay single tokens. Splitting <> into < > produces
-# invalid PostgreSQL when dynamic_postgres_entry joins tokens with spaces.
+# Catalog keys were hashed with this tokenizer; changing it orphans every entry
+# whose SQL contains <>, <= or >=, so it must stay as-is.
+KEY_TOKEN=re.compile(r"--[^\n]*|/\*[\s\S]*?\*/|'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|\?(?:\d+)?|[\w$]+|[^\s]")
+# Compound operators and decimals must stay single tokens. Splitting <> into
+# < > or 0.5 into 0 . 5 produces invalid PostgreSQL when dynamic_postgres_entry
+# joins tokens with spaces.
 TOKEN=re.compile(
     r"--[^\n]*|/\*[\s\S]*?\*/|"
     r"'(?:''|[^'])*'|\"(?:\"\"|[^\"])*\"|`(?:``|[^`])*`|"
     r"\?(?:\d+)?|"
     r"<>|<=|>=|!=|==|"
+    r"\d+\.\d+|"
     r"[\w$]+|"
     r"[^\s]"
 )
@@ -40,9 +45,9 @@ def normalize_lists(sql):
         i+=1
     for a,b in reversed(changes):sql=sql[:a]+'?'+sql[b:]
     return sql,mapping
-def query_key(sql):
+def query_key(sql,token=KEY_TOKEN):
     sql,_=normalize_lists(sql)
-    tokens=[m.group() for m in TOKEN.finditer(sql) if not m.group().startswith(('--','/*'))]
+    tokens=[m.group() for m in token.finditer(sql) if not m.group().startswith(('--','/*'))]
     while tokens and tokens[-1]==';':tokens.pop()
     return ' '.join(t if t.startswith(("'",'"','`')) else t.lower() for t in tokens)
 
@@ -56,7 +61,7 @@ CATALOG_EXTENSIONS = {
     'b0b4655add8e8adac8ff90f9692d4173a283a8d69a036203adc50470133f184b': {'parameters': 5, 'verb': 'select', 'generatedReturning': None, 'postgres': 'SELECT CASE WHEN EXISTS(SELECT 1 FROM "tools" AS "t" WHERE "t"."id" = $1 AND "t"."content_safety_status" = \'safe\') THEN 1 ELSE 0 END AS "has_content_safety", CASE WHEN EXISTS(SELECT 1 FROM "tool_assets" AS "ta" WHERE "ta"."tool_id" = $2 AND "ta"."asset_kind" = \'screenshot\' AND "ta"."storage_bucket" = $3 AND "ta"."is_current" = 1) THEN 1 ELSE 0 END AS "has_screenshot", CASE WHEN EXISTS(SELECT 1 FROM "tool_assets" AS "ta" WHERE "ta"."tool_id" = $4 AND "ta"."asset_kind" = \'favicon\' AND "ta"."is_current" = 1) THEN 1 ELSE 0 END AS "has_favicon", CASE WHEN EXISTS(SELECT 1 FROM "tool_localizations" AS "tl" WHERE "tl"."tool_id" = $5 AND TRIM("tl"."name") <> \'\' AND TRIM(COALESCE("tl"."short_description", \'\')) <> \'\') THEN 1 ELSE 0 END AS "has_description"'},
     '78bc5ccefff604004c456b15dc336c8a50d983682e854ba22472b421ae3281df': {'parameters': 8, 'verb': 'update', 'generatedReturning': None, 'postgres': 'UPDATE "domain_state_tasks" SET "status" = \'processing\', "attempts" = "attempts" + 1, "last_started_at" = $1, "next_retry_at" = NULL, "last_error" = NULL, "lease_owner" = $2, "lease_token" = LOWER(HEX(RANDOMBLOB(16))), "lease_expires_at" = $3, "updated_at" = $4 WHERE "migration_row_id" IN (WITH "ready_tasks" AS MATERIALIZED (SELECT "migration_row_id" AS "__rid", COALESCE("next_retry_at", \'\') AS "__due_at", "updated_at" AS "__updated_at", "normalized_domain" AS "__domain" FROM "domain_state_tasks" WHERE "source" = $5 AND "dead_letter_at" IS NULL AND "attempts" < "max_attempts" AND ("status" IN (\'queued\', \'failed\', \'sync_failed\') AND ("next_retry_at" IS NULL OR "next_retry_at" <= $6)) ORDER BY COALESCE("next_retry_at", \'\') NULLS FIRST, "updated_at" NULLS FIRST, "normalized_domain" NULLS FIRST LIMIT $8), "expired_tasks" AS MATERIALIZED (SELECT "migration_row_id" AS "__rid", COALESCE("next_retry_at", \'\') AS "__due_at", "updated_at" AS "__updated_at", "normalized_domain" AS "__domain" FROM "domain_state_tasks" WHERE "source" = $5 AND "dead_letter_at" IS NULL AND "attempts" < "max_attempts" AND ("status" = \'processing\' AND NOT "lease_expires_at" IS NULL AND "lease_expires_at" <= $7) ORDER BY COALESCE("next_retry_at", \'\') NULLS FIRST, "updated_at" NULLS FIRST, "normalized_domain" NULLS FIRST LIMIT $8) SELECT "__rid" FROM (SELECT * FROM "ready_tasks" UNION ALL SELECT * FROM "expired_tasks") ORDER BY "__due_at" NULLS FIRST, "__updated_at" NULLS FIRST, "__domain" NULLS FIRST LIMIT $8) RETURNING "normalized_domain", "attempts", "max_attempts", "generation", "lease_token", "fetch_domain_rating", "fetch_rdap"'},
     '1921cd3eaf9c7ba565d077e2c305e8db775b7b8cff01223a34607ac0f74b668d': {'parameters': 4, 'verb': 'update', 'generatedReturning': None, 'postgres': 'UPDATE "domain_state_tasks" SET "status" = \'queued\', "attempts" = 0, "generation" = "generation" + 1, "last_queued_at" = $1, "next_retry_at" = NULL, "last_error" = NULL, "lease_owner" = NULL, "lease_token" = NULL, "lease_expires_at" = NULL, "dead_letter_at" = NULL, "updated_at" = $2 WHERE "migration_row_id" IN (SELECT "migration_row_id" FROM "domain_state_tasks" WHERE "source" = $3 AND "status" = \'failed\' AND "attempts" >= "max_attempts" AND NOT "dead_letter_at" IS NULL AND "last_error" = \'AHREF_API_KEY is required for Ahrefs Domain Rating requests\' ORDER BY "updated_at" NULLS FIRST, "normalized_domain" NULLS FIRST LIMIT $4)'},
-    '5d72cc9fb784f888b923c74307c29fa9fb02b4b3c2cc2ea3ba343657428bc6fa': {'parameters': 1, 'verb': 'select', 'generatedReturning': None, 'postgres': 'SELECT "t"."id" AS "tool_id" FROM "tools" AS "t" LEFT JOIN "tool_enrichment_states" AS "state" ON "state"."tool_id" = "t"."id" WHERE "t"."status" IN (\'pending_enrich\', \'pending_review\', \'published\') AND "t"."duplicate_of_tool_id" IS NULL AND ("state"."evaluated_at" IS NULL OR "t"."updated_at" > "state"."evaluated_at" OR POSITION(\'"screenshot"\' IN COALESCE("state"."blocking_json", \'\')) > 0 OR POSITION(\'"published_localization"\' IN COALESCE("state"."blocking_json", \'\')) > 0 OR POSITION(\'"key_feature"\' IN COALESCE("state"."blocking_json", \'\')) > 0 OR POSITION(\'"key_features"\' IN COALESCE("state"."blocking_json", \'\')) > 0 OR POSITION(\'"name_quality"\' IN COALESCE("state"."blocking_json", \'\')) > 0 OR POSITION(\'"content_safety"\' IN COALESCE("state"."blocking_json", \'\')) > 0 OR (POSITION(\'"category"\' IN COALESCE("state"."blocking_json", \'\')) > 0 AND EXISTS(SELECT 1 FROM "product_taxonomy_assignments" AS "assignment" JOIN "taxonomy_terms" AS "term" ON "term"."id" = "assignment"."term_id" AND "term"."dimension" = \'primary_category\' AND "term"."status" = \'active\' WHERE "assignment"."tool_id" = "t"."id" AND "assignment"."is_primary" = 1 AND "assignment"."decision_status" IN (\'verified\', \'auto_accepted\') AND ("assignment"."decision_status" = \'verified\' OR COALESCE("assignment"."confidence", 0) >= 0.5)))) ORDER BY CASE WHEN "t"."status" = \'pending_enrich\' THEN 0 ELSE 1 END NULLS FIRST, CASE WHEN "state"."evaluated_at" IS NULL THEN 0 ELSE 1 END NULLS FIRST, "state"."evaluated_at" NULLS FIRST, "t"."id" NULLS FIRST LIMIT $1'},
+    'b11fd5d206e7c25983bd6308d3d107f5e0c4ee20527332b78b3114e084a0e3ad': {'parameters': 1, 'verb': 'select', 'generatedReturning': None, 'postgres': 'SELECT "t"."id" AS "tool_id" FROM "tools" AS "t" LEFT JOIN "tool_enrichment_states" AS "state" ON "state"."tool_id" = "t"."id" WHERE "t"."status" IN (\'pending_enrich\', \'pending_review\', \'published\') AND "t"."duplicate_of_tool_id" IS NULL AND ("state"."evaluated_at" IS NULL OR "t"."updated_at" > "state"."evaluated_at" OR POSITION(\'"screenshot"\' IN COALESCE("state"."blocking_json", \'\')) > 0 OR POSITION(\'"published_localization"\' IN COALESCE("state"."blocking_json", \'\')) > 0 OR POSITION(\'"key_feature"\' IN COALESCE("state"."blocking_json", \'\')) > 0 OR POSITION(\'"key_features"\' IN COALESCE("state"."blocking_json", \'\')) > 0 OR POSITION(\'"name_quality"\' IN COALESCE("state"."blocking_json", \'\')) > 0 OR POSITION(\'"content_safety"\' IN COALESCE("state"."blocking_json", \'\')) > 0 OR (POSITION(\'"category"\' IN COALESCE("state"."blocking_json", \'\')) > 0 AND EXISTS(SELECT 1 FROM "product_taxonomy_assignments" AS "assignment" JOIN "taxonomy_terms" AS "term" ON "term"."id" = "assignment"."term_id" AND "term"."dimension" = \'primary_category\' AND "term"."status" = \'active\' WHERE "assignment"."tool_id" = "t"."id" AND "assignment"."is_primary" = 1 AND "assignment"."decision_status" IN (\'verified\', \'auto_accepted\') AND ("assignment"."decision_status" = \'verified\' OR COALESCE("assignment"."confidence", 0) >= 0.5)))) ORDER BY CASE WHEN "t"."status" = \'pending_enrich\' THEN 0 ELSE 1 END NULLS FIRST, CASE WHEN "state"."evaluated_at" IS NULL THEN 0 ELSE 1 END NULLS FIRST, "state"."evaluated_at" NULLS FIRST, "t"."id" NULLS FIRST LIMIT $1'},
 }
 
 def dynamic_postgres_entry(sql):
@@ -142,6 +147,8 @@ class LegacyPostgresClient:
 
     def prepare(self,sql,params):
         entry=catalog_entry(self.catalog,query_key(sql))
+        # Extensions added while keys used compound-operator tokens (2026-11-01).
+        if entry is None:entry=catalog_entry(self.catalog,query_key(sql,TOKEN))
         if entry is None:entry=dynamic_postgres_entry(sql)
         if entry is None:raise ValueError('Unmapped ainav SQL; an explicit PostgreSQL catalog entry and regression test are required')
         _,mapping=normalize_lists(sql)

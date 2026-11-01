@@ -64,10 +64,10 @@ class D1EnrichmentStore:
                 WHERE l.tool_id = t.id AND trim(l.name) <> ''
                   AND coalesce(l.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
                   AND (length(trim(l.name)) <= 80 OR (l.name_review_status = 'human_approved' AND length(trim(l.name)) <= 120))
-                  AND instr(l.name, '<') = 0
-                  AND instr(l.name, '>') = 0
-                  AND instr(l.name, '`') = 0
-                  AND instr(lower(l.name), 'json-ld') = 0
+                  AND l.name NOT LIKE '%<%'
+                  AND l.name NOT LIKE '%>%'
+                  AND l.name NOT LIKE '%`%'
+                  AND lower(l.name) NOT LIKE '%json-ld%'
               ) THEN 1 ELSE 0 END AS has_name_quality,
               CASE WHEN {accepted_primary_taxonomy_predicate('t')}
                    THEN 1 ELSE 0 END AS has_category,
@@ -121,10 +121,10 @@ class D1EnrichmentStore:
                 WHERE l.tool_id = t.id AND trim(l.name) <> ''
                   AND coalesce(l.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
                   AND (length(trim(l.name)) <= 80 OR (l.name_review_status = 'human_approved' AND length(trim(l.name)) <= 120))
-                  AND instr(l.name, '<') = 0
-                  AND instr(l.name, '>') = 0
-                  AND instr(l.name, '`') = 0
-                  AND instr(lower(l.name), 'json-ld') = 0
+                  AND l.name NOT LIKE '%<%'
+                  AND l.name NOT LIKE '%>%'
+                  AND l.name NOT LIKE '%`%'
+                  AND lower(l.name) NOT LIKE '%json-ld%'
               ) THEN 1 ELSE 0 END AS has_name_quality,
               CASE WHEN {accepted_primary_taxonomy_predicate('t')}
                    THEN 1 ELSE 0 END AS has_category,

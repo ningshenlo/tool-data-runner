@@ -50,6 +50,32 @@ class PostgresDeploymentTests(unittest.TestCase):
         self.assertIn('"name_quality"', entry['postgres'])
         self.assertIn('"content_safety"', entry['postgres'])
 
+    def test_catalog_keys_survive_dynamic_tokenizer_changes(self):
+        from shared.db.legacy import catalog_entry, query_key
+        from workloads.assets.store import D1AssetStore
+
+        captured = []
+
+        class RecordingClient:
+            async def query(self, sql, params):
+                captured.append(sql)
+                return []
+
+        # Numbered parameters and <= only work through the explicit catalog entry.
+        asyncio.run(D1AssetStore(RecordingClient()).claim_due_tasks(5, 'test'))
+        client = LegacyPostgresClient('postgresql://ci:ci@postgres.invalid/sigpik')
+        self.assertIsNotNone(catalog_entry(client.catalog, query_key(captured[0])))
+        entry, _, _ = client.prepare(captured[0], ['tool-assets', 'now', 'now', 5])
+        self.assertEqual(entry['parameters'], 4)
+
+    def test_dynamic_rewrite_keeps_compound_operators_and_decimals(self):
+        from shared.db.legacy import dynamic_postgres_entry
+
+        entry = dynamic_postgres_entry("SELECT 1 FROM t WHERE a <> '' AND b >= 0.5 AND c <= ?")
+        self.assertIn("<> ''", entry['postgres'])
+        self.assertIn('>= 0.5', entry['postgres'])
+        self.assertIn('<= $1', entry['postgres'])
+
     def test_pipeline_queries_covered_by_postgres_catalog(self):
         client = LegacyPostgresClient('postgresql://ci:ci@postgres.invalid/sigpik')
         predicate = f"({tool_live_ready_predicate('t')}) AND ({tool_auto_publish_admission_predicate('t')})"
