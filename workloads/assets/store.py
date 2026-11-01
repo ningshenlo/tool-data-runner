@@ -42,7 +42,12 @@ from workloads.assets.content import (
     numbered_public_slug,
     public_tool_slug_base,
 )
-from workloads.assets.types import AssetFetchResult, AssetTask, ContentSafetyAssessment
+from workloads.assets.types import (
+    AssetFetchResult,
+    AssetTask,
+    ContentSafetyAssessment,
+    PageQualityAssessment,
+)
 from runner import (
     DOMAIN_STATE_SOURCE,
     TRAFFIC_SOURCE,

@@ -1,4 +1,5 @@
 """Offline checks that production database selection and query catalog coverage fail closed."""
+import asyncio
 import os
 import unittest
 from unittest.mock import patch
@@ -29,6 +30,25 @@ class PostgresDeploymentTests(unittest.TestCase):
         with patch.dict(os.environ, {'DATABASE_BACKEND': 'postgres', 'DATABASE_URL': url}), patch('shared.db.legacy.LegacyPostgresClient') as client:
             self.assertIs(transport_for(AINAV_DATABASE_ID), client.return_value)
             client.assert_called_once_with(url)
+
+    def test_enrichment_reconcile_query_uses_explicit_catalog_entry(self):
+        from shared.db.legacy import catalog_entry, query_key
+
+        captured = []
+
+        class RecordingClient:
+            async def query(self, sql, params):
+                captured.append(sql)
+                return []
+
+        asyncio.run(runner.D1EnrichmentStore(RecordingClient()).reconcile_active_tools(5))
+        client = LegacyPostgresClient('postgresql://ci:ci@postgres.invalid/sigpik')
+        entry = catalog_entry(client.catalog, query_key(captured[0]))
+        # Dynamic rewriting would leave SQLite instr() in place, which PostgreSQL rejects.
+        self.assertIsNotNone(entry)
+        self.assertNotIn('instr', entry['postgres'].lower())
+        self.assertIn('"name_quality"', entry['postgres'])
+        self.assertIn('"content_safety"', entry['postgres'])
 
     def test_pipeline_queries_covered_by_postgres_catalog(self):
         client = LegacyPostgresClient('postgresql://ci:ci@postgres.invalid/sigpik')

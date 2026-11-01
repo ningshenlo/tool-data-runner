@@ -13,7 +13,7 @@ from libs.domains import normalize_domain
 from libs.logging_util import log_error, log_info
 from libs.numbers import normalize_country_code, to_integer, to_month_start, to_number
 from libs.timeutil import utc_now_iso
-from runner import D1Client
+from runner import Config, D1Client
 from workloads.traffic.parse import parse_monthly_rows
 from workloads.traffic.parse import (
     build_domain_traffic_monthly_upsert,

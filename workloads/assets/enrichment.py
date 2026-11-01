@@ -261,6 +261,8 @@ class D1EnrichmentStore:
                 OR instr(coalesce(state.blocking_json, ''), '"published_localization"') > 0
                 OR instr(coalesce(state.blocking_json, ''), '"key_feature"') > 0
                 OR instr(coalesce(state.blocking_json, ''), '"key_features"') > 0
+                OR instr(coalesce(state.blocking_json, ''), '"name_quality"') > 0
+                OR instr(coalesce(state.blocking_json, ''), '"content_safety"') > 0
                 OR (
                   instr(coalesce(state.blocking_json, ''), '"category"') > 0
                   AND {accepted_primary_taxonomy_predicate('t')}

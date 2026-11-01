@@ -4122,6 +4122,39 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state["readiness"], "ready")
         self.assertEqual(state["blocking_json"], "[]")
 
+    async def test_reconcile_reevaluates_states_blocked_by_demoted_gates(self) -> None:
+        tool_id = self.add_tool("stale-name-quality")
+        self.seed_primary_taxonomy(tool_id)
+        self.connection.execute(
+            """
+            INSERT INTO tool_localizations (
+              tool_id, locale_code, localized_slug, name, short_description,
+              feature_highlights, translation_status, published_at
+            )
+            VALUES (?, 'en', 'stale-name-quality', 'Stale Name Quality', '', '[]', 'published', ?)
+            """,
+            [tool_id, runner.utc_now_iso()],
+        )
+        self.connection.execute(
+            """
+            INSERT INTO tool_sources (tool_id, source_type, source_url, is_primary)
+            VALUES (?, 'official_site', 'https://stale-name-quality.example', 1)
+            """,
+            [tool_id],
+        )
+        # Evaluated under the old gate, where name_quality was still blocking.
+        self.connection.execute(
+            "INSERT INTO tool_enrichment_states (tool_id, readiness, blocking_json, evaluated_at) VALUES (?, 'blocked', ?, ?)",
+            [tool_id, '["name_quality"]', '2099-01-01T00:00:00.000Z'],
+        )
+        self.connection.commit()
+
+        result = await runner.D1EnrichmentStore(self.d1).reconcile_active_tools(100)
+
+        self.assertGreaterEqual(result["ready"], 1)
+        tool = self.connection.execute("SELECT status FROM tools WHERE id = ?", [tool_id]).fetchone()
+        self.assertEqual(tool["status"], "pending_review")
+
     async def test_catalog_auto_publish_publishes_ready_tool_with_audit_once(self) -> None:
         tool_id = self.add_tool("catalog-auto-publish", status="pending_review")
         self.seed_publishable_tool(tool_id, "catalog-auto-publish")

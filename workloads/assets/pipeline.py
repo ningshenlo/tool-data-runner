@@ -47,6 +47,7 @@ from workloads.assets.types import (
     ContentSafetyAssessment,
     ContentSafetyError,
     FaviconAsset,
+    PageQualityAssessment,
     PageQualityError,
 )
 from workloads.assets.content import (

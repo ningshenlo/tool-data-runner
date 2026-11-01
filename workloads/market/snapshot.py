@@ -10,6 +10,7 @@ from runner import (
     TRAFFIC_SOURCE,
     Config,
     D1Client,
+    log_error,
     log_info,
     to_integer,
     to_month_start,
