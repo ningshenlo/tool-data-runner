@@ -4,9 +4,9 @@ One Docker image. Separate Dokploy services. Code packages under `workloads/`.
 
 | Dokploy service | CLI | Package | Owns |
 |---|---|---|---|
-| `assets-worker` | `python runner.py --assets --loop` | `workloads/assets` | `asset_tasks`, enrichment reconcile, catalog auto-publish |
-| `periodic-facts-worker` | `python runner.py --periodic-facts --loop` | `workloads/traffic` + `workloads/domain_state` + `workloads/market` (+ `workloads/periodic`) | Similarweb traffic, Ahrefs DR/RDAP, market snapshot hooks |
-| `taxonomy-worker` | `python runner.py --taxonomy --loop` | `workloads/taxonomy` | primary taxonomy automation |
+| `assets-worker` | `python -m runner --assets --loop` | `workloads/assets` | `asset_tasks`, enrichment reconcile, catalog auto-publish |
+| `periodic-facts-worker` | `python -m runner --periodic-facts --loop` | `workloads/traffic` + `workloads/domain_state` + `workloads/market` (+ `workloads/periodic`) | Similarweb traffic, Ahrefs DR/RDAP, market snapshot hooks |
+| `taxonomy-worker` | `python -m runner --taxonomy --loop` | `workloads/taxonomy` | primary taxonomy automation |
 | `sitemap-monitor-worker` | sitemap_monitor CLI | `sitemap_monitor/` | sitemap sync (separate package) |
 
 Legacy: `python runner.py --all --loop` → `workloads.periodic.run_all_loop` (rollback only).

@@ -44,7 +44,8 @@ services:
         ipv4_address: 172.22.0.22
     command:
       - python
-      - runner.py
+      - -m
+      - runner
       - --periodic-facts
       - --loop
       - --interval-seconds
@@ -95,7 +96,8 @@ services:
       - *postgres-ca
     command:
       - python
-      - runner.py
+      - -m
+      - runner
       - --assets
       - --loop
       - --interval-seconds
@@ -185,7 +187,7 @@ services:
         ipv4_address: 172.22.0.24
     volumes:
       - *postgres-ca
-    command: ["python", "runner.py", "--taxonomy", "--loop"]
+    command: ["python", "-m", "runner", "--taxonomy", "--loop"]
     environment:
       <<: *common-environment
       JEV_API_KEY: ${JEV_API_KEY:-${jev_api_key:-${TYPESAFE_API_KEY:-}}}

@@ -17,6 +17,10 @@ import sys
 import time
 import uuid
 import xml.etree.ElementTree as ET
+
+# `python runner.py` loads this file as `__main__`. Workloads still do
+# `from runner import ...`; alias so Dokploy entrypoints share one module object.
+sys.modules.setdefault("runner", sys.modules[__name__])
 from contextlib import suppress
 from contextvars import ContextVar
 from dataclasses import dataclass, replace

@@ -1,33 +1,36 @@
 from __future__ import annotations
 
 import json
-from typing import Any
-from urllib.parse import quote
+import re
+import time
+from typing import TYPE_CHECKING, Any
+from urllib.parse import urlsplit
 
 import httpx
+from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
-from runner import (
-    Config,
-    log_debug,
-    log_error,
-    log_info,
-    normalize_domain,
-    parse_monthly_rows,
-    redact_log_text,
-    response_body_sample,
-    response_header_summary,
+from config.constants import (
+    SIMILARWEB_API_BASE,
+    SIMILARWEB_EXTENSION_ID,
+    SIMILARWEB_EXTENSION_UPDATE_URL,
+    SIMILARWEB_EXTENSION_VERSION_FALLBACK,
+    SIMILARWEB_USER_AGENT,
 )
+from libs.domains import normalize_domain
+from libs.http import response_body_sample, response_header_summary
+from libs.logging_util import log_error, log_info, mask_value
+from libs.text import generate_session_id
 from workloads.traffic.parse import (
-    build_traffic_metrics,
     extract_brightdata_zone,
     latest_observed_traffic_month,
-    parse_ai_traffic,
-    parse_top_countries,
-    parse_top_keywords,
-    parse_traffic_sources,
+    parse_monthly_rows,
     requested_month_has_traffic_data,
 )
 from workloads.traffic.types import FetchResult
+
+if TYPE_CHECKING:
+    from runner import Config
+
 
 async def fetch_similarweb_extension_version(timeout: float = 10.0) -> str | None:
     params = {
@@ -41,6 +44,7 @@ async def fetch_similarweb_extension_version(timeout: float = 10.0) -> str | Non
     response.raise_for_status()
     match = re.search(r'<updatecheck[^>]*\bversion="([^"]+)"', response.text)
     return match.group(1) if match else None
+
 
 class SimilarWebClient:
     def __init__(self, config: Config):
