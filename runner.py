@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import argparse
 import asyncio
 import base64
@@ -448,6 +450,9 @@ def load_config(require_brightdata: bool = True) -> Config:
     )
 
 
+# Types used by D1Client annotations must resolve on Python 3.12 at class body
+# time unless postponed; import the lightweight dataclasses before D1Client.
+from workloads.traffic.types import FetchResult, TrafficReleaseGateResult, TrafficTask
 
 
 class D1Client:
