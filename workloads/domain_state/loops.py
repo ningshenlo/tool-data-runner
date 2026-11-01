@@ -85,5 +85,7 @@ async def run_domain_state_loop(config: Any, limit: int | None, interval_seconds
         except asyncio.CancelledError:
             raise
         except Exception as error:
+            # Avoid 1s error storms when a batch fails (e.g. SQL/catalog miss).
+            next_delay = max(30, int(interval_seconds))
             log_error("domain_state_runner.batch.failed", error=str(error)[:500])
         await asyncio.sleep(next_delay)
