@@ -1,27 +1,18 @@
 from __future__ import annotations
 
-import json
 import re
 import time
 from typing import TYPE_CHECKING, Any
-from urllib.parse import urlsplit
 
 import httpx
-from curl_cffi.requests import AsyncSession as CurlAsyncSession
 
 from config.constants import (
-    SIMILARWEB_API_BASE,
     SIMILARWEB_EXTENSION_ID,
     SIMILARWEB_EXTENSION_UPDATE_URL,
-    SIMILARWEB_EXTENSION_VERSION_FALLBACK,
-    SIMILARWEB_USER_AGENT,
 )
 from libs.domains import normalize_domain
-from libs.http import response_body_sample, response_header_summary
-from libs.logging_util import log_error, log_info, mask_value
-from libs.text import generate_session_id
+from libs.logging_util import log_error, log_info
 from workloads.traffic.parse import (
-    extract_brightdata_zone,
     latest_observed_traffic_month,
     parse_monthly_rows,
     requested_month_has_traffic_data,
@@ -31,8 +22,12 @@ from workloads.traffic.types import FetchResult
 if TYPE_CHECKING:
     from runner import Config
 
+# The unified service retries once per domain and caps a request at 90 seconds.
+TRAFFIC_SERVICE_TIMEOUT_SECONDS = 100.0
+
 
 async def fetch_similarweb_extension_version(timeout: float = 10.0) -> str | None:
+    """Diagnostics only: the unified traffic service owns the request protocol."""
     params = {
         "response": "updatecheck",
         "prodversion": "120.0",
@@ -47,127 +42,115 @@ async def fetch_similarweb_extension_version(timeout: float = 10.0) -> str | Non
 
 
 class SimilarWebClient:
+    """Thin client of the unified traffic service (traffic-desk-executor).
+
+    Similarweb signing, Bright Data proxy sessions, TLS fingerprinting, 429
+    backoff and the shared 24h cache all live in the service. This client only
+    asks for the raw Similarweb payload and keeps the existing local parsing, so
+    parse/store/pipeline behavior is unchanged.
+    """
+
     def __init__(self, config: Config):
-        self.proxy_host = config.brightdata_proxy_host
-        self.proxy_port = config.brightdata_proxy_port
-        self.proxy_user = config.brightdata_proxy_user
-        self.proxy_password = config.brightdata_proxy_password
-        self.proxy_user_summary = mask_value(config.brightdata_proxy_user)
-        self.extension_version: str | None = None
+        self.service_url = (getattr(config, "traffic_service_url", "") or "https://will-api.sigpik.com").rstrip("/")
+        self.service_token = getattr(config, "traffic_service_token", "") or ""
         log_info(
             "similarweb.client.config",
-            proxy_host=self.proxy_host,
-            proxy_port=self.proxy_port,
-            proxy_user=self.proxy_user_summary,
-            proxy_zone=extract_brightdata_zone(config.brightdata_proxy_user),
-            proxy_user_has_session="-session-" in config.brightdata_proxy_user,
-            proxy_session_per_fetch=True,
+            traffic_service_url=self.service_url,
+            traffic_service_token_configured=bool(self.service_token),
         )
 
-    def build_proxy_url(self) -> str:
-        session_id = generate_session_id()
-        username = f"{self.proxy_user}-session-{session_id}"
-        return f"http://{username}:{self.proxy_password}@{self.proxy_host}:{self.proxy_port}"
-
-    async def get_extension_version(self) -> str:
-        if self.extension_version:
-            return self.extension_version
+    async def _query(self, clean_domain: str, bypass_cache: bool) -> tuple[dict[str, Any] | None, FetchResult | None]:
+        """Return (service result item, None) or (None, failure FetchResult)."""
+        body: dict[str, Any] = {"url": clean_domain, "include_raw": True}
+        if bypass_cache:
+            body["bypass_cache"] = True
+        started_at = time.perf_counter()
         try:
-            version = await fetch_similarweb_extension_version()
-        except Exception as error:
+            async with httpx.AsyncClient(timeout=TRAFFIC_SERVICE_TIMEOUT_SECONDS) as client:
+                response = await client.post(
+                    f"{self.service_url}/v1/traffic",
+                    headers={"Authorization": f"Bearer {self.service_token}"},
+                    json=body,
+                )
+        except httpx.HTTPError as error:
             log_error(
-                "similarweb.extension_version.fetch_error",
+                "similarweb.fetch.request_error",
+                domain=clean_domain,
                 error_type=type(error).__name__,
                 error=str(error)[:500],
             )
-            version = None
-        self.extension_version = version or SIMILARWEB_EXTENSION_VERSION_FALLBACK
-        return self.extension_version
+            return None, FetchResult(status="failed", monthly_rows=[], error=f"request_error:{type(error).__name__}")
+        elapsed_ms = int((time.perf_counter() - started_at) * 1000)
+        if response.status_code != 200:
+            log_error(
+                "similarweb.fetch.service_http_error",
+                domain=clean_domain,
+                status_code=response.status_code,
+                elapsed_ms=elapsed_ms,
+            )
+            return None, FetchResult(
+                status="failed",
+                monthly_rows=[],
+                error=f"traffic_service_http_{response.status_code}",
+            )
+        try:
+            item = response.json()["results"][0]
+            if not isinstance(item, dict):
+                raise TypeError("result item is not an object")
+        except (ValueError, KeyError, IndexError, TypeError):
+            log_error("similarweb.fetch.invalid_service_response", domain=clean_domain)
+            return None, FetchResult(status="failed", monthly_rows=[], error="traffic_service_invalid_response")
+        error = item.get("error") if isinstance(item.get("error"), dict) else {}
+        log_info(
+            "similarweb.fetch.response",
+            domain=clean_domain,
+            status=item.get("status"),
+            cached=bool(item.get("cached")),
+            fetched_at=item.get("fetched_at"),
+            error_code=error.get("code"),
+            elapsed_ms=elapsed_ms,
+        )
+        return item, None
 
     async def fetch(self, domain: str, requested_month: str) -> FetchResult:
         clean_domain = normalize_domain(domain)
         if not clean_domain:
             log_info("similarweb.invalid_domain", domain=domain, requested_month=requested_month)
             return FetchResult(status="failed", monthly_rows=[], error="invalid_domain")
+        if not self.service_token:
+            log_error("similarweb.fetch.service_not_configured", domain=clean_domain)
+            return FetchResult(status="failed", monthly_rows=[], error="traffic_service_not_configured")
 
-        extension_version = await self.get_extension_version()
-        headers = {
-            "User-Agent": SIMILARWEB_USER_AGENT,
-            "Accept": "application/json,text/plain,*/*",
-            "Accept-Language": "en-US,en;q=0.9",
-            "DNT": "1",
-            "X-Extension-Version": extension_version,
-        }
-        url = f"{SIMILARWEB_API_BASE}?domain={clean_domain}"
         log_info("similarweb.fetch.start", domain=clean_domain, requested_month=requested_month)
+        item, failure = await self._query(clean_domain, bypass_cache=False)
+        if failure:
+            return failure
+        result = self._to_fetch_result(item, clean_domain, requested_month)
+        # A cached payload may predate Similarweb's release of the requested
+        # month. Re-check upstream once before reporting the month unavailable.
+        if item.get("cached") and result.status == "no_data":
+            item, failure = await self._query(clean_domain, bypass_cache=True)
+            if failure:
+                return failure
+            result = self._to_fetch_result(item, clean_domain, requested_month)
+        return result
 
-        try:
-            started_at = time.perf_counter()
-            async with CurlAsyncSession() as client:
-                response = await client.get(
-                    url,
-                    proxy=self.build_proxy_url(),
-                    headers=headers,
-                    timeout=25.0,
-                    verify=False,
-                    impersonate="chrome",
-                    default_headers=True,
-                )
-            elapsed_ms = int((time.perf_counter() - started_at) * 1000)
-        except Exception as error:
-            log_error(
-                "similarweb.fetch.request_error",
-                domain=clean_domain,
-                error_type=type(error).__name__,
-                error=str(error)[:500],
-                proxy_host=self.proxy_host,
-                proxy_port=self.proxy_port,
-                proxy_user=self.proxy_user_summary,
-            )
-            return FetchResult(status="failed", monthly_rows=[], error=f"request_error:{str(error)[:300]}")
-
-        is_success = 200 <= response.status_code < 300
-        response_history = getattr(response, "history", []) or []
-        log_info(
-            "similarweb.fetch.response",
-            domain=clean_domain,
-            status_code=response.status_code,
-            elapsed_ms=elapsed_ms,
-            final_host=urlsplit(str(response.url)).netloc,
-            http_version=str(getattr(response, "http_version", "")),
-            history_statuses=[item.status_code for item in response_history],
-            **response_header_summary(response),
-        )
-        if not is_success:
-            log_info(
-                "similarweb.fetch.response_body",
-                domain=clean_domain,
-                status_code=response.status_code,
-                body_sample=response_body_sample(response),
-            )
-
-        if response.status_code == 404:
+    def _to_fetch_result(self, item: dict[str, Any], clean_domain: str, requested_month: str) -> FetchResult:
+        status = item.get("status")
+        if status == "no_data":
             return FetchResult(status="no_data", monthly_rows=[], error="similarweb_no_data")
-        if response.status_code == 403:
-            return FetchResult(status="forbidden", monthly_rows=[], error="similarweb_forbidden")
-        if response.status_code in (407, 429) or response.status_code >= 500:
-            return FetchResult(
-                status="failed",
-                monthly_rows=[],
-                error=f"similarweb_http_{response.status_code}:{response.text[:300]}",
-            )
-        if not is_success:
-            return FetchResult(
-                status="failed",
-                monthly_rows=[],
-                error=f"similarweb_http_{response.status_code}:{response.text[:300]}",
-            )
-
-        try:
-            payload = response.json()
-        except json.JSONDecodeError:
-            log_error("similarweb.fetch.invalid_json", domain=clean_domain)
-            return FetchResult(status="failed", monthly_rows=[], error="similarweb_invalid_json")
+        if status == "invalid_url":
+            return FetchResult(status="failed", monthly_rows=[], error="invalid_domain")
+        if status != "ok":
+            error = item.get("error") if isinstance(item.get("error"), dict) else {}
+            code = str(error.get("code") or "unknown")
+            if code == "upstream_http_403":
+                return FetchResult(status="forbidden", monthly_rows=[], error="similarweb_forbidden")
+            return FetchResult(status="failed", monthly_rows=[], error=f"traffic_service:{code}"[:300])
+        payload = item.get("raw")
+        if not isinstance(payload, dict):
+            log_error("similarweb.fetch.missing_raw_payload", domain=clean_domain)
+            return FetchResult(status="failed", monthly_rows=[], error="traffic_service_missing_raw")
 
         monthly_rows = parse_monthly_rows(payload, clean_domain, requested_month)
         observed_latest_month = latest_observed_traffic_month(monthly_rows)
@@ -181,6 +164,7 @@ class SimilarWebClient:
             requested_month=requested_month,
             observed_latest_month=observed_latest_month,
             monthly_rows=len(monthly_rows),
+            cached=bool(item.get("cached")),
         )
         return FetchResult(
             status=status,

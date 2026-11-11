@@ -164,6 +164,10 @@ class Config:
     jev_min_confidence: float = 0.85
     jev_timeout_seconds: int = 8
     jev_capability_limit: int = 6
+    # Unified traffic service (traffic-desk-executor /v1/traffic). The service
+    # owns Similarweb signing, Bright Data proxying, 429 backoff and the cache.
+    traffic_service_url: str = "https://will-api.sigpik.com"
+    traffic_service_token: str = ""
 
 
 class D1RequestError(RuntimeError):
@@ -322,6 +326,8 @@ def load_config(require_brightdata: bool = True) -> Config:
         jev_min_confidence=min(1.0, max(0.5, read_float_env("JEV_MIN_CONFIDENCE", 0.85))),
         jev_timeout_seconds=min(10, max(1, read_int_env("JEV_TIMEOUT_SECONDS", 8))),
         jev_capability_limit=min(10, max(1, read_int_env("JEV_CAPABILITY_LIMIT", 6))),
+        traffic_service_url=(os.getenv("TRAFFIC_SERVICE_URL") or "https://will-api.sigpik.com").strip().rstrip("/"),
+        traffic_service_token=(os.getenv("TRAFFIC_SERVICE_TOKEN") or "").strip(),
         taxonomy_auto_enabled=read_bool_env("TAXONOMY_AUTO_ENABLED", True),
         taxonomy_recheck_auto_non_product=read_bool_env(
             "TAXONOMY_RECHECK_AUTO_NON_PRODUCT", False

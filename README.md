@@ -32,7 +32,7 @@ changes with semantic fingerprints, establishes a no-alert first baseline, and w
 deterministic state/diff objects without using an LLM. See
 [`sitemap_monitor/README.md`](sitemap_monitor/README.md) for its isolated CLI and scope.
 
-It uses the Cloudflare D1 `ainav` database as the task source and system of record. Traffic mode first verifies that Similarweb has published the target previous-month data through one configured probe domain. Only after that D1-backed release gate is available does it queue the catalog-wide traffic batch, fetch through the Bright Data proxy zone, store rows in `domain_traffic_snapshots` and `tool_traffic_monthly`, then update `traffic_tasks` and `tool_traffic_fetch_status`.
+It uses the Cloudflare D1 `ainav` database as the task source and system of record. Traffic mode first verifies that Similarweb has published the target previous-month data through one configured probe domain. Only after that D1-backed release gate is available does it queue the catalog-wide traffic batch, fetch through the unified traffic service (`will-api.sigpik.com/v1/traffic`), store rows in `domain_traffic_snapshots` and `tool_traffic_monthly`, then update `traffic_tasks` and `tool_traffic_fetch_status`.
 
 Price monitoring was retired on 2026-10-01. Collection, extraction, review, and publication entrypoints have been removed. Historical evidence is retained; migration `0128_retire_price_monitoring.sql` deactivates collection sources.
 
@@ -61,7 +61,8 @@ Fill `.env` with:
 - `AHREF_API_KEY`: Ahrefs free Domain Rating API authentication. The runner sends it as `Authorization: Bearer <token>`.
 - DR cadence and provider budget: `RUNNER_DOMAIN_STATE_MAX_AGE_DAYS` (default `30`), `RUNNER_DOMAIN_POLL_INTERVAL_SECONDS` (default `1` while draining a full batch), and `RUNNER_AHREFS_REQUESTS_PER_MINUTE` (default `60`, hard-clamped to Ahrefs' documented ceiling). Polling backs off to at least 10 seconds after a partial batch and 60 seconds when idle, avoiding a full D1 queue scan every second. The free DR endpoint does not consume API units; HTTP 429 responses honor `Retry-After` before retrying.
   The limiter is process-local, so production should run one `periodic-facts-worker` replica. If that service is intentionally scaled out, divide the 60 requests/minute budget across replicas.
-- `BRIGHTDATA_PROXY_USER`, `BRIGHTDATA_PROXY_PASSWORD`: Bright Data proxy credentials for traffic mode.
+- `TRAFFIC_SERVICE_URL` (default `https://will-api.sigpik.com`), `TRAFFIC_SERVICE_TOKEN`: traffic mode fetches Similarweb data only through the unified traffic service (`POST /v1/traffic` with `include_raw=true`). Signing, Bright Data proxying, 429 backoff and the shared 24h cache live in that service; parsing and storage stay here. Without a token, traffic tasks fail with `traffic_service_not_configured` instead of calling Similarweb directly.
+- `BRIGHTDATA_PROXY_USER`, `BRIGHTDATA_PROXY_PASSWORD`: still required by the traffic CLI configuration loader; no longer used for Similarweb requests.
 - Optional runner identity and tuning: stable `RUNNER_INSTANCE_ID`, `RUNNER_SERVICE_NAME`, deploy label `RUNNER_VERSION`, `RUNNER_LIMIT`.
 - Workload concurrency: `RUNNER_TRAFFIC_CONCURRENCY`, `RUNNER_DOMAIN_CONCURRENCY`, and `RUNNER_ASSET_CONCURRENCY`. Each falls back to legacy `RUNNER_CONCURRENCY` when omitted.
 - Logging: `RUNNER_LOG_LEVEL=info` emits lifecycle, batch summaries, failures, retries, and non-success task outcomes. Use `debug` temporarily for per-task success/start events.
