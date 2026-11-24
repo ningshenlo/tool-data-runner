@@ -372,3 +372,83 @@ class PlanNameSlugCleanupTests(unittest.TestCase):
         conflict_slugs = {(c["conflict_type"], c["desired_slug"], c["winner_tool_id"]) for c in plan["squatter_conflicts"]}
         self.assertIn(("tool_slug_alias", "character", 184), conflict_slugs)
         self.assertIn(("inactive_tool_localization", "easymusic", 8779), conflict_slugs)
+
+    def test_planner_avoids_canonical_slug_and_active_alias_owners_and_validates(self) -> None:
+        from ops.apply_name_slug_cleanup import validate_cleanup_plan
+        from ops.plan_name_slug_cleanup import build_cleanup_plan
+
+        rows = [
+            {
+                "tool_id": 8662,
+                "status": "pending_review",
+                "normalized_domain": "chat.crushon.ai",
+                "official_url": "https://chat.crushon.ai/",
+                "canonical_slug": "chat-crushon-ai-deadbeef",
+                "localized_slug": "ai-boyfriend-deadbeef",
+                "name": "Crushon AI Chat",
+                "name_source": "discovery_direct",
+                "name_review_status": "auto_approved",
+                "monthly_visits": 100000,
+            },
+            {
+                "tool_id": 2259,
+                "status": "published",
+                "normalized_domain": "nanopic.app",
+                "official_url": "https://nanopic.app/",
+                "canonical_slug": "nanopic-app",
+                "localized_slug": "nano-banana-pro",
+                "name": "Nano Banana Pro",
+                "name_source": "open_graph_site_name",
+                "name_review_status": "auto_approved",
+                "monthly_visits": 50000,
+            },
+            {
+                "tool_id": 9170,
+                "status": "published",
+                "normalized_domain": "nano-banana-pro.ai",
+                "official_url": "https://nano-banana-pro.ai/",
+                "canonical_slug": "nano-banana-pro-ai-11223344",
+                "localized_slug": "nano-banana-pro-11223344",
+                "name": "Nano Banana Pro AI",
+                "name_source": "open_graph_site_name",
+                "name_review_status": "auto_approved",
+                "monthly_visits": 30000,
+            },
+        ]
+        canon_owners = {"crushon": 190, "nano-banana-pro-ai-11223344": 9170, "nanopic-app": 2259}
+        active_aliases = {"nano-banana-pro": {2259}}
+        active_slugs = {
+            "ai-boyfriend-deadbeef": 8662,
+            "nano-banana-pro": 2259,
+            "nano-banana-pro-11223344": 9170,
+        }
+
+        plan = build_cleanup_plan(
+            rows,
+            canonical_slug_owners=canon_owners,
+            active_alias_owners=active_aliases,
+        )
+        by_id = {r["tool_id"]: r for r in plan["plan_rows"]}
+        # Rejected tool #190 holds canonical_slug 'crushon', so chat.crushon.ai falls back cleanly to 'crushon-ai'.
+        self.assertEqual(by_id[8662]["proposed_slug"], "crushon-ai")
+        # Published active tool #2259 holds 'nano-banana-pro', so nano-banana-pro.ai falls back to 'nano-banana-pro-ai'.
+        self.assertEqual(by_id[9170]["proposed_slug"], "nano-banana-pro-ai")
+
+        summary = validate_cleanup_plan(
+            plan,
+            canonical_slug_owners=canon_owners,
+            active_slug_owners=active_slugs,
+            active_alias_owners=active_aliases,
+        )
+        self.assertEqual(summary["summary"]["changed_tools"], 2)
+        self.assertEqual(summary["summary"]["reclaim_aliases"], 0)
+
+        # Pre-flight guard rejects conflicting active alias overrides.
+        bad_plan = {"plan_rows": [dict(by_id[9170], proposed_slug="nano-banana-pro")], "squatter_conflicts": []}
+        with self.assertRaises(ValueError):
+            validate_cleanup_plan(
+                bad_plan,
+                canonical_slug_owners=canon_owners,
+                active_slug_owners=active_slugs,
+                active_alias_owners=active_aliases,
+            )

@@ -176,6 +176,8 @@ def build_cleanup_plan(
     *,
     alias_rows: list[dict[str, Any]] | None = None,
     inactive_slug_rows: list[dict[str, Any]] | None = None,
+    canonical_slug_owners: dict[str, int] | None = None,
+    active_alias_owners: dict[str, set[int]] | None = None,
 ) -> dict[str, Any]:
     """Compute Scheme A Phase 1 plan rows, squatter aliases, and brand duplicates."""
     snapshots = [
@@ -332,18 +334,34 @@ def build_cleanup_plan(
             }
     brand_duplicates = list(dup_by_id.values())
 
+    active_ids: set[int] = {r.tool_id for r in ordered}
+    canon_owners: dict[str, int] = {
+        str(k).strip().lower(): int(v)
+        for k, v in (canonical_slug_owners or {}).items()
+        if str(k).strip()
+    }
+    active_aliases_by_slug: dict[str, set[int]] = defaultdict(set)
+    for slug, owners in (active_alias_owners or {}).items():
+        clean_s = str(slug).strip().lower()
+        if clean_s:
+            active_aliases_by_slug[clean_s].update(int(o) for o in owners)
+
     alias_by_slug: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for alias in alias_rows or []:
         slug = str(alias.get("slug") or "").strip().lower()
         if slug:
-            alias_by_slug[slug].append(
-                {"slug": slug, "tool_id": int(alias["tool_id"]), "created_at": str(alias.get("created_at") or "")}
-            )
+            owner_id = int(alias["tool_id"])
+            if owner_id in active_ids:
+                active_aliases_by_slug[slug].add(owner_id)
+            else:
+                alias_by_slug[slug].append(
+                    {"slug": slug, "tool_id": owner_id, "created_at": str(alias.get("created_at") or "")}
+                )
 
     inactive_by_slug: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for row in inactive_slug_rows or []:
         slug = str(row.get("localized_slug") or "").strip().lower()
-        if slug:
+        if slug and int(row["tool_id"]) not in active_ids:
             inactive_by_slug[slug].append(
                 {
                     "tool_id": int(row["tool_id"]),
@@ -399,7 +417,24 @@ def build_cleanup_plan(
             slug_reason = "clean_existing"
         else:
             effective_reason = dirty_reason or "active_slug_duplicate"
-            proposed_slug = next((c for c in cands if c not in used_active_slugs), f"tool-{r.tool_id}")
+
+            def _slug_free(candidate: str) -> bool:
+                if candidate in used_active_slugs:
+                    return False
+                canon_owner = canon_owners.get(candidate)
+                if canon_owner is not None and canon_owner != r.tool_id:
+                    return False
+                alias_owners = active_aliases_by_slug.get(candidate)
+                if alias_owners and any(oid != r.tool_id for oid in alias_owners):
+                    return False
+                return True
+
+            proposed_slug = next((c for c in cands if _slug_free(c)), "")
+            if not proposed_slug:
+                suffix_n = 2
+                while not _slug_free(f"tool-{r.tool_id}" if suffix_n == 1 else f"tool-{r.tool_id}-{suffix_n}"):
+                    suffix_n += 1
+                proposed_slug = f"tool-{r.tool_id}-{suffix_n}" if suffix_n > 1 else f"tool-{r.tool_id}"
             used_active_slugs.add(proposed_slug)
             if proposed_slug == r.current_slug:
                 slug_action = "keep"
@@ -486,7 +521,15 @@ def _resolve_read_dsn(explicit_dsn: str = "") -> str:
     raise RuntimeError("No PostgreSQL DSN provided; pass --dsn or set DATABASE_URL")
 
 
-def _fetch_pg_snapshot(dsn: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+def _fetch_pg_snapshot(
+    dsn: str,
+) -> tuple[
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    list[dict[str, Any]],
+    dict[str, int],
+    dict[str, set[int]],
+]:
     import psycopg
 
     with psycopg.connect(dsn) as conn:
@@ -520,10 +563,21 @@ def _fetch_pg_snapshot(dsn: str) -> tuple[list[dict[str, Any]], list[dict[str, A
             )
             cols = [d.name for d in cur.description]
             tools_rows = [dict(zip(cols, row)) for row in cur.fetchall()]
+            active_ids = {int(r["tool_id"]) for r in tools_rows}
 
             cur.execute("SELECT slug, tool_id, created_at FROM tool_slug_aliases WHERE locale_code = 'en'")
             acols = [d.name for d in cur.description]
-            alias_rows = [dict(zip(acols, row)) for row in cur.fetchall()]
+            all_aliases = [dict(zip(acols, row)) for row in cur.fetchall()]
+            alias_rows: list[dict[str, Any]] = []
+            active_alias_owners: dict[str, set[int]] = defaultdict(set)
+            for row in all_aliases:
+                oid = int(row["tool_id"])
+                slug = str(row["slug"] or "").strip().lower()
+                if oid in active_ids:
+                    if slug:
+                        active_alias_owners[slug].add(oid)
+                else:
+                    alias_rows.append(row)
 
             cur.execute(
                 """
@@ -538,7 +592,16 @@ def _fetch_pg_snapshot(dsn: str) -> tuple[list[dict[str, Any]], list[dict[str, A
             icols = [d.name for d in cur.description]
             inactive_rows = [dict(zip(icols, row)) for row in cur.fetchall()]
 
-    return tools_rows, alias_rows, inactive_rows
+            cur.execute(
+                """
+                SELECT lower(canonical_slug) AS slug, id
+                FROM tools
+                WHERE COALESCE(trim(canonical_slug), '') <> ''
+                """
+            )
+            canonical_slug_owners = {str(slug): int(tid) for slug, tid in cur.fetchall()}
+
+    return tools_rows, alias_rows, inactive_rows, canonical_slug_owners, dict(active_alias_owners)
 
 
 def _write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
@@ -626,11 +689,13 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     dsn = _resolve_read_dsn(args.dsn)
-    tools_rows, alias_rows, inactive_rows = _fetch_pg_snapshot(dsn)
+    tools_rows, alias_rows, inactive_rows, canon_owners, active_alias_owners = _fetch_pg_snapshot(dsn)
     result = build_cleanup_plan(
         tools_rows,
         alias_rows=alias_rows,
         inactive_slug_rows=inactive_rows,
+        canonical_slug_owners=canon_owners,
+        active_alias_owners=active_alias_owners,
     )
     stats = write_plan_artifacts(result, Path(args.out_dir))
     print(json.dumps(stats, ensure_ascii=False))
