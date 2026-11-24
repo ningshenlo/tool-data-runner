@@ -453,8 +453,10 @@ class TaxonomyBatchPureTests(unittest.TestCase):
             "DATABASE_BACKEND": "postgres",
             "DATABASE_URL": "postgresql://u:p@h/db",
         }
-        with patch.dict(os.environ, clean_env, clear=True):
-            cfg = runner.load_config()
+        with patch.object(runner, "load_dotenv"), patch.dict(
+            os.environ, clean_env, clear=True
+        ):
+            cfg = runner.load_config(require_brightdata=False)
         self.assertFalse(cfg.taxonomy_capabilities_enabled)
         self.assertFalse(cfg.taxonomy_capability_backfill_enabled)
         self.assertTrue(cfg.taxonomy_single_call_enabled)
@@ -463,12 +465,12 @@ class TaxonomyBatchPureTests(unittest.TestCase):
         self.assertEqual(cfg.taxonomy_batch_leaf_reasoning_effort, "low")
         self.assertEqual(cfg.taxonomy_batch_capability_reasoning_effort, "low")
         self.assertEqual(cfg.taxonomy_batch_escalation_reasoning_effort, "high")
-        with patch.dict(
+        with patch.object(runner, "load_dotenv"), patch.dict(
             os.environ,
             {**clean_env, "TAXONOMY_SINGLE_CALL_ENABLED": "0"},
             clear=True,
         ):
-            rollback_cfg = runner.load_config()
+            rollback_cfg = runner.load_config(require_brightdata=False)
         self.assertFalse(rollback_cfg.taxonomy_single_call_enabled)
 
     def test_migration_contains_resumable_state_and_usage_columns(self):
