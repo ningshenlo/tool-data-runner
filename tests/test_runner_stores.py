@@ -1792,8 +1792,32 @@ class RunnerStoreLifecycleTests(unittest.IsolatedAsyncioTestCase):
             "SELECT localized_slug, name FROM tool_localizations WHERE tool_id = ? AND locale_code = 'en'",
             [tool_id],
         ).fetchone()
-        self.assertEqual(localization["localized_slug"], "hocoos-2")
+        self.assertEqual(localization["localized_slug"], "hocoos-com")
         self.assertEqual(localization["name"], "Hocoos AI Website Builder")
+
+        second_tool_id = self.add_tool("hocoos-2nd-e549821f")
+        self.connection.execute(
+            "UPDATE tools SET normalized_domain = 'hocoos.com', official_url = 'https://hocoos.com/pro' WHERE id = ?",
+            [second_tool_id],
+        )
+        self.connection.commit()
+        second_task = runner.AssetTask(
+            tool_id=second_tool_id,
+            canonical_slug="hocoos-2nd-e549821f",
+            normalized_domain="hocoos.com",
+            official_url="https://hocoos.com/pro",
+            attempts=1,
+            max_attempts=5,
+            generation=1,
+            lease_token="test-lease-2",
+        )
+        await runner.D1AssetStore(self.d1).save_tool_localization(second_task, result)
+
+        second_loc = self.connection.execute(
+            "SELECT localized_slug FROM tool_localizations WHERE tool_id = ? AND locale_code = 'en'",
+            [second_tool_id],
+        ).fetchone()
+        self.assertEqual(second_loc["localized_slug"], "hocoos-com-2")
 
     async def test_low_confidence_name_requires_name_review(self) -> None:
         tool_id = self.add_tool("uncertain-name")

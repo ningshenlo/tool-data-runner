@@ -37,7 +37,7 @@ from workloads.assets.constants import (
 )
 from taxonomy_schema import strict_json_schema
 from workloads.assets.content import *  # noqa: F403
-from workloads.assets.content import _CONTENT_SAFETY_STRONG_DOMAIN_RE
+from workloads.assets.content import assess_content_safety
 from workloads.assets.types import (
     AssetFetchResult,
     AssetPipelineError,
@@ -700,8 +700,14 @@ class CloudflareBrowserRunAssetClient:
         description = read_html_meta(html_body, {"description", "og:description", "twitter:description"})
         favicon_href = extract_favicon_href(html_body, final_url) or ""
 
-        is_adult = bool(_CONTENT_SAFETY_STRONG_DOMAIN_RE.search(task.normalized_domain))
-        safety_status = "nsfw" if is_adult else "safe"
+        safety = assess_content_safety(
+            html_body,
+            task.normalized_domain,
+            product_name=resolution.page_title or resolution.product_name,
+            description=description,
+            model_label="safe" if html_body.strip() else "",
+            model_confidence=90 if html_body.strip() else 0,
+        )
 
         return AssetFetchResult(
             final_url=final_url,
@@ -716,12 +722,12 @@ class CloudflareBrowserRunAssetClient:
             name_review_status=resolution.review_status,
             page_state="valid_product_page",
             page_state_reason="static_fetch",
-            content_safety_status=safety_status,
-            content_safety_score=100 if is_adult else 0,
-            content_safety_confidence=95,
-            content_safety_reason="domain_regex" if is_adult else "default_safe",
-            content_safety_evidence=[],
-            content_safety_source="domain_check",
+            content_safety_status=safety.status,
+            content_safety_score=safety.risk_score,
+            content_safety_confidence=safety.confidence,
+            content_safety_reason=safety.reason,
+            content_safety_evidence=safety.evidence,
+            content_safety_source=safety.source,
             metadata_error="",
             metadata_retryable=False,
         )

@@ -11,9 +11,58 @@ from taxonomy_precision import MIN_AUTO_PRIMARY_CONFIDENCE
 
 __all__ = [
     "accepted_primary_taxonomy_predicate",
+    "clean_tool_name_sql",
+    "clean_tool_slug_sql",
     "tool_auto_publish_admission_predicate",
     "tool_live_ready_predicate",
 ]
+
+
+def clean_tool_name_sql(loc_alias: str) -> str:
+    if loc_alias not in {"l", "localization"}:
+        raise ValueError("Unsupported tool_localizations table alias")
+    return f"""
+      trim({loc_alias}.name) <> ''
+      AND coalesce({loc_alias}.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
+      AND (length(trim({loc_alias}.name)) <= 60 OR ({loc_alias}.name_review_status = 'human_approved' AND length(trim({loc_alias}.name)) <= 120))
+      AND {loc_alias}.name NOT LIKE '%<%'
+      AND {loc_alias}.name NOT LIKE '%>%'
+      AND {loc_alias}.name NOT LIKE '%`%'
+      AND lower({loc_alias}.name) NOT LIKE '%json-ld%'
+      AND (
+        coalesce({loc_alias}.name_review_status, 'legacy_unreviewed') = 'human_approved'
+        OR (
+          {loc_alias}.name NOT LIKE '% | %'
+          AND {loc_alias}.name NOT LIKE '% - %'
+          AND {loc_alias}.name NOT LIKE '% — %'
+          AND {loc_alias}.name NOT LIKE '% – %'
+          AND {loc_alias}.name NOT LIKE '%: %'
+          AND {loc_alias}.name NOT LIKE '% · %'
+          AND lower(trim({loc_alias}.name)) NOT LIKE 'just a moment%'
+          AND lower(trim({loc_alias}.name)) NOT LIKE 'access denied%'
+          AND lower(trim({loc_alias}.name)) NOT LIKE '403 forbidden%'
+          AND lower(trim({loc_alias}.name)) <> 'home'
+          AND lower(trim({loc_alias}.name)) NOT LIKE 'deployment paused%'
+        )
+      )
+    """
+
+
+def clean_tool_slug_sql(loc_alias: str) -> str:
+    if loc_alias not in {"l", "localization"}:
+        raise ValueError("Unsupported tool_localizations table alias")
+    return f"""
+      trim(coalesce({loc_alias}.localized_slug, '')) <> ''
+      AND length(trim({loc_alias}.localized_slug)) <= 50
+      AND lower(trim({loc_alias}.localized_slug)) NOT LIKE 'access-denied%'
+      AND lower(trim({loc_alias}.localized_slug)) NOT LIKE 'just-a-moment%'
+      AND lower(trim({loc_alias}.localized_slug)) NOT LIKE 'ai-directory-%'
+      AND NOT (
+        length(trim({loc_alias}.localized_slug)) >= 10
+        AND substr(trim({loc_alias}.localized_slug), length(trim({loc_alias}.localized_slug)) - 8, 1) = '-'
+        AND glob('[0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]', substr(trim({loc_alias}.localized_slug), length(trim({loc_alias}.localized_slug)) - 7))
+      )
+    """
 
 
 def accepted_primary_taxonomy_predicate(tool_alias: str) -> str:
@@ -48,7 +97,8 @@ def tool_live_ready_predicate(tool_alias: str) -> str:
       AND EXISTS (
         SELECT 1 FROM tool_localizations localization
         WHERE localization.tool_id = {tool_alias}.id
-          AND trim(localization.name) <> ''
+          AND {clean_tool_name_sql('localization')}
+          AND {clean_tool_slug_sql('localization')}
       )
       AND {accepted_primary_taxonomy_predicate(tool_alias)}
       AND EXISTS (

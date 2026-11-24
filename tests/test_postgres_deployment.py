@@ -100,6 +100,8 @@ class PostgresDeploymentTests(unittest.TestCase):
             self.assertNotIn('json_extract (', entry['postgres'])
             self.assertNotIn(' strftime (', entry['postgres'])
             self.assertIn('ainav_json_extract_text', entry['postgres'])
+            self.assertIn("!~ '-[0-9a-f]{8}$'", entry['postgres'])
+            self.assertNotIn('glob(', entry['postgres'].lower())
             # RETURNING id rows are the published count; identity capture would drop them.
             self.assertIsNone(entry['generatedReturning'])
             client.prepare(sql, params)
@@ -377,3 +379,40 @@ class PostgresDeploymentTests(unittest.TestCase):
             self.assertIsNotNone(entry)
             self.assertIn('%(p1)s', prepared_sql)
             self.assertEqual(len(param_dict), len(params))
+
+    def test_enrichment_evaluate_tool_uses_postgres_safe_catalog_entries(self):
+        from shared.db.legacy import catalog_entry, query_key
+        from workloads.assets.enrichment import D1EnrichmentStore
+
+        client = LegacyPostgresClient('postgresql://ci:ci@postgres.invalid/sigpik')
+        captured_primary = []
+        captured_legacy = []
+
+        class PrimaryClient:
+            async def query(self, sql, params=None, **kwargs):
+                captured_primary.append((sql, params or []))
+                return []
+
+        class FallbackClient:
+            def __init__(self):
+                self.calls = 0
+
+            async def query(self, sql, params=None, **kwargs):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError('no such column: category_status')
+                captured_legacy.append((sql, params or []))
+                return []
+
+        asyncio.run(D1EnrichmentStore(PrimaryClient()).evaluate_tool(101))
+        asyncio.run(D1EnrichmentStore(FallbackClient()).evaluate_tool(101))
+
+        self.assertEqual(len(captured_primary), 1)
+        self.assertEqual(len(captured_legacy), 1)
+        for sql, params in (captured_primary[0], captured_legacy[0]):
+            entry = catalog_entry(client.catalog, query_key(sql))
+            self.assertIsNotNone(entry)
+            self.assertIn('has_clean_slug', entry['postgres'])
+            self.assertIn("!~ '-[0-9a-f]{8}$'", entry['postgres'])
+            self.assertNotIn('glob(', entry['postgres'].lower())
+            client.prepare(sql, params)

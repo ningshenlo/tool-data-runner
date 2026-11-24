@@ -21,6 +21,8 @@ import httpx
 from anti_bot_signatures import detect_anti_bot_page
 from shared.readiness import (
     accepted_primary_taxonomy_predicate,
+    clean_tool_name_sql,
+    clean_tool_slug_sql,
     tool_auto_publish_admission_predicate,
     tool_live_ready_predicate,
 )
@@ -61,14 +63,12 @@ class D1EnrichmentStore:
               ) THEN 1 ELSE 0 END AS has_localization,
               CASE WHEN EXISTS (
                 SELECT 1 FROM tool_localizations l
-                WHERE l.tool_id = t.id AND trim(l.name) <> ''
-                  AND coalesce(l.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
-                  AND (length(trim(l.name)) <= 80 OR (l.name_review_status = 'human_approved' AND length(trim(l.name)) <= 120))
-                  AND l.name NOT LIKE '%<%'
-                  AND l.name NOT LIKE '%>%'
-                  AND l.name NOT LIKE '%`%'
-                  AND lower(l.name) NOT LIKE '%json-ld%'
+                WHERE l.tool_id = t.id AND {clean_tool_name_sql('l')}
               ) THEN 1 ELSE 0 END AS has_name_quality,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM tool_localizations l
+                WHERE l.tool_id = t.id AND {clean_tool_slug_sql('l')}
+              ) THEN 1 ELSE 0 END AS has_clean_slug,
               CASE WHEN {accepted_primary_taxonomy_predicate('t')}
                    THEN 1 ELSE 0 END AS has_category,
               CASE WHEN NOT {accepted_primary_taxonomy_predicate('t')} AND EXISTS (
@@ -118,14 +118,12 @@ class D1EnrichmentStore:
               ) THEN 1 ELSE 0 END AS has_localization,
               CASE WHEN EXISTS (
                 SELECT 1 FROM tool_localizations l
-                WHERE l.tool_id = t.id AND trim(l.name) <> ''
-                  AND coalesce(l.name_review_status, 'legacy_unreviewed') NOT IN ('needs_review', 'rejected')
-                  AND (length(trim(l.name)) <= 80 OR (l.name_review_status = 'human_approved' AND length(trim(l.name)) <= 120))
-                  AND l.name NOT LIKE '%<%'
-                  AND l.name NOT LIKE '%>%'
-                  AND l.name NOT LIKE '%`%'
-                  AND lower(l.name) NOT LIKE '%json-ld%'
+                WHERE l.tool_id = t.id AND {clean_tool_name_sql('l')}
               ) THEN 1 ELSE 0 END AS has_name_quality,
+              CASE WHEN EXISTS (
+                SELECT 1 FROM tool_localizations l
+                WHERE l.tool_id = t.id AND {clean_tool_slug_sql('l')}
+              ) THEN 1 ELSE 0 END AS has_clean_slug,
               CASE WHEN {accepted_primary_taxonomy_predicate('t')}
                    THEN 1 ELSE 0 END AS has_category,
               0 AS category_needs_manual,
@@ -174,6 +172,7 @@ class D1EnrichmentStore:
             for name, column in (
                 ("content_safety", "has_content_safety"),
                 ("name_quality", "has_name_quality"),
+                ("clean_slug", "has_clean_slug"),
                 ("screenshot", "has_screenshot"),
                 ("favicon", "has_favicon"),
                 ("traffic", "has_traffic"),

@@ -19,6 +19,7 @@ from urllib.parse import quote, urljoin, urlsplit
 import httpx
 
 from anti_bot_signatures import detect_anti_bot_page
+from libs.domains import extract_domain_brand_parts, format_domain_brand_name
 from shared.readiness import (
     accepted_primary_taxonomy_predicate,
     tool_auto_publish_admission_predicate,
@@ -327,25 +328,83 @@ def normalize_structured_json_payload(payload: Any) -> dict[str, Any]:
                     return normalized
 
     return payload
-def clean_public_slug(value: Any) -> str:
+RESERVED_PUBLIC_SLUGS = frozenset({
+    "admin",
+    "api",
+    "tools",
+    "tool",
+    "markets",
+    "market",
+    "search",
+    "signals",
+    "ranking",
+    "rankings",
+    "pricing",
+    "about",
+    "contact",
+    "login",
+    "signin",
+    "signup",
+    "dashboard",
+    "account",
+    "home",
+    "index",
+    "app",
+    "web",
+    "www",
+    "blog",
+    "docs",
+    "reports",
+    "share",
+    "embed",
+    "widget",
+    "badge",
+    "sitemaps",
+    "robots",
+    "access-denied",
+    "just-a-moment",
+    "403",
+    "404",
+    "error",
+    "undefined",
+    "null",
+    "pro",
+    "ya",
+})
+
+
+def clean_public_slug(value: Any, max_len: int = 40) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", str(value or "").strip().lower()).strip("-")
-    return slug[:120].rstrip("-")
+    return slug[:max_len].rstrip("-")
+
+
+def public_tool_slug_candidates(task: AssetTask, _title: str = "") -> list[str]:
+    """Build deterministic domain-derived public slug candidates (no -hex8 hashes)."""
+    stem, tld = extract_domain_brand_parts(task.normalized_domain)
+    stem_slug = clean_public_slug(stem)
+    tld_slug = clean_public_slug(f"{stem}-{tld}")
+    host_slug = clean_public_slug(task.normalized_domain)
+
+    candidates: list[str] = []
+    for candidate in (stem_slug, tld_slug, host_slug):
+        if candidate and len(candidate) >= 2 and candidate not in RESERVED_PUBLIC_SLUGS and candidate not in candidates:
+            candidates.append(candidate)
+
+    fallback_base = candidates[1] if len(candidates) > 1 else (candidates[0] if candidates else f"tool-{task.tool_id}")
+    for number in range(2, 51):
+        numbered = numbered_public_slug(fallback_base, number)
+        if numbered not in candidates:
+            candidates.append(numbered)
+    return candidates
 
 
 def public_tool_slug_base(task: AssetTask, title: str = "") -> str:
-    canonical_base = re.sub(r"-[0-9a-f]{8}$", "", task.canonical_slug.strip().lower())
-    registrable_domain = get_registrable_domain(task.normalized_domain)
-    domain_label = registrable_domain.split(".", 1)[0]
-    for value in (canonical_base, domain_label, title, task.canonical_slug):
-        slug = clean_public_slug(value)
-        if slug:
-            return slug
-    return f"tool-{task.tool_id}"
+    return public_tool_slug_candidates(task, title)[0]
 
 
 def numbered_public_slug(base: str, number: int) -> str:
     suffix = "" if number <= 1 else f"-{number}"
-    trimmed_base = base[: 120 - len(suffix)].rstrip("-") or "tool"
+    trimmed_base = base[: 40 - len(suffix)].rstrip("-") or "tool"
     return f"{trimmed_base}{suffix}"
 
 
@@ -445,20 +504,24 @@ def read_html_meta(html_body: str, names: set[str]) -> str:
 
 _CHALLENGE_TITLE_RE = re.compile(
     r"^(?:just\s+(?:a\s+moment|wait)|checking\s+your\s+browser|"
-    r"verify\s+(?:you\s+are\s+human|your\s+identity)|attention\s+required|security\s+check)\b",
+    r"verify\s+(?:you\s+are\s+human|your\s+identity)|attention\s+required|security\s+check|cloudflare)\b",
     re.I,
 )
 _ACCESS_DENIED_TITLE_RE = re.compile(
-    r"^(?:access\s+denied|forbidden|unauthorized|request\s+(?:was\s+)?blocked|error\s*403)\b",
+    r"^(?:access\s+denied|forbidden|unauthorized|request\s+(?:was\s+)?blocked|error\s*403|403\s+forbidden|"
+    r"deployment\s+paused|site\s+under\s+construction|under\s+construction|站点正在建设中|redirecting)\b",
     re.I,
 )
 _ERROR_TITLE_RE = re.compile(
     r"^(?:404|not\s+found|page\s+not\s+found|500|internal\s+server\s+error|service\s+unavailable)\b",
     re.I,
 )
-_GENERIC_PAGE_NAME_RE = re.compile(r"^(?:home|homepage|welcome|index|default\s+page)$", re.I)
-_MARKETING_PAGE_NAME_RE = re.compile(r"^(?:best|free|online|official)\b", re.I)
-_TITLE_SEPARATOR_RE = re.compile(r"\s*[|｜–—]\s*|\s+[·-]\s+|[:：]\s+")
+_GENERIC_PAGE_NAME_RE = re.compile(
+    r"^(?:home|homepage|welcome|index|default\s+page|sign\s*in|log\s*in|login|pricing|contact|about(?:\s+us)?|blog)$",
+    re.I,
+)
+_MARKETING_PAGE_NAME_RE = re.compile(r"^(?:best|top\s+\d+|free|online|official|how\s+to)\b", re.I)
+_TITLE_SEPARATOR_RE = re.compile(r"\s*[|｜–—]\s*|\s+[·•-]\s+|\s+/\s+|::|[:：]\s+")
 
 
 _HOMEPAGE_EXCLUDED_TAGS = {
@@ -706,7 +769,7 @@ def classify_page_state(
     return PageQualityAssessment("valid_product_page", "usable_html", title)
 
 
-def invalid_tool_name_reason(value: Any) -> str:
+def invalid_tool_name_reason(value: Any, hostname: str = "") -> str:
     name = clean_asset_text(value, 160)
     if not name:
         return "empty_name"
@@ -718,17 +781,23 @@ def invalid_tool_name_reason(value: Any) -> str:
         return "access_denied_name"
     if _ERROR_TITLE_RE.search(name):
         return "error_page_name"
-    if _GENERIC_PAGE_NAME_RE.fullmatch(name) or re.fullmatch(r"sign\s*in|log\s*in|pricing|contact|about(?:\s+us)?", name, re.I):
+    if _GENERIC_PAGE_NAME_RE.fullmatch(name) or (
+        name.lower() == "untitled" and "untitled" not in (hostname or "").lower()
+    ):
         return "generic_page_name"
-    if len(name) > 80:
+    if name.endswith("...") or name.endswith("…"):
+        return "truncated_page_title"
+    if len(name) > 50:
         return "name_too_long"
     if _TITLE_SEPARATOR_RE.search(name):
         return "unsplit_page_title"
-    if _MARKETING_PAGE_NAME_RE.search(name) and len(name.split()) >= 4:
+    if _MARKETING_PAGE_NAME_RE.search(name) and (
+        len(name.split()) >= 4 or re.search(r"\b202\d\b", name)
+    ):
         return "marketing_page_title"
     if re.search(r"^\d+[+%]?\s", name) and len(name.split()) >= 4:
         return "marketing_page_title"
-    if len(name.split()) > 8:
+    if len(name.split()) > 5:
         return "name_too_many_words"
     return ""
 
@@ -793,15 +862,19 @@ def _compact_name(value: str) -> str:
 
 def _matches_domain_brand(name: str, hostname: str) -> bool:
     name_key = _compact_name(name)
+    stem, tld = extract_domain_brand_parts(hostname)
+    stem_key = _compact_name(stem)
+    tld_key = _compact_name(tld)
     host = hostname.lower().removeprefix("www.")
-    domain_key = _compact_name(host.split(".")[0])
-    return len(domain_key) >= 3 and domain_key not in {"app", "api", "docs", "blog"} and name_key in {domain_key, f"{domain_key}ai", _compact_name(host)}
+    if len(stem_key) < 2:
+        return False
+    if name_key in {stem_key, f"{stem_key}ai", f"{stem_key}{tld_key}", _compact_name(host)}:
+        return True
+    return len(stem_key) >= 4 and len(name.split()) <= 4 and stem_key in name_key
 
 
 def domain_fallback_tool_name(hostname: str) -> str:
-    label = _domain_brand_label(hostname)
-    parts = [part for part in re.split(r"[-_]+", label) if part]
-    return " ".join(part[:1].upper() + part[1:] for part in parts)[:120] or "Tool"
+    return format_domain_brand_name(hostname, include_tld=False)
 
 
 def resolve_tool_name(
@@ -823,49 +896,48 @@ def resolve_tool_name(
         model_title = ""
     page_title = deterministic_page_title or model_title
 
-    # 1. Upstream submitted/model name
-    product_name = clean_asset_text(model_product_name, 120)
-    if product_name and not invalid_tool_name_reason(product_name):
-        return ToolNameResolution(
-            product_name, page_title, "submitted_name", 95, "upstream_name", "auto_approved"
-        )
-
-    # 2. og:site_name / application-name
+    # 1. og:site_name / application-name / apple-mobile-web-app-title
     site_name = read_html_meta(
         html_body, {"og:site_name", "application-name", "apple-mobile-web-app-title"}
     )
-    if site_name and not invalid_tool_name_reason(site_name):
+    if site_name and not invalid_tool_name_reason(site_name, hostname):
         return ToolNameResolution(
-            site_name, page_title, "open_graph_site_name", 90, "meta_site_name", "auto_approved"
+            site_name, page_title, "open_graph_site_name", 92, "meta_site_name", "auto_approved"
         )
 
-    # 3. JSON-LD name
+    # 2. JSON-LD SoftwareApplication / WebApplication / Product / WebSite name
     for json_name in _json_ld_product_names(html_body, hostname):
-        if json_name and not invalid_tool_name_reason(json_name):
+        if json_name and not invalid_tool_name_reason(json_name, hostname):
             return ToolNameResolution(
-                json_name, page_title, "json_ld_product", 88, "json_ld_name", "auto_approved"
+                json_name, page_title, "json_ld_product", 90, "json_ld_name", "auto_approved"
             )
 
-    # 4. Page title segment (prefer matching domain brand or shortest segment)
+    # 3. Domain-matched <title> segment only (never blind left/shortest segment)
     if page_title and not (
         _CHALLENGE_TITLE_RE.search(page_title)
         or _ACCESS_DENIED_TITLE_RE.search(page_title)
         or _ERROR_TITLE_RE.search(page_title)
     ):
         segments = [
-            clean_asset_text(part, 120).strip(" -|–—:·")
+            clean_asset_text(part, 120).strip(" -|–—:·•")
             for part in _TITLE_SEPARATOR_RE.split(page_title)
         ]
-        eligible_segments = [s for s in segments if s and not invalid_tool_name_reason(s)]
-        if eligible_segments:
-            matching = next((s for s in eligible_segments if _matches_domain_brand(s, hostname)), None)
-            chosen = matching or min(eligible_segments, key=len)
+        eligible_segments = [s for s in segments if s and not invalid_tool_name_reason(s, hostname)]
+        matching = next((s for s in eligible_segments if _matches_domain_brand(s, hostname)), None)
+        if matching:
             return ToolNameResolution(
-                chosen, page_title, "page_title_segment", 85, f"page_title: {chosen}", "auto_approved"
+                matching, page_title, "page_title_segment", 86, f"page_title: {matching}", "auto_approved"
             )
 
-    # 5. Domain fallback
-    fallback = domain_fallback_tool_name(hostname)
+    # 4. Clean submitted/model hint if no structured HTML brand tag or domain-matched title existed
+    product_name = clean_asset_text(model_product_name, 120)
+    if product_name and not invalid_tool_name_reason(product_name, hostname):
+        return ToolNameResolution(
+            product_name, page_title, "submitted_name", 85, "upstream_name", "auto_approved"
+        )
+
+    # 5. Deterministic domain left-part fallback (Scheme A)
+    fallback = format_domain_brand_name(hostname, include_tld=False)
     return ToolNameResolution(
         fallback, page_title, "domain_fallback", 80, f"hostname={hostname}", "auto_approved"
     )

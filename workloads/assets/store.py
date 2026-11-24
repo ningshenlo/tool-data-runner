@@ -19,6 +19,7 @@ from urllib.parse import quote, urljoin, urlsplit
 import httpx
 
 from anti_bot_signatures import detect_anti_bot_page
+from libs.domains import format_domain_brand_name
 from shared.readiness import (
     accepted_primary_taxonomy_predicate,
     tool_auto_publish_admission_predicate,
@@ -39,8 +40,7 @@ from workloads.assets.content import (
     clean_asset_text,
     domain_fallback_tool_name,
     invalid_tool_name_reason,
-    numbered_public_slug,
-    public_tool_slug_base,
+    public_tool_slug_candidates,
 )
 from workloads.assets.types import (
     AssetFetchResult,
@@ -339,7 +339,7 @@ class D1AssetStore:
         name_confidence = max(0, min(100, int(result.name_confidence or 0)))
         name_evidence = clean_asset_text(result.name_evidence, 500)
         name_review_status = str(getattr(result, "name_review_status", None) or "auto_approved")
-        invalid_reason = invalid_tool_name_reason(title)
+        invalid_reason = invalid_tool_name_reason(title, task.normalized_domain)
         if invalid_reason:
             title = domain_fallback_tool_name(task.normalized_domain)
             name_source = "domain_fallback"
@@ -372,7 +372,7 @@ class D1AssetStore:
         current_name = str(current.get("name") or "")
         legacy_name_to_repair = (
             current_name if current.get("name_review_status") == "legacy_unreviewed"
-            and invalid_tool_name_reason(current_name) else None
+            and invalid_tool_name_reason(current_name, task.normalized_domain) else None
         )
         if not locale:
             locale_rows = await self.d1.query(
@@ -387,9 +387,13 @@ class D1AssetStore:
             locale = str(locale_rows[0].get("code") or "") if locale_rows else ""
             if not locale:
                 return
-            slug_base = public_tool_slug_base(task, title)
-            for number in range(1, 1001):
-                localized_slug = numbered_public_slug(slug_base, number)
+            candidates = public_tool_slug_candidates(task, title)
+            for idx, localized_slug in enumerate(candidates):
+                effective_title = (
+                    format_domain_brand_name(task.normalized_domain, include_tld=True)
+                    if idx >= 1 and name_source == "domain_fallback"
+                    else title
+                )
                 meta = await self.d1.run(
                     """
                     INSERT OR IGNORE INTO tool_localizations (
@@ -404,7 +408,7 @@ class D1AssetStore:
                         task.tool_id,
                         locale,
                         localized_slug,
-                        title or localized_slug,
+                        effective_title or localized_slug,
                         description or None,
                         description or None,
                         name_source,

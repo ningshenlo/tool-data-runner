@@ -5,15 +5,24 @@ from unittest.mock import AsyncMock
 import runner
 
 class StreamlinedNamePolicyTests(unittest.TestCase):
-    def test_waterfall_submitted_name_priority(self):
+    def test_waterfall_og_site_name_beats_submitted_name_and_submitted_used_when_missing(self):
         result = runner.resolve_tool_name(
             '<title>Other Brand</title><meta property="og:site_name" content="Third Brand">',
             'shopos.ai',
             model_product_name='ShopOS',
         )
-        self.assertEqual(result.product_name, 'ShopOS')
-        self.assertEqual(result.source, 'submitted_name')
+        self.assertEqual(result.product_name, 'Third Brand')
+        self.assertEqual(result.source, 'open_graph_site_name')
         self.assertEqual(result.review_status, 'auto_approved')
+
+        fallback_submitted = runner.resolve_tool_name(
+            '<title>Create stunning AI workflows for teams</title>',
+            'shopos.ai',
+            model_product_name='ShopOS',
+        )
+        self.assertEqual(fallback_submitted.product_name, 'ShopOS')
+        self.assertEqual(fallback_submitted.source, 'submitted_name')
+        self.assertEqual(fallback_submitted.review_status, 'auto_approved')
 
     def test_waterfall_og_site_name(self):
         html = '<meta property="og:site_name" content="Hypotenuse AI"><title>AI Writer | Hypotenuse</title>'

@@ -41,8 +41,17 @@ from taxonomy_precision import MIN_AUTO_PRIMARY_CONFIDENCE
 from taxonomy_schema import strict_json_schema
 from shared.readiness import (
     accepted_primary_taxonomy_predicate,
+    clean_tool_name_sql,
+    clean_tool_slug_sql,
     tool_auto_publish_admission_predicate,
     tool_live_ready_predicate,
+)
+from libs.domains import (
+    extract_domain_brand_parts,
+    format_domain_brand_name,
+    get_registrable_domain,
+    normalize_domain,
+    normalize_rdap_domain,
 )
 
 from config.constants import (
@@ -237,7 +246,6 @@ from libs.logging_util import (
     redact_log_text,
 )
 from libs.timeutil import iso_delta, parse_iso_timestamp, utc_now_iso
-from libs.domains import get_registrable_domain, normalize_domain, normalize_rdap_domain
 from libs.numbers import (
     country_name,
     estimate_visits_from_bps,
@@ -1283,6 +1291,7 @@ from workloads.assets.content import (
     numbered_public_slug,
     page_visible_text,
     public_tool_slug_base,
+    public_tool_slug_candidates,
     read_html_meta,
     read_html_title,
     resolve_tool_name,
