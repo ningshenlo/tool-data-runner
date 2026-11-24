@@ -5,6 +5,7 @@
 | `check-deployment-contract.py` | CI: validate rendered Dokploy Compose |
 | `check-market-publication.py` | Ops: inspect market snapshot readiness |
 | `check-search-demand-publication.py` | Ops: dry-run search-demand publish |
+| `taxonomy_observability.py` | Ops: read-only taxonomy cache/escalation/gap report |
 | `sync-report-runtime.py` | CI/deploy: verify report-runtime bundle |
 | `crawl_ai_directories.py` | Maintained crawler (see `docs/ai-directory-crawler.md`) |
 | `build_revision.py` | Fingerprint shipped source for image audits |

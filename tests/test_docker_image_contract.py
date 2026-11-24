@@ -34,6 +34,7 @@ class DockerImageContractTests(unittest.TestCase):
         self.assertIn("COPY report-markets.json .", dockerfile)
         self.assertIn("COPY scripts/check-market-publication.py ./scripts/", dockerfile)
         self.assertIn("COPY scripts/check-search-demand-publication.py ./scripts/", dockerfile)
+        self.assertIn("COPY scripts/taxonomy_observability.py ./scripts/", dockerfile)
 
 
 if __name__ == "__main__":

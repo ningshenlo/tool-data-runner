@@ -24,6 +24,7 @@ COPY search_demand_refresh.py .
 COPY search_demand_brand.py .
 COPY scripts/check-search-demand-publication.py ./scripts/
 COPY scripts/check-market-publication.py ./scripts/
+COPY scripts/taxonomy_observability.py ./scripts/
 COPY report_review_api.py .
 COPY report-markets.json .
 COPY taxonomy_shadow.py .
