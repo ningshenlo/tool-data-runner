@@ -125,6 +125,7 @@ class Config:
     taxonomy_auto_accept_confidence: float
     taxonomy_provider_backoff_seconds: int
     taxonomy_batch_enabled: bool
+    taxonomy_single_call_enabled: bool
     taxonomy_batch_model: str
     taxonomy_batch_escalation_model: str
     taxonomy_batch_profile_reasoning_effort: str
@@ -357,6 +358,9 @@ def load_config(require_brightdata: bool = True) -> Config:
             900, read_int_env("RUNNER_TAXONOMY_PROVIDER_BACKOFF_SECONDS", 21600)
         ),
         taxonomy_batch_enabled=read_bool_env("TAXONOMY_BATCH_ENABLED", True),
+        taxonomy_single_call_enabled=read_bool_env(
+            "TAXONOMY_SINGLE_CALL_ENABLED", True
+        ),
         taxonomy_batch_model=(
             os.getenv("OPENAI_TAXONOMY_MODEL", "gpt-5.6-luna").strip()
             or "gpt-5.6-luna"

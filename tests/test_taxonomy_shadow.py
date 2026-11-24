@@ -11,8 +11,10 @@ from runner import AssetTask
 from taxonomy_shadow import (
     SHADOW_PROMPT_VERSION,
     TAXONOMY_TERMS_SQL,
+    TaxonomyCatalog,
     TaxonomyTerm,
     auto_primary_write_state,
+    build_evidence_blocks,
     build_leaf_candidate_pool,
     build_product_profile,
     capability_term_chunks,
@@ -23,9 +25,13 @@ from taxonomy_shadow import (
     classify_tool_shadow,
     decide_primary_status,
     evidence_quote_is_grounded,
+    format_evidence_blocks,
     load_capability_backfill_tasks,
     load_shadow_tasks,
+    materialize_evidence_ids,
+    materialize_unified_single_call_output,
     merge_capability_decisions,
+    normalize_evidence_block_id,
     normalize_evidence_items,
     normalize_evidenced_value,
     parse_capabilities,
@@ -33,9 +39,12 @@ from taxonomy_shadow import (
     parse_leaf_decision,
     parse_secondary_leaf_decisions,
     parse_top2_l1,
+    profile_evidence_text,
     profile_has_signal,
     recall_capability_candidates,
     resolve_entity_decision,
+    unified_single_call_prompt,
+    unified_single_call_schema,
 )
 
 
@@ -1667,6 +1676,115 @@ class CapabilityTests(unittest.TestCase):
             [term.slug for term in capability_retry_terms(raw, catalog)],
             ["text-to-video"],
         )
+
+    def test_build_evidence_blocks_and_materialize_ids_preserve_grounding(self):
+        source = (
+            "Kling creates cinema-grade AI videos from text prompts.\n"
+            "Kling creates cinema-grade AI videos from text prompts.\n"
+            "Also generate photorealistic images from sketches. Edit keyframes with camera controls.\n"
+            "-\n"
+        )
+        blocks = build_evidence_blocks(source, max_blocks=10, max_chars_per_block=65)
+        self.assertEqual([b["id"] for b in blocks], ["E1", "E2", "E3"])
+        for block in blocks:
+            self.assertNotIn("…", block["text"])
+            self.assertTrue(evidence_quote_is_grounded(block["text"], source))
+        formatted = format_evidence_blocks(blocks)
+        self.assertIn("[E1] Kling creates cinema-grade AI videos from text prompts.", formatted)
+        self.assertEqual(normalize_evidence_block_id(" [e2] "), "E2")
+        self.assertEqual(normalize_evidence_block_id("bad"), "")
+        self.assertEqual(normalize_evidence_block_id(True), "")
+
+        block_map = {b["id"]: b["text"] for b in blocks}
+        evidence = materialize_evidence_ids(
+            ["e1", "[E1]", "E99", "2"],
+            block_map,
+            source_url="https://kling.example",
+            source_text=source,
+        )
+        self.assertEqual(
+            [e["node_id"] for e in evidence],
+            ["E1", "E2"],
+        )
+        self.assertEqual(
+            evidence[0]["quote"],
+            "Kling creates cinema-grade AI videos from text prompts.",
+        )
+
+    def test_render_compact_tree_and_unified_prompt_prefix_cache(self):
+        catalog = _catalog()
+        tree = catalog.render_compact_tree()
+        self.assertIn("L1 video", tree)
+        self.assertIn("  L2 text-to-video", tree)
+        self.assertNotIn("parent=video", tree)
+
+        from taxonomy_schema import strict_json_schema
+
+        schema = strict_json_schema(unified_single_call_schema())
+        self.assertEqual(schema["additionalProperties"], False)
+        self.assertIn("taxonomy_gap", schema["required"])
+
+        p1 = unified_single_call_prompt(
+            catalog,
+            "https://one.example",
+            "Tool One generates synthetic training videos.",
+        )
+        p2 = unified_single_call_prompt(
+            catalog,
+            "https://two.example",
+            "Tool Two detects AI images.",
+        )
+        marker = "Page URL: "
+        self.assertEqual(p1.split(marker)[0], p2.split(marker)[0])
+        self.assertLess(p1.index("L1 video"), p1.index("[E1]"))
+
+    def test_materialize_unified_single_call_output_resolves_evidence_and_gap(self):
+        catalog = _catalog()
+        source = (
+            "WorldSim simulates physics-accurate interactive 3D worlds.\n"
+            "Predict robot action outcomes across persistent virtual environments."
+        )
+        blocks = build_evidence_blocks(source)
+        materialized = materialize_unified_single_call_output(
+            {
+                "entity_kind": "independent_product",
+                "entity_confidence": 0.94,
+                "entity_reason": "Standalone world simulation platform",
+                "entity_evidence_ids": ["E1"],
+                "primary_job": {"value": "Simulate interactive 3D worlds", "evidence_ids": ["E1"]},
+                "main_sold_workflow": {"value": "Physics world simulation", "evidence_ids": ["E2"]},
+                "negative_claims": [],
+                "primary_outputs": [{"value": "Interactive 3D worlds", "evidence_ids": ["E1"]}],
+                "capabilities_raw": [{"value": "World modeling", "evidence_ids": ["E2"]}],
+                "l1_candidates": [],
+                "primary_leaf": {"slug": "", "confidence": 0.0, "reason": "No market fits", "evidence_ids": []},
+                "secondary_leaves": [],
+                "taxonomy_gap": {
+                    "is_gap": True,
+                    "suggested_parent_l1": "",
+                    "suggested_category": "ai-world-models",
+                    "reason": "General physics-aware 3D world simulator",
+                    "evidence_ids": ["E1", "E2"],
+                },
+            },
+            catalog=catalog,
+            source_url="https://worldsim.example",
+            source_text=source,
+            blocks=blocks,
+        )
+        profile = materialized["profile"]
+        self.assertTrue(profile["entity_decision"]["accepted"])
+        self.assertEqual(
+            profile["primary_job"]["evidence"][0]["quote"],
+            "WorldSim simulates physics-accurate interactive 3D worlds.",
+        )
+        self.assertIn(
+            "Predict robot action outcomes across persistent virtual environments.",
+            profile_evidence_text(profile),
+        )
+        self.assertTrue(materialized["taxonomy_gap"]["is_gap"])
+        self.assertEqual(materialized["taxonomy_gap"]["suggested_category"], "ai-world-models")
+        self.assertEqual(len(materialized["taxonomy_gap"]["evidence"]), 2)
 
 
 if __name__ == "__main__":

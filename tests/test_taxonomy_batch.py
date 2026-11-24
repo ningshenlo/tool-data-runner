@@ -457,11 +457,19 @@ class TaxonomyBatchPureTests(unittest.TestCase):
             cfg = runner.load_config()
         self.assertFalse(cfg.taxonomy_capabilities_enabled)
         self.assertFalse(cfg.taxonomy_capability_backfill_enabled)
+        self.assertTrue(cfg.taxonomy_single_call_enabled)
         self.assertEqual(cfg.taxonomy_batch_profile_reasoning_effort, "low")
         self.assertEqual(cfg.taxonomy_batch_l1_reasoning_effort, "low")
         self.assertEqual(cfg.taxonomy_batch_leaf_reasoning_effort, "low")
         self.assertEqual(cfg.taxonomy_batch_capability_reasoning_effort, "low")
         self.assertEqual(cfg.taxonomy_batch_escalation_reasoning_effort, "high")
+        with patch.dict(
+            os.environ,
+            {**clean_env, "TAXONOMY_SINGLE_CALL_ENABLED": "0"},
+            clear=True,
+        ):
+            rollback_cfg = runner.load_config()
+        self.assertFalse(rollback_cfg.taxonomy_single_call_enabled)
 
     def test_migration_contains_resumable_state_and_usage_columns(self):
         migration = (
@@ -2059,6 +2067,295 @@ class TaxonomyBatchStateMachineTests(unittest.IsolatedAsyncioTestCase):
                 (2, 0, "auto_accepted"),
             ],
         )
+
+    def _multimarket_catalog(self):
+        self.connection.execute(
+            "INSERT OR IGNORE INTO taxonomy_terms VALUES (4, 'primary_category', 'active')"
+        )
+        self.connection.execute(
+            "INSERT OR IGNORE INTO taxonomy_terms VALUES (5, 'primary_category', 'active')"
+        )
+        self.connection.commit()
+        video_root = TaxonomyTerm(
+            term_id=4,
+            dimension="primary_category",
+            slug="video-animation",
+            name="Video and Animation",
+            taxonomy_version=2,
+        )
+        video_leaf = TaxonomyTerm(
+            term_id=5,
+            dimension="primary_category",
+            slug="video-generation-conversion",
+            name="Video generation",
+            parent_id=4,
+            parent_slug="video-animation",
+            taxonomy_version=2,
+        )
+        image_root = self.catalog.get("primary_category", "image-generation")
+        image_leaf = self.catalog.get("primary_category", "image-generators")
+        assert image_root is not None and image_leaf is not None
+        return TaxonomyCatalog([video_root, video_leaf, image_root, image_leaf])
+
+    async def test_single_call_multimarket_tool_completes_in_one_batch_request(self):
+        catalog = self._multimarket_catalog()
+        self.catalog = catalog
+        self.config.taxonomy_capabilities_enabled = False
+        self.config.taxonomy_single_call_enabled = True
+
+        source = (
+            "Acme studio generates AI videos from prompts.\n"
+            "Also create custom marketing images from text descriptions."
+        )
+        item_id = self.connection.execute(
+            """
+            INSERT INTO taxonomy_batch_items (
+              tool_id, pipeline_version, prompt_version, taxonomy_version,
+              source_url, source_text, source_content_hash,
+              existing_entity_kind, existing_entity_source
+            ) VALUES (10, 'p1-test', 'p1-test', 2, 'https://acme.example', ?, 'hash',
+                      'unresolved', 'auto')
+            """,
+            (source,),
+        ).lastrowid
+        self.connection.commit()
+
+        await enqueue_stage(
+            self.d1, self.config, catalog, item_id=item_id, stage="profile"
+        )
+        queued = await self._request("profile")
+        request_body = json.loads(queued["request_json"])["body"]
+        self.assertEqual(request_body["text"]["format"]["name"], "taxonomy_single_call")
+        prompt_text = request_body["input"][0]["content"][0]["text"]
+        self.assertIn("[E1] Acme studio generates AI videos from prompts.", prompt_text)
+        self.assertIn("[E2] Also create custom marketing images from text descriptions.", prompt_text)
+        self.assertLess(prompt_text.index("L1 video-animation"), prompt_text.index("[E1]"))
+
+        await self._apply(
+            "profile",
+            {
+                "entity_kind": "independent_product",
+                "entity_confidence": 0.96,
+                "entity_reason": "Independent creative AI platform",
+                "entity_evidence_ids": ["E1"],
+                "primary_job": {
+                    "value": "Generate AI videos and images",
+                    "evidence_ids": ["E1"],
+                },
+                "main_sold_workflow": {
+                    "value": "AI video creation studio",
+                    "evidence_ids": ["E1"],
+                },
+                "negative_claims": [],
+                "primary_outputs": [
+                    {"value": "AI video", "evidence_ids": ["E1"]},
+                    {"value": "Custom images", "evidence_ids": ["E2"]},
+                ],
+                "capabilities_raw": [
+                    {"value": "Text to video", "evidence_ids": ["E1"]},
+                ],
+                "l1_candidates": [
+                    {"slug": "video-animation", "confidence": 0.95, "reason": "Core video workflow"},
+                    {"slug": "image-generation", "confidence": 0.91, "reason": "Also image creation"},
+                ],
+                "primary_leaf": {
+                    "slug": "video-generation-conversion",
+                    "confidence": 0.90,
+                    "reason": "Main workflow is AI video generation",
+                    "evidence_ids": ["E1"],
+                },
+                "secondary_leaves": [
+                    {
+                        "slug": "image-generators",
+                        "confidence": 0.86,
+                        "reason": "Secondary marketing image generator",
+                        "evidence_ids": ["E2"],
+                    }
+                ],
+                "taxonomy_gap": {
+                    "is_gap": False,
+                    "suggested_parent_l1": "",
+                    "suggested_category": "",
+                    "reason": "",
+                    "evidence_ids": [],
+                },
+            },
+        )
+
+        item = self.connection.execute(
+            "SELECT status, current_stage FROM taxonomy_batch_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        self.assertEqual(tuple(item), ("succeeded", "complete"))
+        stages = [
+            row[0]
+            for row in self.connection.execute(
+                "SELECT stage FROM taxonomy_batch_requests WHERE item_id = ? ORDER BY id",
+                (item_id,),
+            ).fetchall()
+        ]
+        self.assertEqual(stages, ["profile"])
+        run_row = self.connection.execute(
+            "SELECT model_name, run_status FROM classification_runs WHERE tool_id = 10 ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        self.assertEqual(tuple(run_row), ("gpt-5.6-luna", "succeeded"))
+        assignments = self.connection.execute(
+            """
+            SELECT term_id, is_primary, decision_status
+            FROM product_taxonomy_assignments
+            WHERE tool_id = 10
+            ORDER BY is_primary DESC, term_id ASC
+            """
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in assignments],
+            [(5, 1, "auto_accepted"), (2, 0, "auto_accepted")],
+        )
+
+    async def test_single_call_rollback_switch_uses_legacy_profile_schema(self):
+        self.config.taxonomy_single_call_enabled = False
+        item_id = self.connection.execute(
+            """
+            INSERT INTO taxonomy_batch_items (
+              tool_id, pipeline_version, prompt_version, taxonomy_version,
+              source_url, source_text, source_content_hash,
+              existing_entity_kind, existing_entity_source
+            ) VALUES (10, 'rb-test', 'rb-test', 2, 'https://acme.example',
+                      'Acme creates images.', 'hash', 'unresolved', 'auto')
+            """
+        ).lastrowid
+        self.connection.commit()
+
+        await enqueue_stage(
+            self.d1, self.config, self.catalog, item_id=item_id, stage="profile"
+        )
+        queued = await self._request("profile")
+        request_body = json.loads(queued["request_json"])["body"]
+        self.assertEqual(request_body["text"]["format"]["name"], "taxonomy_profile")
+
+    async def test_single_call_low_confidence_escalates_to_leaf_escalation(self):
+        self.config.taxonomy_capabilities_enabled = False
+        self.config.taxonomy_single_call_enabled = True
+        source = "Acme builds AI art assets from short prompts."
+        item_id = self.connection.execute(
+            """
+            INSERT INTO taxonomy_batch_items (
+              tool_id, pipeline_version, prompt_version, taxonomy_version,
+              source_url, source_text, source_content_hash,
+              existing_entity_kind, existing_entity_source
+            ) VALUES (10, 'esc-test', 'esc-test', 2, 'https://acme.example', ?, 'hash',
+                      'unresolved', 'auto')
+            """,
+            (source,),
+        ).lastrowid
+        self.connection.commit()
+
+        await enqueue_stage(
+            self.d1, self.config, self.catalog, item_id=item_id, stage="profile"
+        )
+        await self._apply(
+            "profile",
+            {
+                "entity_kind": "independent_product",
+                "entity_confidence": 0.95,
+                "entity_reason": "Product homepage",
+                "entity_evidence_ids": ["E1"],
+                "primary_job": {"value": "Generate AI art assets", "evidence_ids": ["E1"]},
+                "main_sold_workflow": {"value": "AI art generation", "evidence_ids": ["E1"]},
+                "negative_claims": [],
+                "primary_outputs": [{"value": "AI art", "evidence_ids": ["E1"]}],
+                "capabilities_raw": [],
+                "l1_candidates": [
+                    {"slug": "image-generation", "confidence": 0.92, "reason": "Image generation"},
+                ],
+                "primary_leaf": {
+                    "slug": "image-generators",
+                    "confidence": 0.45,
+                    "reason": "Low confidence guess",
+                    "evidence_ids": ["E1"],
+                },
+                "secondary_leaves": [],
+                "taxonomy_gap": {
+                    "is_gap": False,
+                    "suggested_parent_l1": "",
+                    "suggested_category": "",
+                    "reason": "",
+                    "evidence_ids": [],
+                },
+            },
+        )
+        row = self.connection.execute(
+            "SELECT current_stage, status, profile_json, leaf_json FROM taxonomy_batch_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        self.assertEqual(row[0], "leaf_escalation")
+        self.assertEqual(row[1], "running")
+        self.assertIn("Acme builds AI art assets", row[2])
+        self.assertIn("image-generators", row[3])
+
+    async def test_single_call_taxonomy_gap_routes_to_needs_review_after_escalation(self):
+        self.config.taxonomy_capabilities_enabled = False
+        self.config.taxonomy_single_call_enabled = True
+        source = "WorldSim simulates interactive 3D worlds with causal physics."
+        item_id = self.connection.execute(
+            """
+            INSERT INTO taxonomy_batch_items (
+              tool_id, pipeline_version, prompt_version, taxonomy_version,
+              source_url, source_text, source_content_hash,
+              existing_entity_kind, existing_entity_source
+            ) VALUES (10, 'gap-test', 'gap-test', 2, 'https://worldsim.example', ?, 'hash',
+                      'unresolved', 'auto')
+            """,
+            (source,),
+        ).lastrowid
+        self.connection.commit()
+
+        await enqueue_stage(
+            self.d1, self.config, self.catalog, item_id=item_id, stage="profile"
+        )
+        await self._apply(
+            "profile",
+            {
+                "entity_kind": "independent_product",
+                "entity_confidence": 0.95,
+                "entity_reason": "Standalone world model platform",
+                "entity_evidence_ids": ["E1"],
+                "primary_job": {"value": "Simulate interactive 3D worlds", "evidence_ids": ["E1"]},
+                "main_sold_workflow": {"value": "Physics world simulation", "evidence_ids": ["E1"]},
+                "negative_claims": [],
+                "primary_outputs": [{"value": "3D world simulation", "evidence_ids": ["E1"]}],
+                "capabilities_raw": [],
+                "l1_candidates": [],
+                "primary_leaf": {"slug": "", "confidence": 0.0, "reason": "No fit", "evidence_ids": []},
+                "secondary_leaves": [],
+                "taxonomy_gap": {
+                    "is_gap": True,
+                    "suggested_parent_l1": "",
+                    "suggested_category": "ai-world-models",
+                    "reason": "Interactive 3D physics world simulator has no market fit",
+                    "evidence_ids": ["E1"],
+                },
+            },
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT current_stage FROM taxonomy_batch_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()[0],
+            "l1_escalation",
+        )
+        await self._apply("l1_escalation", {"l1_candidates": []})
+        item = self.connection.execute(
+            "SELECT status, current_stage, error FROM taxonomy_batch_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        self.assertEqual(tuple(item), ("needs_review", "complete", "taxonomy_gap:ai-world-models"))
+        raw_output = json.loads(
+            self.connection.execute(
+                "SELECT raw_output FROM classification_runs WHERE tool_id = 10 ORDER BY id DESC LIMIT 1"
+            ).fetchone()[0]
+        )
+        self.assertEqual(raw_output["taxonomy_gap"]["suggested_category"], "ai-world-models")
 
 
 class TaxonomyBatchSelectionTests(unittest.IsolatedAsyncioTestCase):

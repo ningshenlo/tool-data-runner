@@ -32,15 +32,19 @@ from taxonomy_shadow import (
     SHADOW_EXTRACTOR_VERSION,
     TaxonomyCatalog,
     auto_primary_write_state,
+    build_evidence_blocks,
     build_leaf_candidate_pool,
     build_product_profile,
     capabilities_prompt,
     capabilities_schema,
+    clean_slug,
     insert_classification_run,
+    is_unified_single_call_output,
     leaf_adjudication_prompt,
     leaf_adjudication_schema,
     load_taxonomy_catalog,
     load_verified_manual_primary_term_id,
+    materialize_unified_single_call_output,
     parse_capabilities,
     parse_leaf_decision,
     parse_secondary_leaf_decisions,
@@ -54,6 +58,8 @@ from taxonomy_shadow import (
     supersede_auto_assignments,
     top2_l1_prompt,
     top2_l1_schema,
+    unified_single_call_prompt,
+    unified_single_call_schema,
     update_classification_run_status,
     update_tool_entity_kind,
     upsert_assignment,
@@ -819,6 +825,7 @@ def _stage_prompt_and_schema(
     stage: str,
     *,
     capability_candidate_limit: int = 96,
+    single_call: bool = False,
 ) -> tuple[str, dict[str, Any]]:
     profile = _json_object(item.get("profile_json"))
     l1_raw = _json_object(item.get("l1_json"))
@@ -826,6 +833,12 @@ def _stage_prompt_and_schema(
     if stage == "profile":
         source_url = str(item.get("source_url") or "")
         source_text = str(item.get("source_text") or "")
+        if single_call:
+            blocks = build_evidence_blocks(source_text)
+            return (
+                unified_single_call_prompt(catalog, source_url, blocks),
+                unified_single_call_schema(),
+            )
         return (
             profile_extract_from_main_content_prompt(source_url, source_text),
             profile_extract_schema(),
@@ -873,6 +886,9 @@ async def enqueue_stage(
     item = await load_batch_item(d1, item_id)
     if not item:
         raise RuntimeError(f"taxonomy batch item {item_id} not found")
+    single_call = stage == "profile" and bool(
+        getattr(config, "taxonomy_single_call_enabled", True)
+    )
     model, effort, max_tokens = stage_policy(config, stage)
     prompt, schema = _stage_prompt_and_schema(
         item,
@@ -881,6 +897,7 @@ async def enqueue_stage(
         capability_candidate_limit=int(
             getattr(config, "taxonomy_capability_candidate_limit", 96)
         ),
+        single_call=single_call,
     )
     existing = await d1.query(
         """
@@ -911,11 +928,12 @@ async def enqueue_stage(
     )
     attempt = int(attempt_rows[0].get("max_attempt") or 0) + 1 if attempt_rows else 1
     custom_id = f"taxonomy-{item_id}-{stage}-{attempt}"
+    schema_name = "taxonomy_single_call" if single_call else f"taxonomy_{stage}"
     line = build_responses_batch_line(
         custom_id=custom_id,
         model=model,
         prompt=prompt,
-        schema_name=f"taxonomy_{stage}",
+        schema_name=schema_name,
         schema=schema,
         reasoning_effort=effort,
         max_output_tokens=max_tokens,
@@ -2082,6 +2100,9 @@ def primary_model_for_trace(trace: list[dict[str, Any]]) -> str:
     for row in reversed(trace):
         if row.get("stage") in {"leaf", "leaf_escalation"}:
             return str(row.get("model") or "")
+    for row in reversed(trace):
+        if row.get("stage") == "profile":
+            return str(row.get("model") or "")
     return ""
 
 
@@ -2096,19 +2117,36 @@ async def complete_without_leaf(
     item_id = int(item.get("id") or 0)
     tool_id = int(item.get("tool_id") or 0)
     trace = await _request_trace(d1, item_id)
+    profile = _json_object(item.get("profile_json"))
+    gap_proposal = profile.get("taxonomy_gap_proposal")
+    gap_payload = (
+        gap_proposal
+        if isinstance(gap_proposal, dict) and gap_proposal.get("is_gap")
+        else None
+    )
+    resolved_error = error
+    if (
+        status == "needs_review"
+        and error in {"no_valid_l1_after_escalation", "no_valid_primary_leaf_after_escalation"}
+        and gap_payload
+    ):
+        gap_slug = clean_slug(gap_payload.get("suggested_category")) or "unclassified"
+        resolved_error = f"taxonomy_gap:{gap_slug}"
     raw = {
         "pipeline": BATCH_PIPELINE_VERSION,
         "prompt_version": item.get("prompt_version") or BATCH_PROMPT_VERSION,
         "taxonomy_version": catalog.taxonomy_version,
-        "profile": _json_object(item.get("profile_json")),
+        "profile": profile,
         "l1_raw": _json_object(item.get("l1_json")),
         "leaf_raw": _json_object(item.get("leaf_json")),
         "model_trace": trace,
         "profile_reused": not any(row.get("stage") == "profile" for row in trace),
-        "error": error,
+        "error": resolved_error,
         "primary_policy_version": PRIMARY_POLICY_VERSION,
         "taxonomy_catalog_hash": catalog_fingerprint(catalog),
     }
+    if gap_payload:
+        raw["taxonomy_gap"] = gap_payload
     run_id = int(item.get("classification_run_id") or 0)
     classification_status = "partial" if status == "needs_review" else status
     if not run_id:
@@ -2120,7 +2158,7 @@ async def complete_without_leaf(
             provider=provider_for_trace(trace),
             model_name=trace[-1]["model"] if trace else "",
             raw_output=raw,
-            error=error,
+            error=resolved_error,
             prompt_version=str(item.get("prompt_version") or BATCH_PROMPT_VERSION),
             extractor_version=SHADOW_EXTRACTOR_VERSION,
         )
@@ -2134,14 +2172,14 @@ async def complete_without_leaf(
             completed_at = ?, updated_at = ?
         WHERE id = ?
         """,
-        [status, error, run_id or None, _json(trace), now, now, item_id],
+        [status, resolved_error, run_id or None, _json(trace), now, now, item_id],
     )
     await route_terminal_taxonomy_tool(
         d1,
         tool_id=tool_id,
         item_id=item_id,
         batch_status=status,
-        error=error,
+        error=resolved_error,
     )
 
 
@@ -2436,6 +2474,9 @@ async def finalize_classification(
     }
     if capability_error:
         raw["capabilities_error"] = capability_error
+    gap_proposal = profile.get("taxonomy_gap_proposal")
+    if isinstance(gap_proposal, dict) and gap_proposal.get("is_gap"):
+        raw["taxonomy_gap"] = gap_proposal
     run_status = "partial" if capability_error else "succeeded"
     run_id = int(item.get("classification_run_id") or 0)
     if not run_id:
@@ -2656,6 +2697,89 @@ async def _handle_stage_failure(
     return "needs_review"
 
 
+async def _route_leaf_decision(
+    d1: Any,
+    config: Any,
+    catalog: TaxonomyCatalog,
+    *,
+    item: dict[str, Any],
+    allow_leaf_escalation: bool,
+) -> None:
+    item_id = int(item.get("id") or 0)
+    hits = parse_top2_l1(_json_object(item.get("l1_json")), catalog)
+    pool = build_leaf_candidate_pool(hits, catalog)
+    profile = _json_object(item.get("profile_json"))
+    leaf_raw = _json_object(item.get("leaf_json"))
+    source_url = str(item.get("source_url") or "")
+    evidence_text = profile_evidence_text(profile)
+    decision = parse_leaf_decision(
+        leaf_raw,
+        pool,
+        catalog,
+        source_url=source_url,
+        source_text=evidence_text,
+    )
+    secondary = (
+        parse_secondary_leaf_decisions(
+            leaf_raw,
+            pool,
+            catalog,
+            primary_slug=decision["term"].slug,
+            source_url=source_url,
+            source_text=evidence_text,
+        )
+        if decision
+        else []
+    )
+    min_l1_gap = float(getattr(config, "taxonomy_batch_l1_min_gap", 0.08))
+    escalate = should_escalate_leaf(
+        decision,
+        hits,
+        min_confidence=float(
+            getattr(config, "taxonomy_batch_leaf_min_confidence", 0.60)
+        ),
+        min_l1_gap=min_l1_gap,
+        secondary_decisions=secondary,
+    )
+    acceptance = primary_acceptance(
+        decision,
+        profile,
+        hits,
+        threshold=float(
+            getattr(
+                config,
+                "taxonomy_auto_accept_confidence",
+                MIN_AUTO_PRIMARY_CONFIDENCE,
+            )
+        ),
+        min_l1_gap=min_l1_gap,
+        secondary_decisions=secondary,
+    )
+    escalate = escalate or not acceptance["eligible"]
+    if allow_leaf_escalation and escalate:
+        await enqueue_stage(
+            d1, config, catalog, item_id=item_id, stage="leaf_escalation"
+        )
+    elif not decision:
+        await complete_without_leaf(
+            d1,
+            item,
+            catalog,
+            status="needs_review",
+            error="no_valid_primary_leaf_after_escalation",
+        )
+    elif not acceptance["eligible"]:
+        await complete_without_leaf(
+            d1,
+            item,
+            catalog,
+            status="needs_review",
+            error="primary_quality:" + ",".join(acceptance["reasons"]),
+        )
+    else:
+        await _prepare_capability_or_finalize(d1, config, catalog, item_id)
+
+
 async def apply_request_result(
     d1: Any,
     config: Any,
@@ -2731,38 +2855,66 @@ async def apply_request_result(
     output = result.structured_output
     if stage == "profile":
         source_text = str(item.get("source_text") or "")
-        profile = build_product_profile(
-            output,
-            source_url=str(item.get("source_url") or ""),
-            source_text=source_text,
-        )
+        source_url = str(item.get("source_url") or "")
+        unified = is_unified_single_call_output(output)
+        if unified:
+            materialized = materialize_unified_single_call_output(
+                output,
+                catalog=catalog,
+                source_url=source_url,
+                source_text=source_text,
+            )
+            profile = materialized["profile"]
+            l1_raw = materialized["l1_raw"]
+            leaf_raw = materialized["leaf_raw"]
+            taxonomy_gap = materialized["taxonomy_gap"]
+        else:
+            profile = build_product_profile(
+                output,
+                source_url=source_url,
+                source_text=source_text,
+            )
+            l1_raw = {}
+            leaf_raw = {}
+            taxonomy_gap = None
         entity = resolve_entity_decision(
             profile.get("entity_decision") or {},
             existing_kind=str(item.get("existing_entity_kind") or "unresolved"),
             existing_source=str(item.get("existing_entity_source") or ""),
         )
         profile["entity_decision"] = entity
+        if taxonomy_gap and taxonomy_gap.get("is_gap"):
+            profile["taxonomy_gap_proposal"] = taxonomy_gap
         await upsert_product_profile(d1, int(item.get("tool_id") or 0), profile)
         if entity.get("source") == "auto":
             await update_tool_entity_kind(
                 d1, int(item.get("tool_id") or 0), str(entity.get("kind") or "")
             )
-        await d1.run(
-            """
-            UPDATE taxonomy_batch_items
-            SET profile_json = ?, source_text = NULL, updated_at = ?
-            WHERE id = ?
-            """,
-            [_json(profile), now, item_id],
-        )
+        if unified:
+            await d1.run(
+                """
+                UPDATE taxonomy_batch_items
+                SET profile_json = ?, l1_json = ?, leaf_json = ?,
+                    source_text = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                [_json(profile), _json(l1_raw), _json(leaf_raw), now, item_id],
+            )
+        else:
+            await d1.run(
+                """
+                UPDATE taxonomy_batch_items
+                SET profile_json = ?, source_text = NULL, updated_at = ?
+                WHERE id = ?
+                """,
+                [_json(profile), now, item_id],
+            )
         item = await load_batch_item(d1, item_id)
         eligible = bool(entity.get("accepted")) and str(entity.get("kind") or "") in {
             "independent_product",
             "app_or_extension",
         }
-        if eligible and profile_has_signal(profile):
-            await enqueue_stage(d1, config, catalog, item_id=item_id, stage="l1")
-        else:
+        if not (eligible and profile_has_signal(profile)):
             status = "skipped" if entity.get("accepted") else "partial"
             await complete_without_leaf(
                 d1,
@@ -2770,6 +2922,25 @@ async def apply_request_result(
                 catalog,
                 status=status,
                 error="entity_ineligible_or_profile_without_signal",
+            )
+            return True
+        if not unified:
+            await enqueue_stage(d1, config, catalog, item_id=item_id, stage="l1")
+            return True
+        hits = parse_top2_l1(l1_raw, catalog)
+        if should_escalate_l1(
+            hits, float(getattr(config, "taxonomy_batch_l1_min_gap", 0.08))
+        ):
+            await enqueue_stage(
+                d1, config, catalog, item_id=item_id, stage="l1_escalation"
+            )
+        else:
+            await _route_leaf_decision(
+                d1,
+                config,
+                catalog,
+                item=item,
+                allow_leaf_escalation=True,
             )
         return True
     if stage in {"l1", "l1_escalation"}:
@@ -2802,63 +2973,13 @@ async def apply_request_result(
             [_json(output), now, item_id],
         )
         item = await load_batch_item(d1, item_id)
-        hits = parse_top2_l1(_json_object(item.get("l1_json")), catalog)
-        pool = build_leaf_candidate_pool(hits, catalog)
-        profile = _json_object(item.get("profile_json"))
-        decision = parse_leaf_decision(
-            output,
-            pool,
+        await _route_leaf_decision(
+            d1,
+            config,
             catalog,
-            source_url=str(item.get("source_url") or ""),
-            source_text=profile_evidence_text(profile),
+            item=item,
+            allow_leaf_escalation=(stage == "leaf"),
         )
-        secondary = (
-            parse_secondary_leaf_decisions(
-                output,
-                pool,
-                catalog,
-                primary_slug=decision["term"].slug,
-                source_url=str(item.get("source_url") or ""),
-                source_text=profile_evidence_text(profile),
-            )
-            if decision
-            else []
-        )
-        escalate = should_escalate_leaf(
-            decision,
-            hits,
-            min_confidence=float(
-                getattr(config, "taxonomy_batch_leaf_min_confidence", 0.60)
-            ),
-            min_l1_gap=float(getattr(config, "taxonomy_batch_l1_min_gap", 0.08)),
-            secondary_decisions=secondary,
-        )
-        acceptance = primary_acceptance(
-            decision,
-            profile,
-            hits,
-            threshold=float(getattr(config, "taxonomy_auto_accept_confidence", MIN_AUTO_PRIMARY_CONFIDENCE)),
-            min_l1_gap=float(getattr(config, "taxonomy_batch_l1_min_gap", 0.08)),
-            secondary_decisions=secondary,
-        )
-        escalate = escalate or not acceptance["eligible"]
-        if stage == "leaf" and escalate:
-            await enqueue_stage(
-                d1, config, catalog, item_id=item_id, stage="leaf_escalation"
-            )
-        elif not decision:
-            await complete_without_leaf(
-                d1,
-                item,
-                catalog,
-                status="needs_review",
-                error="no_valid_primary_leaf_after_escalation",
-            )
-        elif not acceptance["eligible"]:
-            await complete_without_leaf(d1, item, catalog, status="needs_review",
-                                        error="primary_quality:" + ",".join(acceptance["reasons"]))
-        else:
-            await _prepare_capability_or_finalize(d1, config, catalog, item_id)
         return True
     if stage == "capability":
         await d1.run(
