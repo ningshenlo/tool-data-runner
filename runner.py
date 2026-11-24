@@ -333,10 +333,10 @@ def load_config(require_brightdata: bool = True) -> Config:
             "TAXONOMY_RECHECK_AUTO_NON_PRODUCT", False
         ),
         taxonomy_capabilities_enabled=read_bool_env(
-            "TAXONOMY_CAPABILITIES_ENABLED", True
+            "TAXONOMY_CAPABILITIES_ENABLED", False
         ),
         taxonomy_capability_backfill_enabled=read_bool_env(
-            "TAXONOMY_CAPABILITY_BACKFILL_ENABLED", True
+            "TAXONOMY_CAPABILITY_BACKFILL_ENABLED", False
         ),
         taxonomy_capability_candidate_limit=min(
             160,
@@ -366,16 +366,16 @@ def load_config(require_brightdata: bool = True) -> Config:
             or "gpt-5.6-terra"
         ),
         taxonomy_batch_profile_reasoning_effort=os.getenv(
-            "OPENAI_TAXONOMY_PROFILE_REASONING_EFFORT", "medium"
+            "OPENAI_TAXONOMY_PROFILE_REASONING_EFFORT", "low"
         ).strip(),
         taxonomy_batch_l1_reasoning_effort=os.getenv(
             "OPENAI_TAXONOMY_L1_REASONING_EFFORT", "low"
         ).strip(),
         taxonomy_batch_leaf_reasoning_effort=os.getenv(
-            "OPENAI_TAXONOMY_LEAF_REASONING_EFFORT", "high"
+            "OPENAI_TAXONOMY_LEAF_REASONING_EFFORT", "low"
         ).strip(),
         taxonomy_batch_capability_reasoning_effort=os.getenv(
-            "OPENAI_TAXONOMY_CAPABILITY_REASONING_EFFORT", "medium"
+            "OPENAI_TAXONOMY_CAPABILITY_REASONING_EFFORT", "low"
         ).strip(),
         taxonomy_batch_escalation_reasoning_effort=os.getenv(
             "OPENAI_TAXONOMY_ESCALATION_REASONING_EFFORT", "high"

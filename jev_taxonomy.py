@@ -12,6 +12,8 @@ from taxonomy_shadow import profile_evidence_text, utc_now_iso
 
 
 def enabled(config: Any) -> bool:
+    if not bool(getattr(config, "taxonomy_capabilities_enabled", True)):
+        return False
     provider = str(getattr(config, "taxonomy_capability_provider", "openai")).strip().lower()
     has_jev_key = bool(str(getattr(config, "jev_api_key", "") or "").strip())
     has_openrouter_key = bool(str(getattr(config, "openrouter_api_key", "") or os.getenv("OPENROUTER_API_KEY", "") or "").strip())

@@ -17,8 +17,13 @@ from typing import Any
 
 from anti_bot_signatures import detect_anti_bot_text
 from taxonomy_precision import (
-    DETECTION_BOUNDARY, DETECTION_MARKETS, MIN_AUTO_PRIMARY_CONFIDENCE,
-    catalog_fingerprint, primary_acceptance, valid_confidence,
+    DETECTION_BOUNDARY,
+    DETECTION_MARKETS,
+    MIN_AUTO_PRIMARY_CONFIDENCE,
+    catalog_fingerprint,
+    primary_acceptance,
+    secondary_acceptance_status,
+    valid_confidence,
 )
 
 SHADOW_PROMPT_VERSION = "shadow-markets-capabilities-v8-scoped-primary-evidence-2026-09-10"
@@ -519,7 +524,9 @@ def profile_extract_prompt() -> str:
         "negative_claims = explicit statements about what the product cannot do or is not "
         "(especially not an AI/authorship detector, not a correctness verdict, not a security product). "
         "Do not drop negation or turn denials into positive capabilities. "
-        "Each evidence item needs a short quote from the page."
+        "Each evidence item needs a short verbatim quote from the page. "
+        "Keep output concise: at most 1 to 2 short verbatim quotes (<=140 chars) per field, "
+        "at most 4 primary_outputs, and at most 5 core capabilities_raw; avoid repeating the same quote across items unless needed."
     )
 
 
@@ -529,8 +536,6 @@ def profile_extract_schema() -> dict[str, Any]:
         "additionalProperties": False,
         "properties": {
             "quote": {"type": "string"},
-            "node_id": {"type": "string"},
-            "source_url": {"type": "string"},
         },
         "required": ["quote"],
     }
@@ -712,8 +717,8 @@ def top2_l1_prompt(
         "or compliant are supporting attributes and MUST NOT justify this market. "
         "Definitions and excludes are binding. Do not invent slugs.\n\n"
         f"{DETECTION_BOUNDARY}\n\n"
-        f"Product facts: {profile_classification_context(profile)}\n\n"
-        f"L1 catalog:\n{catalog.render_terms(roots)}"
+        f"L1 catalog:\n{catalog.render_terms(roots)}\n\n"
+        f"Product facts: {profile_classification_context(profile)}"
     )
 
 
@@ -749,10 +754,14 @@ def leaf_adjudication_prompt(
     profile: dict[str, Any],
 ) -> str:
     detection_boundary = DETECTION_BOUNDARY if any(term.slug in DETECTION_MARKETS for term in candidates) else ""
+    ordered_candidates = sorted(
+        candidates,
+        key=lambda term: (term.parent_id or 0, term.term_id, term.slug),
+    )
+    boundary_block = f"{detection_boundary}\n\n" if detection_boundary else ""
     return (
         "Ignore the neutral transport page. Classify only the evidence-backed product "
         "facts embedded below. "
-        f"L1 candidates already selected: {', '.join(l1_slugs)}. "
         "Choose exactly one stable PRIMARY market leaf and 0 to 3 materially supported "
         "SECONDARY market leaves from the candidate list below. A secondary market must "
         "represent another real competitor set for the product, not a feature or integration. "
@@ -766,9 +775,10 @@ def leaf_adjudication_prompt(
         "secondary_leaves must exclude leaf_slug and use exact candidate slugs. "
         "For each evidence.quote, copy verbatim from an evidence[].quote in Product facts. "
         "The value fields are summaries, not source quotes; never cite or paraphrase them as evidence.\n\n"
-        f"{detection_boundary}\n\n"
-        f"Product facts: {profile_classification_context(profile)}\n\n"
-        f"Leaf candidates:\n{catalog.render_terms(candidates)}"
+        f"{boundary_block}"
+        f"Leaf candidates:\n{catalog.render_terms(ordered_candidates)}\n\n"
+        f"L1 candidates already selected: {', '.join(l1_slugs)}\n"
+        f"Product facts: {profile_classification_context(profile)}"
     )
 
 
@@ -787,7 +797,6 @@ def leaf_adjudication_schema() -> dict[str, Any]:
                     "additionalProperties": False,
                     "properties": {
                         "quote": {"type": "string"},
-                        "node_id": {"type": "string"},
                     },
                     "required": ["quote"],
                 },
@@ -809,7 +818,6 @@ def leaf_adjudication_schema() -> dict[str, Any]:
                     "additionalProperties": False,
                     "properties": {
                         "quote": {"type": "string"},
-                        "node_id": {"type": "string"},
                     },
                     "required": ["quote"],
                 },
@@ -860,9 +868,9 @@ def capabilities_prompt(
         "Only include capabilities explicitly supported by those page evidence quotes. "
         "Do not invent capabilities from brand reputation. "
         "Use exact slugs only.\n\n"
+        f"Capability whitelist:\n{catalog.render_terms(capabilities, limit=None)}\n\n"
         f"primary_job={job}\n"
-        f"capabilities_raw_json={json.dumps(raw_caps[:MAX_CAPABILITIES], ensure_ascii=False)}\n\n"
-        f"Capability whitelist:\n{catalog.render_terms(capabilities, limit=None)}"
+        f"capabilities_raw_json={json.dumps(raw_caps[:MAX_CAPABILITIES], ensure_ascii=False)}"
     )
 
 
@@ -2493,7 +2501,22 @@ async def classify_tool_shadow(
             )
         result.raw = raw_bundle
         return result
-    acceptance = primary_acceptance(leaf_decision, profile, l1_hits, threshold=auto_accept_threshold)
+    if leaf_decision:
+        secondary_decisions = parse_secondary_leaf_decisions(
+            leaf_raw if isinstance(leaf_raw, dict) else {},
+            pool,
+            catalog,
+            primary_slug=leaf_decision["term"].slug,
+            source_url=source_url,
+            source_text=downstream_evidence_text,
+        )
+    acceptance = primary_acceptance(
+        leaf_decision,
+        profile,
+        l1_hits,
+        threshold=auto_accept_threshold,
+        secondary_decisions=secondary_decisions,
+    )
     raw_bundle["primary_acceptance"] = acceptance
     raw_bundle["taxonomy_catalog_hash"] = catalog_fingerprint(catalog)
     if not acceptance["eligible"]:
@@ -2519,14 +2542,6 @@ async def classify_tool_shadow(
         }
         result.primary_slug = leaf_decision["term"].slug
         result.primary_confidence = float(leaf_decision["confidence"])
-        secondary_decisions = parse_secondary_leaf_decisions(
-            leaf_raw if isinstance(leaf_raw, dict) else {},
-            pool,
-            catalog,
-            primary_slug=leaf_decision["term"].slug,
-            source_url=source_url,
-            source_text=downstream_evidence_text,
-        )
     raw_bundle["secondary_markets_accepted"] = [
         {
             "slug": decision["term"].slug,
@@ -2673,7 +2688,7 @@ async def classify_tool_shadow(
             run_id=result.run_id or None,
             is_primary=False,
             confidence=float(secondary["confidence"]),
-            decision_status="provisional",
+            decision_status=secondary_acceptance_status(secondary),
             evidence={
                 "role": "secondary_market",
                 "reason": secondary.get("reason"),

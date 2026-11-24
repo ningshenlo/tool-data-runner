@@ -17,7 +17,15 @@ import httpx
 
 from taxonomy_schema import strict_json_schema
 
-from taxonomy_precision import MIN_AUTO_PRIMARY_CONFIDENCE, PRIMARY_POLICY_VERSION, catalog_fingerprint, primary_acceptance
+from taxonomy_precision import (
+    MIN_AUTO_PRIMARY_CONFIDENCE,
+    PRIMARY_POLICY_VERSION,
+    catalog_fingerprint,
+    is_corroborated_multimarket,
+    is_high_confidence_multimarket_l1,
+    primary_acceptance,
+    secondary_acceptance_status,
+)
 
 from taxonomy_shadow import (
     PROVIDER_BLOCKED_RE,
@@ -519,10 +527,13 @@ def should_escalate_l1(hits: list[dict[str, Any]], min_gap: float) -> bool:
     if float(hits[0].get("confidence") or 0.0) < 0.55:
         return True
     if len(hits) >= 2:
-        gap = float(hits[0].get("confidence") or 0.0) - float(
-            hits[1].get("confidence") or 0.0
+        ordered = sorted(
+            (float(hit.get("confidence") or 0.0) for hit in hits),
+            reverse=True,
         )
-        return gap < max(0.0, float(min_gap))
+        gap = ordered[0] - ordered[1]
+        if gap < max(0.0, float(min_gap)):
+            return not is_high_confidence_multimarket_l1(hits, min_l1_gap=min_gap)
     return False
 
 
@@ -532,17 +543,25 @@ def should_escalate_leaf(
     *,
     min_confidence: float,
     min_l1_gap: float,
+    secondary_decisions: list[dict[str, Any]] | None = None,
 ) -> bool:
     if not decision or not decision.get("evidence"):
         return True
     if float(decision.get("confidence") or 0.0) < max(MIN_AUTO_PRIMARY_CONFIDENCE, float(min_confidence)):
         return True
     if len(l1_hits) >= 2:
-        gap = float(l1_hits[0].get("confidence") or 0.0) - float(
-            l1_hits[1].get("confidence") or 0.0
+        ordered = sorted(
+            (float(hit.get("confidence") or 0.0) for hit in l1_hits),
+            reverse=True,
         )
+        gap = ordered[0] - ordered[1]
         if gap < max(0.0, float(min_l1_gap)):
-            return True
+            return not is_corroborated_multimarket(
+                decision,
+                l1_hits,
+                secondary_decisions,
+                min_l1_gap=min_l1_gap,
+            )
     return False
 
 
@@ -744,9 +763,7 @@ def stage_policy(config: Any, stage: str) -> tuple[str, str, int]:
     }.get(stage.replace("_escalation", ""), "taxonomy_batch_leaf_reasoning_effort")
     if escalation:
         effort_field = "taxonomy_batch_escalation_reasoning_effort"
-    default_effort = "high" if escalation or stage.startswith("leaf") else "medium"
-    if stage == "l1":
-        default_effort = "low"
+    default_effort = "high" if escalation else "low"
     effort = str(getattr(config, effort_field, default_effort) or default_effort).strip()
     max_all = max(1024, int(getattr(config, "taxonomy_batch_max_output_tokens", 4096)))
     max_tokens = min(max_all, 2048) if stage.startswith("l1") else max_all
@@ -1503,8 +1520,8 @@ async def seed_batch_items(
         await load_capability_only_batch_tasks(
             d1, catalog=catalog, limit=remaining
         )
-        if bool(getattr(config, "taxonomy_capabilities_enabled", True))
-        and bool(getattr(config, "taxonomy_capability_backfill_enabled", True))
+        if bool(getattr(config, "taxonomy_capabilities_enabled", False))
+        and bool(getattr(config, "taxonomy_capability_backfill_enabled", False))
         and remaining > 0
         else []
     )
@@ -2336,15 +2353,6 @@ async def finalize_classification(
             error="no_valid_primary_leaf_after_escalation",
         )
         return
-    acceptance = primary_acceptance(
-        primary, profile, l1_hits,
-        threshold=float(getattr(config, "taxonomy_auto_accept_confidence", MIN_AUTO_PRIMARY_CONFIDENCE)),
-        min_l1_gap=float(getattr(config, "taxonomy_batch_l1_min_gap", 0.08)),
-    )
-    if not acceptance["eligible"]:
-        await complete_without_leaf(d1, item, catalog, status="needs_review",
-                                    error="primary_quality:" + ",".join(acceptance["reasons"]))
-        return
     secondary = parse_secondary_leaf_decisions(
         leaf_raw,
         pool,
@@ -2353,6 +2361,16 @@ async def finalize_classification(
         source_url=source_url,
         source_text=evidence_text,
     )
+    acceptance = primary_acceptance(
+        primary, profile, l1_hits,
+        threshold=float(getattr(config, "taxonomy_auto_accept_confidence", MIN_AUTO_PRIMARY_CONFIDENCE)),
+        min_l1_gap=float(getattr(config, "taxonomy_batch_l1_min_gap", 0.08)),
+        secondary_decisions=secondary,
+    )
+    if not acceptance["eligible"]:
+        await complete_without_leaf(d1, item, catalog, status="needs_review",
+                                    error="primary_quality:" + ",".join(acceptance["reasons"]))
+        return
     markets = [decision["term"] for decision in [primary, *secondary]]
     cap_candidates = recall_capability_candidates(
         profile,
@@ -2479,7 +2497,7 @@ async def finalize_classification(
             run_id=run_id or None,
             is_primary=False,
             confidence=float(decision["confidence"]),
-            decision_status="provisional",
+            decision_status=secondary_acceptance_status(decision),
             evidence={
                 "role": "secondary_market",
                 "reason": decision.get("reason"),
@@ -2543,7 +2561,7 @@ async def _prepare_capability_or_finalize(
 ) -> None:
     item = await load_batch_item(d1, item_id)
     profile = _json_object(item.get("profile_json"))
-    if not bool(getattr(config, "taxonomy_capabilities_enabled", True)):
+    if not bool(getattr(config, "taxonomy_capabilities_enabled", False)):
         await finalize_classification(d1, config, catalog, item_id)
         return
     if not profile.get("capabilities_raw"):
@@ -2794,6 +2812,18 @@ async def apply_request_result(
             source_url=str(item.get("source_url") or ""),
             source_text=profile_evidence_text(profile),
         )
+        secondary = (
+            parse_secondary_leaf_decisions(
+                output,
+                pool,
+                catalog,
+                primary_slug=decision["term"].slug,
+                source_url=str(item.get("source_url") or ""),
+                source_text=profile_evidence_text(profile),
+            )
+            if decision
+            else []
+        )
         escalate = should_escalate_leaf(
             decision,
             hits,
@@ -2801,10 +2831,16 @@ async def apply_request_result(
                 getattr(config, "taxonomy_batch_leaf_min_confidence", 0.60)
             ),
             min_l1_gap=float(getattr(config, "taxonomy_batch_l1_min_gap", 0.08)),
+            secondary_decisions=secondary,
         )
-        acceptance = primary_acceptance(decision, profile, hits,
+        acceptance = primary_acceptance(
+            decision,
+            profile,
+            hits,
             threshold=float(getattr(config, "taxonomy_auto_accept_confidence", MIN_AUTO_PRIMARY_CONFIDENCE)),
-            min_l1_gap=float(getattr(config, "taxonomy_batch_l1_min_gap", 0.08)))
+            min_l1_gap=float(getattr(config, "taxonomy_batch_l1_min_gap", 0.08)),
+            secondary_decisions=secondary,
+        )
         escalate = escalate or not acceptance["eligible"]
         if stage == "leaf" and escalate:
             await enqueue_stage(

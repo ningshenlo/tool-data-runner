@@ -1,6 +1,6 @@
 import unittest
 
-from taxonomy_precision import primary_acceptance, catalog_fingerprint
+from taxonomy_precision import primary_acceptance, catalog_fingerprint, secondary_acceptance_status
 from taxonomy_shadow import (TaxonomyCatalog, TaxonomyTerm, build_product_profile,
     profile_classification_context, parse_leaf_decision, decide_primary_status)
 
@@ -179,6 +179,99 @@ class PrimaryPrecisionTests(unittest.TestCase):
         result_ambiguous = primary_acceptance(decision, profile_ambiguous, l1_hits)
         self.assertFalse(result_ambiguous['eligible'])
         self.assertIn('unresolved_market_ambiguity', result_ambiguous['reasons'])
+
+    def test_corroborated_dual_high_multimarket_is_accepted(self):
+        video_root = TaxonomyTerm(1, 'primary_category', 'video-animation', 'Video and Animation')
+        video_leaf = TaxonomyTerm(2, 'primary_category', 'video-generation-conversion', 'Video Generation', parent_id=1, parent_slug='video-animation')
+        image_root = TaxonomyTerm(3, 'primary_category', 'image-generation', 'Image Generation')
+        image_leaf = TaxonomyTerm(4, 'primary_category', 'basic-image-generation', 'Basic Image Generation', parent_id=3, parent_slug='image-generation')
+        profile = {
+            'entity_decision': {'accepted': True, 'kind': 'independent_product'},
+            'primary_job': {'value': 'Generate AI videos and images', 'evidence': [{'quote': 'Generate AI videos and images'}]},
+            'main_sold_workflow': {'value': 'Generate AI videos and images', 'evidence': [{'quote': 'Generate AI videos and images'}]},
+        }
+        l1_hits = [
+            {'term': video_root, 'confidence': 0.98},
+            {'term': image_root, 'confidence': 0.95},
+        ]
+        decision = {'term': video_leaf, 'confidence': 0.89, 'evidence': [{'quote': 'Generate AI videos'}]}
+        secondary = [{'term': image_leaf, 'confidence': 0.87, 'evidence': [{'quote': 'Generate images'}]}]
+
+        result = primary_acceptance(decision, profile, l1_hits, secondary_decisions=secondary)
+        self.assertTrue(result['eligible'])
+        self.assertTrue(result['multimarket_corroborated'])
+        self.assertEqual(result['status'], 'auto_accepted')
+        self.assertEqual(secondary_acceptance_status(secondary[0]), 'auto_accepted')
+
+    def test_low_confidence_close_l1s_still_fail_even_with_secondary(self):
+        video_root = TaxonomyTerm(1, 'primary_category', 'video-animation', 'Video and Animation')
+        video_leaf = TaxonomyTerm(2, 'primary_category', 'video-generation-conversion', 'Video Generation', parent_id=1, parent_slug='video-animation')
+        image_root = TaxonomyTerm(3, 'primary_category', 'image-generation', 'Image Generation')
+        image_leaf = TaxonomyTerm(4, 'primary_category', 'basic-image-generation', 'Basic Image Generation', parent_id=3, parent_slug='image-generation')
+        profile = self.profile('Generate AI videos and images')
+        l1_hits = [
+            {'term': video_root, 'confidence': 0.66},
+            {'term': image_root, 'confidence': 0.62},
+        ]
+        decision = {'term': video_leaf, 'confidence': 0.89, 'evidence': [{'quote': 'Generate AI videos'}]}
+        secondary = [{'term': image_leaf, 'confidence': 0.87, 'evidence': [{'quote': 'Generate images'}]}]
+
+        result = primary_acceptance(decision, profile, l1_hits, secondary_decisions=secondary)
+        self.assertFalse(result['eligible'])
+        self.assertFalse(result['multimarket_corroborated'])
+        self.assertIn('unresolved_market_ambiguity', result['reasons'])
+
+    def test_security_family_never_bypasses_ambiguity_or_auto_accepts_secondary(self):
+        writing_root = TaxonomyTerm(5, 'primary_category', 'writing-text', 'Writing')
+        writing_leaf = TaxonomyTerm(6, 'primary_category', 'text-editing', 'Text Editing', parent_id=5, parent_slug='writing-text')
+        sec_leaf = TaxonomyTerm(305, 'primary_category', 'ai-security', 'AI Security', parent_id=28, parent_slug='ai-security-compliance')
+
+        profile = self.profile('Detect AI-generated text and rewrite it safely.')
+        decision_sec = {'term': self.leaf, 'confidence': 0.90, 'evidence': [{'quote': 'Detect AI-generated text'}]}
+        secondary_writing = [{'term': writing_leaf, 'confidence': 0.88, 'evidence': [{'quote': 'rewrite it safely'}]}]
+        res1 = primary_acceptance(
+            decision_sec,
+            profile,
+            [{'term': self.root, 'confidence': 0.98}, {'term': writing_root, 'confidence': 0.95}],
+            secondary_decisions=secondary_writing,
+        )
+        self.assertFalse(res1['eligible'])
+        self.assertIn('unresolved_market_ambiguity', res1['reasons'])
+
+        decision_writing = {'term': writing_leaf, 'confidence': 0.90, 'evidence': [{'quote': 'rewrite it safely'}]}
+        secondary_sec = [{'term': sec_leaf, 'confidence': 0.88, 'evidence': [{'quote': 'Detect AI-generated text'}]}]
+        res2 = primary_acceptance(
+            decision_writing,
+            profile,
+            [{'term': writing_root, 'confidence': 0.98}, {'term': self.root, 'confidence': 0.95}],
+            secondary_decisions=secondary_sec,
+        )
+        self.assertFalse(res2['eligible'])
+        self.assertIn('unresolved_market_ambiguity', res2['reasons'])
+        self.assertEqual(secondary_acceptance_status(secondary_sec[0]), 'provisional')
+        self.assertEqual(
+            secondary_acceptance_status({'term': writing_leaf, 'confidence': 0.65, 'evidence': [{'quote': 'rewrite'}]}),
+            'provisional',
+        )
+
+    def test_parent_rank_mismatch_never_bypasses_ambiguity(self):
+        video_root = TaxonomyTerm(1, 'primary_category', 'video-animation', 'Video and Animation')
+        video_leaf = TaxonomyTerm(2, 'primary_category', 'video-generation-conversion', 'Video Generation', parent_id=1, parent_slug='video-animation')
+        image_root = TaxonomyTerm(3, 'primary_category', 'image-generation', 'Image Generation')
+        image_leaf = TaxonomyTerm(4, 'primary_category', 'basic-image-generation', 'Basic Image Generation', parent_id=3, parent_slug='image-generation')
+        profile = self.profile('Generate AI videos and images')
+        l1_hits = [
+            {'term': video_root, 'confidence': 0.98},
+            {'term': image_root, 'confidence': 0.95},
+        ]
+        # Primary belongs to Top-2 L1 (image_root) instead of Top-1 L1 (video_root).
+        decision = {'term': image_leaf, 'confidence': 0.89, 'evidence': [{'quote': 'Generate images'}]}
+        secondary = [{'term': video_leaf, 'confidence': 0.87, 'evidence': [{'quote': 'Generate AI videos'}]}]
+
+        result = primary_acceptance(decision, profile, l1_hits, secondary_decisions=secondary)
+        self.assertFalse(result['eligible'])
+        self.assertFalse(result['multimarket_corroborated'])
+        self.assertIn('unresolved_market_ambiguity', result['reasons'])
 
 
 class DirectPrimaryGateTests(unittest.IsolatedAsyncioTestCase):

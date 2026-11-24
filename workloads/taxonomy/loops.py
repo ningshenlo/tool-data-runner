@@ -35,10 +35,10 @@ async def run_taxonomy_once(config: Any) -> dict[str, int]:
                 config, "taxonomy_recheck_auto_non_product", True
             ),
             include_capabilities=getattr(
-                config, "taxonomy_capabilities_enabled", True
+                config, "taxonomy_capabilities_enabled", False
             ),
             include_capability_backfill=getattr(
-                config, "taxonomy_capability_backfill_enabled", True
+                config, "taxonomy_capability_backfill_enabled", False
             ),
             capability_candidate_limit=getattr(
                 config, "taxonomy_capability_candidate_limit", 96

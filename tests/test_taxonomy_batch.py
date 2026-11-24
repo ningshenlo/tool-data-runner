@@ -35,7 +35,10 @@ from taxonomy_batch import (
 from taxonomy_shadow import (
     TaxonomyCatalog,
     TaxonomyTerm,
+    capabilities_prompt,
     leaf_adjudication_prompt,
+    leaf_adjudication_schema,
+    profile_extract_schema,
     top2_l1_prompt,
 )
 
@@ -259,12 +262,206 @@ class TaxonomyBatchPureTests(unittest.TestCase):
 
     def test_stage_policy_uses_luna_and_terra_only_for_escalation(self):
         config = SimpleNamespace(taxonomy_batch_max_output_tokens=4096)
-        self.assertEqual(stage_policy(config, "l1")[0], "gpt-5.6-luna")
-        self.assertEqual(stage_policy(config, "l1")[1], "low")
-        self.assertEqual(
-            stage_policy(config, "leaf_escalation")[0], "gpt-5.6-terra"
+        for stage in ("profile", "l1", "leaf", "capability"):
+            self.assertEqual(stage_policy(config, stage)[:2], ("gpt-5.6-luna", "low"))
+        for stage in ("l1_escalation", "leaf_escalation"):
+            self.assertEqual(
+                stage_policy(config, stage)[:2], ("gpt-5.6-terra", "high")
+            )
+
+    def test_multimarket_escalation_rules(self):
+        video_root = TaxonomyTerm(1, "primary_category", "video-animation", "Video")
+        video_leaf = TaxonomyTerm(
+            2,
+            "primary_category",
+            "video-generation-conversion",
+            "Video generation",
+            parent_id=1,
+            parent_slug="video-animation",
         )
-        self.assertEqual(stage_policy(config, "leaf_escalation")[1], "high")
+        image_root = TaxonomyTerm(3, "primary_category", "image-generation", "Image")
+        image_leaf = TaxonomyTerm(
+            4,
+            "primary_category",
+            "basic-image-generation",
+            "Image generation",
+            parent_id=3,
+            parent_slug="image-generation",
+        )
+        sec_root = TaxonomyTerm(
+            28, "primary_category", "ai-security-compliance", "Security"
+        )
+
+        dual_high_hits = [
+            {"term": video_root, "confidence": 0.98},
+            {"term": image_root, "confidence": 0.95},
+        ]
+        self.assertFalse(should_escalate_l1(dual_high_hits, 0.08))
+        self.assertTrue(
+            should_escalate_l1(
+                [
+                    {"term": sec_root, "confidence": 0.98},
+                    {"term": image_root, "confidence": 0.95},
+                ],
+                0.08,
+            )
+        )
+
+        primary = {
+            "term": video_leaf,
+            "confidence": 0.89,
+            "evidence": [{"quote": "Generate AI videos"}],
+        }
+        secondary = [
+            {
+                "term": image_leaf,
+                "confidence": 0.87,
+                "evidence": [{"quote": "Generate images"}],
+            }
+        ]
+        self.assertTrue(
+            should_escalate_leaf(
+                primary,
+                dual_high_hits,
+                min_confidence=0.60,
+                min_l1_gap=0.08,
+            )
+        )
+        self.assertFalse(
+            should_escalate_leaf(
+                primary,
+                dual_high_hits,
+                min_confidence=0.60,
+                min_l1_gap=0.08,
+                secondary_decisions=secondary,
+            )
+        )
+
+    def test_prompt_cache_prefix_ordering_and_candidate_determinism(self):
+        video_root = TaxonomyTerm(1, "primary_category", "video-animation", "Video")
+        video_leaf = TaxonomyTerm(
+            2,
+            "primary_category",
+            "video-generation-conversion",
+            "Video generation",
+            parent_id=1,
+            parent_slug="video-animation",
+        )
+        image_root = TaxonomyTerm(3, "primary_category", "image-generation", "Image")
+        image_leaf = TaxonomyTerm(
+            4,
+            "primary_category",
+            "basic-image-generation",
+            "Image generation",
+            parent_id=3,
+            parent_slug="image-generation",
+        )
+        cap = TaxonomyTerm(10, "capability", "text-to-video", "Text to video")
+        catalog = TaxonomyCatalog([video_root, video_leaf, image_root, image_leaf, cap])
+        profile = {
+            "primary_job": {
+                "value": "Generate videos and images",
+                "evidence": [{"quote": "Generate videos and images"}],
+            },
+            "capabilities_raw": [
+                {
+                    "value": "text to video",
+                    "evidence": [{"quote": "Generate videos and images"}],
+                }
+            ],
+        }
+
+        l1_prompt = top2_l1_prompt([video_root, image_root], catalog, profile)
+        self.assertLess(l1_prompt.index("L1 catalog:"), l1_prompt.index("Product facts:"))
+
+        prompt_a = leaf_adjudication_prompt(
+            [video_leaf, image_leaf],
+            ["video-animation", "image-generation"],
+            catalog,
+            profile,
+        )
+        prompt_b = leaf_adjudication_prompt(
+            [image_leaf, video_leaf],
+            ["image-generation", "video-animation"],
+            catalog,
+            profile,
+        )
+        marker = "L1 candidates already selected:"
+        self.assertLess(prompt_a.index("Leaf candidates:"), prompt_a.index(marker))
+        self.assertLess(prompt_a.index(marker), prompt_a.index("Product facts:"))
+        self.assertEqual(prompt_a.split(marker, 1)[0], prompt_b.split(marker, 1)[0])
+
+        cap_prompt = capabilities_prompt([cap], catalog, profile)
+        self.assertLess(
+            cap_prompt.index("Capability whitelist:"),
+            cap_prompt.index("primary_job="),
+        )
+        self.assertLess(
+            cap_prompt.index("Capability whitelist:"),
+            cap_prompt.index("capabilities_raw_json="),
+        )
+
+    def test_evidence_schemas_omit_redundant_node_id_and_source_url(self):
+        profile_schema = strict_json_schema(profile_extract_schema())
+        self.assertEqual(
+            set(profile_schema["properties"]["entity_evidence"]["items"]["properties"]),
+            {"quote"},
+        )
+        self.assertEqual(
+            set(
+                profile_schema["properties"]["primary_job"]["properties"]["evidence"][
+                    "items"
+                ]["properties"]
+            ),
+            {"quote"},
+        )
+
+        leaf_schema = strict_json_schema(leaf_adjudication_schema())
+        self.assertEqual(
+            set(leaf_schema["properties"]["evidence"]["items"]["properties"]),
+            {"quote"},
+        )
+        self.assertEqual(
+            set(
+                leaf_schema["properties"]["secondary_leaves"]["items"]["properties"][
+                    "evidence"
+                ]["items"]["properties"]
+            ),
+            {"quote"},
+        )
+
+    def test_capabilities_kill_switch_disables_jev_and_default_config(self):
+        import os
+        from unittest.mock import patch
+        import jev_taxonomy
+        import runner
+
+        self.assertFalse(
+            jev_taxonomy.enabled(
+                SimpleNamespace(
+                    taxonomy_capabilities_enabled=False,
+                    taxonomy_capability_provider="jev",
+                    jev_api_key="test-key",
+                    openrouter_api_key="sk-or-test",
+                )
+            )
+        )
+        clean_env = {
+            "CLOUDFLARE_ACCOUNT_ID": "acct",
+            "CLOUDFLARE_D1_DATABASE_ID": "db",
+            "CLOUDFLARE_API_TOKEN": "tok",
+            "DATABASE_BACKEND": "postgres",
+            "DATABASE_URL": "postgresql://u:p@h/db",
+        }
+        with patch.dict(os.environ, clean_env, clear=True):
+            cfg = runner.load_config()
+        self.assertFalse(cfg.taxonomy_capabilities_enabled)
+        self.assertFalse(cfg.taxonomy_capability_backfill_enabled)
+        self.assertEqual(cfg.taxonomy_batch_profile_reasoning_effort, "low")
+        self.assertEqual(cfg.taxonomy_batch_l1_reasoning_effort, "low")
+        self.assertEqual(cfg.taxonomy_batch_leaf_reasoning_effort, "low")
+        self.assertEqual(cfg.taxonomy_batch_capability_reasoning_effort, "low")
+        self.assertEqual(cfg.taxonomy_batch_escalation_reasoning_effort, "high")
 
     def test_migration_contains_resumable_state_and_usage_columns(self):
         migration = (
@@ -1727,6 +1924,141 @@ class TaxonomyBatchStateMachineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(item["status"], "running")
         self.assertEqual(item["current_stage"], "l1")
         self.assertTrue(item["profile_json"])
+
+    async def test_multimarket_product_completes_without_escalation_or_capabilities_when_disabled(self):
+        self.connection.execute(
+            "INSERT INTO taxonomy_terms VALUES (4, 'primary_category', 'active')"
+        )
+        self.connection.execute(
+            "INSERT INTO taxonomy_terms VALUES (5, 'primary_category', 'active')"
+        )
+        self.connection.commit()
+
+        video_root = TaxonomyTerm(
+            term_id=4,
+            dimension="primary_category",
+            slug="video-animation",
+            name="Video and Animation",
+            taxonomy_version=2,
+        )
+        video_leaf = TaxonomyTerm(
+            term_id=5,
+            dimension="primary_category",
+            slug="video-generation-conversion",
+            name="Video generation",
+            parent_id=4,
+            parent_slug="video-animation",
+            taxonomy_version=2,
+        )
+        image_root = self.catalog.get("primary_category", "image-generation")
+        image_leaf = self.catalog.get("primary_category", "image-generators")
+        assert image_root is not None and image_leaf is not None
+        catalog = TaxonomyCatalog([video_root, video_leaf, image_root, image_leaf])
+        self.catalog = catalog
+        self.config.taxonomy_capabilities_enabled = False
+
+        source = "Acme studio generates AI videos from prompts and generates custom images."
+        item_id = self.connection.execute(
+            """
+            INSERT INTO taxonomy_batch_items (
+              tool_id, pipeline_version, prompt_version, taxonomy_version,
+              source_url, source_text, source_content_hash,
+              existing_entity_kind, existing_entity_source
+            ) VALUES (10, 'mm-test', 'mm-test', 2, 'https://acme.example', ?, 'hash',
+                      'unresolved', 'auto')
+            """,
+            (source,),
+        ).lastrowid
+        self.connection.commit()
+
+        await enqueue_stage(
+            self.d1, self.config, catalog, item_id=item_id, stage="profile"
+        )
+        await self._apply(
+            "profile",
+            {
+                "entity_kind": "independent_product",
+                "entity_confidence": 0.96,
+                "entity_reason": "Product studio",
+                "entity_evidence": [{"quote": source}],
+                "primary_job": {
+                    "value": "Generate AI videos and images",
+                    "evidence": [{"quote": source}],
+                },
+                "main_sold_workflow": {
+                    "value": "Generate AI videos and images",
+                    "evidence": [{"quote": source}],
+                },
+                "primary_outputs": [],
+                "capabilities_raw": [
+                    {"value": "Text to video", "evidence": [{"quote": source}]}
+                ],
+            },
+        )
+        await self._apply(
+            "l1",
+            {
+                "l1_candidates": [
+                    {"slug": "video-animation", "confidence": 0.98, "reason": "Primary video"},
+                    {"slug": "image-generation", "confidence": 0.95, "reason": "Also image"},
+                ]
+            },
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT current_stage FROM taxonomy_batch_items WHERE id = ?",
+                (item_id,),
+            ).fetchone()[0],
+            "leaf",
+        )
+        await self._apply(
+            "leaf",
+            {
+                "leaf_slug": "video-generation-conversion",
+                "confidence": 0.89,
+                "reason": "Main workflow is video generation",
+                "evidence": [{"quote": "generates AI videos from prompts"}],
+                "secondary_leaves": [
+                    {
+                        "slug": "image-generators",
+                        "confidence": 0.87,
+                        "reason": "Also generates custom images",
+                        "evidence": [{"quote": "generates custom images"}],
+                    }
+                ],
+            },
+        )
+
+        item = self.connection.execute(
+            "SELECT status, current_stage FROM taxonomy_batch_items WHERE id = ?",
+            (item_id,),
+        ).fetchone()
+        self.assertEqual(tuple(item), ("succeeded", "complete"))
+
+        stages = [
+            row[0]
+            for row in self.connection.execute(
+                "SELECT stage FROM taxonomy_batch_requests WHERE item_id = ? ORDER BY id",
+                (item_id,),
+            ).fetchall()
+        ]
+        self.assertEqual(stages, ["profile", "l1", "leaf"])
+
+        assignments = self.connection.execute(
+            """
+            SELECT term_id, is_primary, decision_status
+            FROM product_taxonomy_assignments
+            WHERE tool_id = 10
+            ORDER BY is_primary DESC, term_id ASC
+            """
+        ).fetchall()
+        self.assertEqual(
+            [tuple(row) for row in assignments],
+            [
+                (5, 1, "auto_accepted"),
+                (2, 0, "auto_accepted"),
+            ],
+        )
 
 
 class TaxonomyBatchSelectionTests(unittest.IsolatedAsyncioTestCase):
