@@ -513,6 +513,28 @@ async def _run_assets_once(config: Config, d1: D1Client, limit: int | None = Non
     counts["enrichment_blocked"] += reconciliation["blocked"]
     counts["enrichment_has_more"] = reconciliation["has_more"]
 
+    if (
+        getattr(config, "sw_screenshot_sync_enabled", True)
+        and os.getenv("DATABASE_BACKEND", "").strip().lower() == "postgres"
+        and os.getenv("DATABASE_URL", "").strip()
+    ):
+        try:
+            from workloads.assets.similarweb_screenshots import sync_similarweb_screenshots
+
+            sw_sync = await sync_similarweb_screenshots(
+                config,
+                limit=max(1, int(getattr(config, "sw_screenshot_sync_limit", 25))),
+                concurrency=min(8, max(1, int(concurrency))),
+                dry_run=False,
+            )
+            counts["sw_screenshots_inserted"] = int(sw_sync.get("inserted") or 0)
+            counts["sw_screenshots_failed"] = int(sw_sync.get("failed") or 0)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            counts["sw_screenshots_failed"] = 1
+            log_error("assets_runner.sw_screenshot_sync.failed", error=str(error)[:300])
+
     return counts
 
 

@@ -178,6 +178,8 @@ class Config:
     # owns Similarweb signing, Bright Data proxying, 429 backoff and the cache.
     traffic_service_url: str = "https://will-api.sigpik.com"
     traffic_service_token: str = ""
+    sw_screenshot_sync_enabled: bool = True
+    sw_screenshot_sync_limit: int = 25
 
 
 class D1RequestError(RuntimeError):
@@ -469,6 +471,10 @@ def load_config(require_brightdata: bool = True) -> Config:
         ).strip(),
         runner_service_name=(os.getenv("RUNNER_SERVICE_NAME") or "tool-data-runner").strip(),
         runner_workloads=(),
+        sw_screenshot_sync_enabled=read_bool_env("SW_SCREENSHOT_SYNC_ENABLED", True),
+        sw_screenshot_sync_limit=min(
+            200, max(1, read_int_env("SW_SCREENSHOT_SYNC_LIMIT", 25))
+        ),
     )
 
 
@@ -1352,6 +1358,9 @@ def runtime_profile_for_args(args: argparse.Namespace) -> tuple[str, tuple[str, 
             args.activate_market_snapshot_id is not None,
             args.shadow_taxonomy,
             args.eval_gold,
+            args.sync_sw_screenshots,
+            args.extract_static_prices,
+            args.enrich_profiles_batch,
         )
     ):
         return "tool-data-maintenance", ()
@@ -1483,20 +1492,52 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         default=None,
         help="simulate auto_accepted when provisional confidence >= threshold (default 0.85)",
     )
+    parser.add_argument(
+        "--sync-sw-screenshots",
+        action="store_true",
+        help="sync missing tool_assets screenshots from stored Similarweb LargeScreenshot URLs into R2",
+    )
+    parser.add_argument(
+        "--extract-static-prices",
+        action="store_true",
+        help="locate public price pages and extract static summary pricing via Cloudflare Clairic",
+    )
+    parser.add_argument(
+        "--enrich-profiles-batch",
+        action="store_true",
+        help="run low-cost OpenAI nano Batch workflow for English capabilities, use cases, long description, and key features",
+    )
+    parser.add_argument(
+        "--batch-action",
+        choices=("build", "submit", "status", "apply", "audit-provisional"),
+        default="build",
+        help="with --enrich-profiles-batch: batch lifecycle action",
+    )
+    parser.add_argument(
+        "--batch-dir",
+        default="work/20261127-enrichment-pipeline/tmp/openai-batch",
+        help="with --enrich-profiles-batch: directory for requests.jsonl, manifest.json, and output.jsonl",
+    )
+    parser.add_argument(
+        "--batch-id",
+        default="",
+        help="with --enrich-profiles-batch --batch-action status: explicit OpenAI batch id",
+    )
     parser.add_argument("--all", action="store_true", help="legacy: run every automatic workload in one process")
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="for market snapshot or Shadow taxonomy: run without writes",
+        help="for market snapshot, Shadow taxonomy, or enrichment maintenance modes: run without writes",
     )
     parser.add_argument(
         "--task-id",
         type=int,
         action="append",
         default=[],
-        help="published tool id with Shadow taxonomy/eval modes; can be repeated",
+        help="published tool id filter for Shadow taxonomy, eval, or enrichment modes; can be repeated",
     )
     parser.add_argument("--limit", type=int, default=None)
+    parser.add_argument("--concurrency", type=int, default=None)
     parser.add_argument("--interval-seconds", type=int, default=None)
     args = parser.parse_args(argv)
     selected = [
@@ -1509,6 +1550,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         args.activate_market_snapshot_id is not None,
         args.shadow_taxonomy,
         args.eval_gold,
+        args.sync_sw_screenshots,
+        args.extract_static_prices,
+        args.enrich_profiles_batch,
         args.all,
     ]
     if sum(1 for value in selected if value) > 1:
@@ -1516,8 +1560,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "--assets, --domain-state, --periodic-facts, --taxonomy, "
             "--backfill-traffic-monthly, "
             "--build-market-snapshot, --activate-market-snapshot-id, "
-            "--shadow-taxonomy, "
-            "--eval-gold, and --all are mutually exclusive"
+            "--shadow-taxonomy, --eval-gold, --sync-sw-screenshots, "
+            "--extract-static-prices, --enrich-profiles-batch, and --all are mutually exclusive"
         )
     if args.all and not args.loop:
         parser.error("--all requires --loop")
@@ -1526,16 +1570,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     if args.task_id and not (
         args.shadow_taxonomy
         or args.eval_gold
+        or args.sync_sw_screenshots
+        or args.extract_static_prices
+        or args.enrich_profiles_batch
     ):
         parser.error(
-            "--task-id requires --shadow-taxonomy, or --eval-gold"
+            "--task-id requires --shadow-taxonomy, --eval-gold, --sync-sw-screenshots, --extract-static-prices, or --enrich-profiles-batch"
         )
     if args.dry_run and not (
         args.build_market_snapshot
         or args.shadow_taxonomy
+        or args.sync_sw_screenshots
+        or args.extract_static_prices
+        or args.enrich_profiles_batch
     ):
         parser.error(
-            "--dry-run requires --build-market-snapshot, or --shadow-taxonomy"
+            "--dry-run requires --build-market-snapshot, --shadow-taxonomy, --sync-sw-screenshots, --extract-static-prices, or --enrich-profiles-batch"
         )
     if args.market_traffic_month and not args.build_market_snapshot:
         parser.error("--market-traffic-month requires --build-market-snapshot")
@@ -1553,8 +1603,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         parser.error("--allow-unresolved-entity requires --shadow-taxonomy")
     if args.primary_only and not args.shadow_taxonomy:
         parser.error("--primary-only requires --shadow-taxonomy")
-    if args.after_tool_id and not args.shadow_taxonomy:
-        parser.error("--after-tool-id requires --shadow-taxonomy")
+    if args.after_tool_id and not (
+        args.shadow_taxonomy
+        or args.sync_sw_screenshots
+        or args.extract_static_prices
+        or args.enrich_profiles_batch
+    ):
+        parser.error(
+            "--after-tool-id requires --shadow-taxonomy, --sync-sw-screenshots, --extract-static-prices, or --enrich-profiles-batch"
+        )
     if args.after_tool_id < 0:
         parser.error("--after-tool-id must be non-negative")
     if args.after_tool_id and args.task_id:
@@ -1596,6 +1653,9 @@ def main() -> None:
             or args.activate_market_snapshot_id is not None
             or args.shadow_taxonomy
             or args.eval_gold
+            or args.sync_sw_screenshots
+            or args.extract_static_prices
+            or args.enrich_profiles_batch
         )
     )
     config = apply_runtime_profile(config, args)
@@ -1654,6 +1714,75 @@ def main() -> None:
             )
         )
         log_info("shadow_taxonomy.summary", **counts)
+        return
+    if args.sync_sw_screenshots:
+        from workloads.assets.similarweb_screenshots import sync_similarweb_screenshots
+
+        loop_factory = None
+        if os.name == "nt":
+            import selectors
+
+            loop_factory = lambda: asyncio.SelectorEventLoop(selectors.SelectSelector())
+        counts = asyncio.run(
+            sync_similarweb_screenshots(
+                config,
+                limit=args.limit or 50,
+                concurrency=args.concurrency or 8,
+                dry_run=args.dry_run,
+                tool_ids=args.task_id or None,
+                after_tool_id=args.after_tool_id,
+            ),
+            loop_factory=loop_factory,
+        )
+        log_info("sw_screenshots.summary", **{k: v for k, v in counts.items() if k != "samples"})
+        print(json.dumps(counts, ensure_ascii=False, indent=2))
+        return
+    if args.extract_static_prices:
+        from workloads.enrichment.clairic_pricing import run_static_pricing_extraction
+
+        loop_factory = None
+        if os.name == "nt":
+            import selectors
+
+            loop_factory = lambda: asyncio.SelectorEventLoop(selectors.SelectSelector())
+        counts = asyncio.run(
+            run_static_pricing_extraction(
+                config,
+                limit=args.limit or 20,
+                concurrency=args.concurrency or 4,
+                dry_run=args.dry_run,
+                tool_ids=args.task_id or None,
+                after_tool_id=args.after_tool_id,
+            ),
+            loop_factory=loop_factory,
+        )
+        log_info("static_pricing.summary", **{k: v for k, v in counts.items() if k != "samples"})
+        print(json.dumps(counts, ensure_ascii=False, indent=2))
+        return
+    if args.enrich_profiles_batch:
+        from workloads.enrichment.openai_profile_batch import run_profile_batch_cli
+
+        loop_factory = None
+        if os.name == "nt":
+            import selectors
+
+            loop_factory = lambda: asyncio.SelectorEventLoop(selectors.SelectSelector())
+        counts = asyncio.run(
+            run_profile_batch_cli(
+                config,
+                action=args.batch_action,
+                batch_dir=args.batch_dir,
+                batch_id=args.batch_id or None,
+                limit=args.limit or 20,
+                concurrency=args.concurrency or 8,
+                dry_run=args.dry_run,
+                tool_ids=args.task_id or None,
+                after_tool_id=args.after_tool_id,
+            ),
+            loop_factory=loop_factory,
+        )
+        log_info("profile_enrichment_batch.summary", **{k: v for k, v in counts.items() if k != "samples"})
+        print(json.dumps(counts, ensure_ascii=False, indent=2))
         return
     if args.eval_gold:
         from ops.taxonomy_eval import (
